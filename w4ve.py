@@ -516,6 +516,19 @@ def release_supports_mc(release, mc):
     return any(name_mentions_mc(f["name"], mc) for f in named)
 
 
+def published_for(piece, mc):
+    """Whether some release of this piece explicitly ships that Minecraft.
+
+    The `mc` range in the catalog is a promise somebody typed; a release that
+    names the version is a fact. When they disagree the fact wins, because the
+    alternative is refusing to install a jar that exists: ShapeBoard said
+    `>=1.21 <1.22` long after it started shipping a 26.2 build."""
+    if not mc:
+        return False
+    return any(mc in (r.get("minecraft") or ())
+               for r in piece.get("releases") or [])
+
+
 def pick_release(piece, want=None, mc=None):
     """Which release to install, and why not, when there is none."""
     releases = piece.get("releases") or []
@@ -794,7 +807,7 @@ def install_one(server, index, pid, want=None, explicit_file=None,
                        f"Install it in the other one.")
 
     supported = mc_matches(piece.get("mc"), server.mc, piece.get("mc_exclude", []))
-    if supported is False:
+    if supported is False and not published_for(piece, server.mc):
         return False, (f"{pid} supports Minecraft {piece['mc']}, "
                        f"this server is {server.mc}")
 
@@ -1346,8 +1359,10 @@ def cmd_doctor(args, index):
         if not piece:
             warnings.append(f"{pid} is installed but no longer in the catalog")
             continue
-        if server.mc and mc_matches(piece.get("mc"), server.mc,
-                                    piece.get("mc_exclude", [])) is False:
+        if (server.mc
+                and mc_matches(piece.get("mc"), server.mc,
+                               piece.get("mc_exclude", [])) is False
+                and not published_for(piece, server.mc)):
             problems.append(f"{pid} supports {piece['mc']}, "
                             f"this server is {server.mc}")
         side = piece.get("side", "both")
