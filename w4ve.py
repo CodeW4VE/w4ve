@@ -1453,42 +1453,48 @@ def build_parser():
         return sub
 
     init = add("init", cmd_init, "write a w4ve.toml here")
-    init.add_argument("--name")
-    init.add_argument("--mc")
+    init.add_argument("--name", help="what to call this server (default: the folder)")
+    init.add_argument("--mc", help="Minecraft version, if it cannot be worked out")
     init.add_argument("--client", action="store_true",
                       help="this folder is a game instance, not a server")
-    init.add_argument("--force", action="store_true")
+    init.add_argument("--force", action="store_true",
+                      help="overwrite an existing w4ve.toml")
 
     add("adopt", cmd_adopt, "write down what is already installed here")
 
     listing = add("list", cmd_list, "what the catalog has")
-    listing.add_argument("--type")
-    listing.add_argument("--side", choices=["server", "client"])
-    listing.add_argument("--profile")
-    listing.add_argument("--installed", action="store_true")
+    listing.add_argument("--type", help="only this kind (fabric-mod, mcdr-plugin...)")
+    listing.add_argument("--side", choices=["server", "client"],
+                         help="only what goes on that side")
+    listing.add_argument("--profile", help="only what this profile contains")
+    listing.add_argument("--installed", action="store_true",
+                         help="only what is installed here")
 
     search = add("search", cmd_search, "find a piece")
-    search.add_argument("text")
+    search.add_argument("text", help="words to look for in names, summaries and tags")
 
     info = add("info", cmd_info, "everything known about one piece")
-    info.add_argument("id")
+    info.add_argument("id", help="the piece to explain")
 
     add("profiles", cmd_profiles, "curated sets of pieces")
 
     install = add("install", cmd_install, "download and place a piece")
-    install.add_argument("ids", nargs="*", metavar="id[@version]")
-    install.add_argument("--profile")
+    install.add_argument("ids", nargs="*", metavar="id[@version]",
+                         help="pieces to install; @version pins one")
+    install.add_argument("--profile", help="install a whole profile at once")
     install.add_argument("--file", help="pick a specific asset by name")
-    install.add_argument("--force", action="store_true")
+    install.add_argument("--force", action="store_true",
+                         help="install over a known conflict or an unsupported version")
 
     update = add("update", cmd_update, "move to the newest version")
-    update.add_argument("ids", nargs="*")
-    update.add_argument("-v", "--verbose", action="store_true")
+    update.add_argument("ids", nargs="*", help="pieces to update (default: all of them)")
+    update.add_argument("-v", "--verbose", action="store_true",
+                        help="also say what is already up to date")
     update.add_argument("--force", action="store_true",
                         help="update even into a known conflict")
 
     remove = add("remove", cmd_remove, "take a piece out")
-    remove.add_argument("ids", nargs="+")
+    remove.add_argument("ids", nargs="+", help="pieces to take out")
 
     add("sync", cmd_sync, "leave the server as w4ve.toml says")
     add("status", cmd_status, "versions and pending restarts")
