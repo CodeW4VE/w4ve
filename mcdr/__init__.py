@@ -8,9 +8,14 @@ methods and 9 events for six of the eight acceptance plugins.
 Everything here is reimplemented from the documented behaviour, never copied:
 MCDR is LGPL-3.0, and copying its code would pull that licence onto W4VE.
 
-Today this package finds plugins and reads what they declare, without running
-any of them. The host that actually loads them comes next.
+What is here today: finding plugins and reading what they declare without
+running them (`loader`), the text objects their output is built from (`text`),
+and the typed config objects they all declare (`serializer`). The host that
+loads and runs them comes next.
 """
 
 from mcdr.loader import (Plugin, discover, duplicates, load_order,  # noqa: F401
                          read, report)
+from mcdr.serializer import Serializable  # noqa: F401
+from mcdr.text import (RAction, RColor, RStyle, RText, RTextBase,  # noqa: F401
+                       RTextList, RTextMCDRTranslation, RTextTranslation)
