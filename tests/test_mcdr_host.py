@@ -227,6 +227,34 @@ class HostCase(unittest.TestCase):
         self.assertTrue(any("cannot route commands yet" in p
                             for p in host.problems), host.problems)
 
+    def test_a_missing_pip_module_is_not_called_a_compatibility_hole(self):
+        """MinecraftDataAPI needs hjson. That is its problem, not ours."""
+        (self.tmp / "plugins" / "needy.py").write_text(
+            "PLUGIN_METADATA = {'id': 'needy', 'version': '1.0.0'}\n"
+            "import hjson_that_does_not_exist\n")
+        host = self.host()
+        found = [p for p in host.problems if "needy" in p]
+        self.assertTrue(found, host.problems)
+        self.assertIn("the plugin's own dependency", found[0])
+
+    def test_a_plugin_waiting_on_the_command_tree_says_that(self):
+        (self.tmp / "plugins" / "commands.py").write_text(
+            "from mcdreforged.api.all import *\n"
+            "PLUGIN_METADATA = {'id': 'commands', 'version': '1.0.0'}\n"
+            "def on_load(server, old):\n"
+            "    server.register_command(Literal('!!x'))\n")
+        host = self.host()
+        self.assertTrue(any("command tree (Literal)" in p
+                            for p in host.problems), host.problems)
+
+    def test_the_singleton_a_plugin_reaches_for_at_module_level(self):
+        """DigAll's tr() helper calls ServerInterface.get_instance()."""
+        from mcdr.interface import ServerInterface
+
+        host = self.host()
+        self.assertIsNotNone(ServerInterface.get_instance())
+        self.assertIs(ServerInterface.si(), ServerInterface.get_instance())
+
     def test_the_metadata_a_plugin_asks_about_itself(self):
         host = self.host()
         meta = host.plugin_metadata("greeter")

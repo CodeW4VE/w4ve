@@ -43,8 +43,34 @@ class PermissionLevel:
 class ServerInterface:
     """What a plugin holds. One per host, shared by every plugin."""
 
+    # Set by the host when it installs the module. Plugins reach for it from
+    # code that was never handed an interface: DigAll's `tr()` helper does it
+    # at module level, and MinecraftDataAPI asks the server its version that
+    # way.
+    _instance = None
+
     def __init__(self, host):
         self._host = host
+
+    @classmethod
+    def si(cls):
+        return cls._instance
+
+    @classmethod
+    def get_instance(cls):
+        return cls._instance
+
+    @classmethod
+    def si_opt(cls):
+        return cls._instance
+
+    @classmethod
+    def psi(cls):
+        return cls._instance
+
+    @classmethod
+    def psi_opt(cls):
+        return cls._instance
 
     # ------------------------------------------------------------ the server
 

@@ -29,6 +29,7 @@ from pathlib import Path
 from mcdr import loader
 from mcdr.info import Info, parse_server_line
 from mcdr.interface import PermissionLevel, PluginServerInterface, ServerInterface
+from mcdr.misc import FunctionThread, Version, VersionRequirement, new_thread
 from mcdr.serializer import Serializable
 from mcdr.text import (RAction, RColor, RStyle, RText, RTextBase, RTextList,
                        RTextMCDRTranslation, RTextTranslation)
@@ -135,6 +136,10 @@ class Host:
         names it expects, and building it here keeps that list in one place
         next to the things it points at.
         """
+        # `ServerInterface.si()` is how a plugin reaches the interface from
+        # code that was never handed one. It is a singleton in MCDR, so it has
+        # to be one here: DigAll calls it from a module level helper.
+        ServerInterface._instance = ServerInterface(self)
         names = {
             # text
             "RText": RText, "RTextList": RTextList, "RTextBase": RTextBase,
@@ -148,6 +153,12 @@ class Host:
             "PluginServerInterface": PluginServerInterface,
             "PermissionLevel": PermissionLevel,
             "Info": Info,
+            # Found by loading real plugins: DigAll needs the decorator,
+            # MinecraftDataAPI needs to compare versions.
+            "new_thread": new_thread,
+            "FunctionThread": FunctionThread,
+            "Version": Version,
+            "VersionRequirement": VersionRequirement,
         }
 
         root = types.ModuleType("mcdreforged")
@@ -213,6 +224,22 @@ class Host:
         """
         try:
             module = self._import(plugin)
+        except ModuleNotFoundError as exc:
+            missing = exc.name or "something"
+            if missing.startswith("mcdreforged"):
+                # A corner of MCDR this host does not provide yet, which is
+                # our problem and worth naming as such.
+                self.problems.append("%s needs %s, which this host does not "
+                                     "provide yet" % (plugin.id, missing))
+            else:
+                # A plugin's own dependency from pip. Not a compatibility hole:
+                # it would be missing under MCDR too, and telling somebody to
+                # `pip install hjson` is a different fix from telling them the
+                # plugin will not run.
+                self.problems.append("%s needs the Python module %s, which is "
+                                     "not installed (it is the plugin's own "
+                                     "dependency)" % (plugin.id, missing))
+            return None
         except Exception as exc:
             self.problems.append("%s did not load: %s: %s"
                                  % (plugin.id, type(exc).__name__, exc))
@@ -282,10 +309,28 @@ class Host:
 
     # ---------------------------------------------------------------- dispatch
 
+    # Names that only exist in the command tree, which this host does not have
+    # yet. A plugin failing on one of these is not broken: it is waiting for a
+    # piece of W4VE, and the difference matters to whoever reads the report.
+    COMMAND_NAMES = ("Literal", "Text", "QuotableText", "GreedyText", "Integer",
+                     "Float", "Number", "Boolean", "Enumeration",
+                     "SimpleCommandBuilder", "CountingLiteral", "ArgumentNode",
+                     "AbstractNode", "CommandContext", "CommandSource",
+                     "ParseResult", "IllegalArgument", "InvalidEnumeration")
+
     def _call(self, entry, event, handler, *args):
         """Call one plugin's handler, and never let it take the host down."""
         try:
             handler(*args)
+        except NameError as exc:
+            wanted = str(exc).split("'")[1] if "'" in str(exc) else ""
+            if wanted in self.COMMAND_NAMES:
+                self.problems.append("%s uses the command tree (%s), which "
+                                     "this host does not have yet"
+                                     % (entry.id, wanted))
+            else:
+                self.problems.append("%s failed in %s: NameError: %s"
+                                     % (entry.id, event, exc))
         except Exception as exc:
             self.problems.append("%s failed in %s: %s: %s"
                                  % (entry.id, event, type(exc).__name__, exc))
@@ -381,7 +426,7 @@ class Host:
         return self.server.pid if self.server else None
 
     def server_information(self):
-        return {"version": None, "ip": None, "port": None}
+        return ServerInformation(self)
 
     # ------------------------------------------------------------- bookkeeping
 
@@ -456,6 +501,29 @@ class Host:
 
     def plugin_command_source(self):
         return ConsoleCommandSource(self)
+
+
+class ServerInformation:
+    """What `get_server_information()` returns: attributes, not a dict.
+
+    MinecraftDataAPI reads `.version` off it and compares it with `Version`, so
+    a plain mapping would break it.
+    """
+
+    def __init__(self, host):
+        self._host = host
+
+    @property
+    def version(self):
+        return getattr(self._host.server, "mc_version", None)
+
+    @property
+    def ip(self):
+        return None
+
+    @property
+    def port(self):
+        return None
 
 
 class Metadata:

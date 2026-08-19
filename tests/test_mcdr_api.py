@@ -150,5 +150,46 @@ class SerializableCase(unittest.TestCase):
                          "a mutable default must not be shared between plugins")
 
 
+class MiscCase(unittest.TestCase):
+    """The small pieces, each of which exists because a plugin needed it."""
+
+    def test_new_thread_bare_and_named(self):
+        from mcdr.misc import new_thread
+
+        ran = []
+
+        @new_thread
+        def plain():
+            ran.append("plain")
+
+        @new_thread("DigAll reseed")
+        def named():
+            ran.append("named")
+
+        plain().join(5)
+        thread = named()
+        thread.join(5)
+        self.assertEqual(sorted(ran), ["named", "plain"])
+        self.assertEqual(thread.name, "DigAll reseed")
+        self.assertTrue(thread.daemon,
+                        "a plugin thread must never hold a shutdown open")
+
+    def test_versions_compare_the_way_minecraft_ones_do(self):
+        from mcdr.misc import Version
+
+        self.assertTrue(Version("1.18") < Version("1.19"))
+        self.assertTrue(Version("1.21.4") > Version("1.21"))
+        self.assertTrue(Version("1.9") < Version("1.10"),
+                        "text comparison would get this backwards")
+        self.assertEqual(Version("1.21"), Version("1.21.0"))
+
+    def test_a_version_requirement(self):
+        from mcdr.misc import VersionRequirement
+
+        self.assertTrue(VersionRequirement(">=2.1.0").accept("2.15.5"))
+        self.assertFalse(VersionRequirement(">=2.1.0").accept("2.0.5"))
+        self.assertTrue(VersionRequirement("*").accept("anything"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
