@@ -295,6 +295,26 @@ class HostCase(unittest.TestCase):
         self.assertTrue(any("SomethingNotImplementedYet" in p
                             for p in host.problems), host.problems)
 
+    def test_two_plugins_with_the_same_id_do_not_share_code(self):
+        """A mirror and a production server, seen from one machine.
+
+        Without clearing the import cache the second load silently gets the
+        first one's code, which is also why a hot reload would never take.
+        """
+        for where, greeting in ((self.tmp, "first"), (self.tmp / "other", "second")):
+            folder = Path(where) / "plugins" / "twin"
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "mcdreforged.plugin.json").write_text(
+                '{"id": "twin", "version": "1.0.0", "entrypoint": "twin"}')
+            (folder / "twin.py").write_text("GREETING = %r\n" % greeting)
+
+        first = Host(self.tmp, on_output=self.lines.append)
+        first.load_all()
+        second = Host(self.tmp / "other", on_output=self.lines.append)
+        second.load_all()
+        self.assertEqual(first.plugin_instance("twin").GREETING, "first")
+        self.assertEqual(second.plugin_instance("twin").GREETING, "second")
+
     def test_a_plugins_language_file_turns_keys_into_sentences(self):
         folder = self.tmp / "plugins" / "spoken"
         (folder / "lang").mkdir(parents=True)

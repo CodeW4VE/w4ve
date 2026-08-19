@@ -342,11 +342,26 @@ class Host:
 
         The entrypoint is a dotted module name relative to that folder, so
         `here.entry` means the `entry` module inside the `here` package.
+
+        The cache is cleared for that name first. Two plugins with the same id
+        in different folders is not hypothetical, it is what a mirror and a
+        production server look like from one machine, and without this the
+        second one silently gets the first one's code. It is also what a hot
+        reload will need.
         """
         root = str(Path(root).resolve())
         if root not in sys.path:
             sys.path.insert(0, root)
+        self._forget(plugin.entrypoint)
         return importlib.import_module(plugin.entrypoint)
+
+    @staticmethod
+    def _forget(name):
+        """Drop a module and everything under it out of the import cache."""
+        head = name.split(".")[0]
+        for cached in [n for n in sys.modules
+                       if n == head or n.startswith(head + ".")]:
+            sys.modules.pop(cached, None)
 
     def _import_archive(self, plugin):
         """A `.mcdr` or `.pyz` is a zip, and a zip can go straight on the path."""
@@ -357,7 +372,9 @@ class Host:
             sys.path.insert(0, path)
         entry = plugin.entrypoint
         if entry and any(n.startswith(entry.split(".")[0] + "/") for n in names):
+            self._forget(entry)
             return importlib.import_module(entry)
+        self._forget(plugin.id)
         return importlib.import_module(plugin.id)
 
     def unload_all(self):
@@ -365,7 +382,12 @@ class Host:
             handler = entry.handler("on_unload")
             if handler:
                 self._call(entry, "on_unload", handler, entry.interface)
+            # A plugin that is unloaded has to be gone from the import cache
+            # too, or loading it again gets the code it had before.
+            self._forget(entry.plugin.entrypoint or entry.id)
         self.loaded.clear()
+        self.commands = []
+        self._help = []
 
     # ---------------------------------------------------------------- dispatch
 
