@@ -394,16 +394,41 @@ class Server:
     # ------------------------------------------------------------------ state
 
     def _load_state(self):
-        if self.state_path.exists():
+        """Read the state, and fall back to the last good copy if it is torn.
+
+        Losing this file means w4ve no longer knows what it installed, so a
+        half written one is not a reason to start from scratch: the previous
+        copy is almost always right, and saying which one is being used beats
+        silently forgetting a server.
+        """
+        for path, what in ((self.state_path, "w4ve/state.json"),
+                           (self.state_path.with_suffix(".json.bak"),
+                            "the previous copy of w4ve/state.json")):
+            if not path.exists():
+                continue
             try:
-                return json.loads(self.state_path.read_text())
+                return json.loads(path.read_text())
             except json.JSONDecodeError:
-                note("w4ve/state.json is corrupt, starting a new one")
+                note(f"{what} is unreadable")
         return {"schema": 1, "pieces": {}}
 
     def save_state(self):
+        """Write it whole or not at all, keeping the copy it replaces.
+
+        A power cut in the middle of `write_text` leaves a truncated file, and
+        this is the file that says what the server has. Write to a temporary
+        name, flush it to the disk itself, then rename: a rename is the one
+        operation the filesystem promises is all or nothing.
+        """
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(json.dumps(self.state, indent=2) + "\n")
+        if self.state_path.exists():
+            shutil.copy2(self.state_path, self.state_path.with_suffix(".json.bak"))
+        tmp = self.state_path.with_suffix(".json.writing")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(self.state, indent=2) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self.state_path)
 
     def installed(self, pid):
         return self.state["pieces"].get(pid)
@@ -1021,6 +1046,29 @@ def check_conflicts(index, wanted, server):
 
 # ------------------------------------------------------------------- commands
 
+def check_interrupted(server):
+    """Clean up after an install that was killed, before doing anything else.
+
+    Anything that touches this server has to run this first: a half applied
+    piece is not a state anyone should be allowed to build on top of.
+    """
+    pkg = package_module()
+    if pkg is None:
+        return
+    found = pkg.interrupted(server)
+    if not found:
+        return
+    problem(f"an install of {found['piece']} {found['version']} was interrupted")
+    result = pkg.roll_back_interrupted(server)
+    if not result:
+        return
+    say(f"{Out.ok('ok')}  rolled it back: "
+        f"{len(result['undone'])} file{'s' if len(result['undone']) != 1 else ''} "
+        f"removed, {len(result['restored'])} put back")
+    for path in result["kept"]:
+        note(f"could not undo {path}, look at it by hand")
+
+
 def need_server(args):
     server = Server.find(getattr(args, "dir", None))
     if not server:
@@ -1571,7 +1619,15 @@ def cmd_doctor(args, index):
         except (OSError, subprocess.SubprocessError):
             warnings.append("no `java` on PATH to check against w4ve.toml")
 
-    # 6. the services a piece brought with it
+    # 6. an install that never finished
+    pkg = package_module()
+    found = pkg.interrupted(server) if pkg else None
+    if found:
+        problems.append(f"an install of {found['piece']} {found['version']} was "
+                        f"interrupted and never rolled back: the next `w4ve "
+                        f"install` undoes it, or `w4ve repair` right now")
+
+    # 7. the services a piece brought with it
     rt = runtime_module()
     for service in (rt.services_from(server.config) if rt else []):
         where = server.root / service["cwd"]
@@ -1632,6 +1688,8 @@ def install_packages(server, paths, args):
     if pkg is None:
         problem("this w4ve cannot read packages (package.py is missing)")
         return 2
+    if not args.dry_run:
+        check_interrupted(server)
     changed = 0
     for path in paths:
         path = Path(path)
@@ -1716,6 +1774,34 @@ def remove_package(server, pid, args, quiet=False):
             say(Out.dim(f"    services taken out of w4ve.toml: "
                         f"{', '.join(result['services'])}"))
     return 1
+
+
+def cmd_repair(args, index):
+    """Undo an install that was killed halfway, on purpose rather than by luck."""
+    pkg = package_module()
+    if pkg is None:
+        problem("this w4ve cannot read packages (package.py is missing)")
+        return 2
+    server = need_server(args)
+    found = pkg.interrupted(server)
+    if not found:
+        say(f"{Out.ok('ok')}  nothing to repair")
+        return 0
+    say(f"an install of {Out.bold(found['piece'])} {found['version']} "
+        f"never finished")
+    for step in found["steps"]:
+        if step.get("op") == "write":
+            say(Out.dim(f"    would undo {step['path']}"))
+    if args.dry_run:
+        return 0
+    if not (args.yes or ask("roll it back?", default=True)):
+        return 0
+    result = pkg.roll_back_interrupted(server)
+    say(f"{Out.ok('ok')}  {len(result['undone'])} removed, "
+        f"{len(result['restored'])} put back")
+    for path in result["kept"]:
+        note(f"could not undo {path}, look at it by hand")
+    return 0
 
 
 def cmd_pack(args, index):
@@ -1882,7 +1968,14 @@ def cmd_console(args, index):
 
     def typing():
         for line in sys.stdin:
-            client.call({"cmd": "send", "process": args.process, "text": line})
+            reply = client.call({"cmd": "send", "process": args.process,
+                                 "text": line})
+            # Over RCON the answer comes back here rather than on the console
+            # stream, so print it instead of dropping it on the floor.
+            if reply.get("ok") and reply.get("message") not in ("sent", None):
+                say(Out.dim(reply["message"]))
+            elif not reply.get("ok"):
+                problem(reply.get("message") or reply.get("error"))
 
     threading.Thread(target=typing, daemon=True).start()
     say(Out.dim("attached, Ctrl-C detaches (the server keeps running)"))
@@ -1951,7 +2044,8 @@ def report_runtime(server, rt):
         if entry.get("uptime"):
             bits.append(Out.dim(f"up {entry['uptime'] // 60}m"))
         if entry.get("pid") and not entry.get("owned"):
-            bits.append(Out.warn("adopted, no console"))
+            bits.append(Out.warn("adopted, over RCON" if entry.get("rcon")
+                                 else "adopted, no console"))
         if entry.get("give_up"):
             bits.append(Out.bad("gave up restarting it"))
         say(f"  {entry['name'].ljust(width)} {'  '.join(bits)}")
@@ -2026,6 +2120,8 @@ def build_parser():
     remove = add("remove", cmd_remove, "take a piece out")
     remove.add_argument("ids", nargs="+", help="pieces to take out")
 
+    add("repair", cmd_repair, "undo an install that was killed halfway")
+
     packing = add("pack", cmd_pack, "build a .w4ve out of a folder")
     packing.add_argument("folder", help="folder with a w4ve.json in it")
     packing.add_argument("--out", help="where to leave the package")
@@ -2068,7 +2164,7 @@ def build_parser():
     logs.add_argument("--journal", action="store_true",
                       help="the guardian journal instead of the console")
 
-    for name in ("run", "start", "stop", "console", "logs", "pack"):
+    for name in ("run", "start", "stop", "console", "logs", "pack", "repair"):
         subparsers.choices[name].set_defaults(needs_index=False)
 
     for name, sub in subparsers.choices.items():

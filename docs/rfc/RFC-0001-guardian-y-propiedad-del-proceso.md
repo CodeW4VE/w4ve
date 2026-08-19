@@ -292,6 +292,14 @@ Pendiente para cerrar el RFC contra producción:
 - El **traspaso de descriptores** (`SCM_RIGHTS`) para actualizar el guardián
   sin reiniciar el servidor. Hoy el servidor sobrevive al guardián, pero
   recupera la consola solo en el siguiente arranque hecho por W4VE.
-- RCON como canal de respaldo real: hoy, sin consola, la parada de un proceso
-  adoptado se hace con `SIGTERM` (funciona y guarda, pero es más bruto de lo
-  que promete la sección 5).
+- ~~RCON como canal de respaldo real~~ ✅ **hecho el 19 de agosto**, en
+  `rcon.py`: un servidor adoptado se para pidiéndoselo por RCON y solo se
+  recurre a las señales si no contesta, se le pueden mandar comandos con la
+  respuesta de vuelta, y `status` dice si hay RCON en vez de decir solo que no
+  hay consola. Las credenciales se leen del `server.properties` del propio
+  servidor cuando hacen falta: no se copian al estado de W4VE ni a sus logs, y
+  hay una función de redacción para que una contraseña no llegue nunca a una
+  línea de log. 13 pruebas, contra un servidor que habla el protocolo de
+  verdad, incluidas las dos partes que todo el mundo falla la primera vez: una
+  contraseña rechazada contesta con id -1, y una respuesta larga llega partida
+  en varios paquetes sin nada que marque el final.

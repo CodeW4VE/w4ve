@@ -51,6 +51,7 @@ w4ve doctor                     # what is wrong before the server finds out
 | `sync` | leave the server exactly as `w4ve.toml` says |
 | `status` | what is running, versions, available updates, pending restarts |
 | `doctor` | missing dependencies, duplicate jars, wrong Java, files changed by hand |
+| `repair` | undo an install that was killed halfway |
 
 ## Packages
 
@@ -82,8 +83,11 @@ w4ve remove mypiece                 # take out exactly what it put in
 - **Declared, not conjured.** Python dependencies are checked by `w4ve doctor`,
   against the interpreter the service will really use, so a service that would
   die on startup is known before it starts. Installing them is your call.
-- **Nothing half installed.** If a package fails partway through, what it wrote
-  is rolled back and the folder is left as it was.
+- **Nothing half installed, even if you kill it.** Every step is written to a
+  journal on disk before it happens, so a package interrupted by a crash or a
+  `SIGKILL` is found by the next command and undone: files removed, replaced
+  ones put back, services and watches taken out of `w4ve.toml`. `w4ve repair`
+  does it on purpose and `w4ve doctor` reports it.
 - **A config you edited is yours.** Components marked `keep_on_update` are
   never overwritten and never deleted by `remove`: the new default arrives as a
   `.new` file next to yours.
@@ -104,6 +108,10 @@ w4ve logs -f                    # the console, or --journal for what the guardia
 
 Three things it does on purpose:
 
+- **A server it did not start is still reachable.** With no stdin of ours the
+  fallback is RCON, read from the server's own `server.properties` when it is
+  needed and never copied into W4VE's state or logs. Stopping an adopted server
+  asks it over RCON first and only escalates to signals if nothing answers.
 - **Killing the guardian never kills the server.** Come back and it finds the
   process again by `(pid, starttime)`, reports it as `adopted, no console`, and
   does not pretend to be in control it does not have.

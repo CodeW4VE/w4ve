@@ -312,6 +312,11 @@ class Install:
     Every file written is remembered with its hash, so removing a piece takes
     out exactly what it put in, and `doctor` can tell a file somebody edited
     from a file that drifted.
+
+    Rolling back in memory only helps while this process is alive. A power cut
+    or a kill in the middle would leave half a piece on disk and nothing that
+    knows it, so every step is also written to a journal on disk before it
+    happens, and the next command to run finds it and undoes the mess.
     """
 
     def __init__(self, package, server):
@@ -321,6 +326,8 @@ class Install:
         self.written = []       # (destination, backup or None)
         self.services = []
         self.watches = []
+        self.journal_path = (Path(server.root) / "w4ve" / "run" /
+                             "install.journal")
 
     def plan(self, mc=None, side=None):
         return self.manifest.install_plan(mc or self.server.mc,
@@ -339,11 +346,22 @@ class Install:
             return root
         return root / self.server.game_dir
 
+    def _journal(self, entry):
+        """Write down what is about to happen, before it happens."""
+        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.journal_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+
     def apply(self, actions):
         record = {"version": self.manifest.version, "source": "package",
                   "files": {}, "editable": [], "services": [], "watches": [],
                   "package": self.package.name}
         pending = False
+        self._journal({"op": "begin", "piece": self.manifest.id,
+                       "version": self.manifest.version,
+                       "package": self.package.name})
         try:
             with zipfile.ZipFile(self.package) as archive:
                 for action in actions:
@@ -374,12 +392,15 @@ class Install:
                 # A config the operator edited is theirs, not ours: leave it
                 # and put the new default next to it for `doctor` to mention.
                 fresh = destination.with_suffix(destination.suffix + ".new")
+                self._journal({"op": "write", "path": str(fresh), "backup": None})
                 self._extract(archive, action["member"], fresh)
                 self.written.append((fresh, None))
                 record["files"][action["dest"] + ".new"] = sha256_of(fresh)
                 return
             backup = destination.with_suffix(destination.suffix + ".w4ve-old")
             shutil.move(str(destination), str(backup))
+        self._journal({"op": "write", "path": str(destination),
+                       "backup": str(backup) if backup else None})
         self._extract(archive, action["member"], destination)
         self.written.append((destination, backup))
         record["files"][action["dest"]] = sha256_of(destination)
@@ -397,6 +418,7 @@ class Install:
 
     def _add_service(self, action, record):
         component = action["component"]
+        self._journal({"op": "service", "name": component["name"]})
         fields = {
             "command": component["command"],
             "cwd": component.get("cwd", "."),
@@ -420,6 +442,7 @@ class Install:
 
     def _add_watch(self, action, record):
         component = action["component"]
+        self._journal({"op": "watch", "name": component["name"]})
         self.server.set_watch(component["name"], {
             "on": component["on"],
             "do": component["do"],
@@ -443,15 +466,87 @@ class Install:
         for name in self.watches:
             self.server.remove_watch(name)
         self.written, self.services, self.watches = [], [], []
+        try:
+            self.journal_path.unlink()
+        except OSError:
+            pass
 
     def commit(self):
-        """Drop the backups once the install stuck."""
+        """Drop the backups and close the journal once the install stuck."""
         for _, backup in self.written:
             if backup and backup.exists():
                 try:
                     backup.unlink()
                 except OSError:
                     pass
+        try:
+            self.journal_path.unlink()
+        except OSError:
+            pass
+
+
+def interrupted(server):
+    """Was an install killed halfway through? Return what it had got to."""
+    path = Path(server.root) / "w4ve" / "run" / "install.journal"
+    if not path.exists():
+        return None
+    steps = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            steps.append(json.loads(line))
+        except ValueError:
+            continue
+    if not steps:
+        return None
+    begin = steps[0] if steps[0].get("op") == "begin" else {}
+    return {"piece": begin.get("piece", "something"),
+            "version": begin.get("version", ""),
+            "package": begin.get("package", ""),
+            "steps": steps, "path": path}
+
+
+def roll_back_interrupted(server):
+    """Undo what a killed install had already done, and say what it undid.
+
+    This runs from the next command, not from the process that died, so the
+    only thing it can trust is the journal: which files were about to be
+    written, and what was moved out of the way to make room.
+    """
+    found = interrupted(server)
+    if not found:
+        return None
+    undone, restored, kept = [], [], []
+    for step in reversed(found["steps"]):
+        if step.get("op") == "write":
+            path = Path(step["path"])
+            backup = Path(step["backup"]) if step.get("backup") else None
+            if path.exists():
+                try:
+                    path.unlink()
+                    undone.append(str(path))
+                except OSError:
+                    kept.append(str(path))
+            if backup and backup.exists():
+                try:
+                    shutil.move(str(backup), str(path))
+                    restored.append(str(path))
+                except OSError:
+                    kept.append(str(backup))
+        elif step.get("op") == "service":
+            server.remove_service(step["name"])
+        elif step.get("op") == "watch":
+            server.remove_watch(step["name"])
+    server.state["pieces"].pop(found["piece"], None)
+    server.save_state()
+    try:
+        found["path"].unlink()
+    except OSError:
+        pass
+    return {"piece": found["piece"], "version": found["version"],
+            "undone": undone, "restored": restored, "kept": kept}
 
 
 def remove(server, piece_id):

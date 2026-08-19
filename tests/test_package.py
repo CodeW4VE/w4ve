@@ -8,6 +8,7 @@ edited.
 
 import json
 import sys
+import time
 import tempfile
 import unittest
 import zipfile
@@ -233,6 +234,123 @@ class InstallCase(unittest.TestCase):
         self.assertEqual(target.read_text(), '{"mine": true}\n')
         self.assertTrue(target.with_suffix(".json.new").exists(),
                         "the new default should arrive next to it, not over it")
+
+
+class InterruptedCase(unittest.TestCase):
+    """An install killed halfway must not leave a piece half applied.
+
+    Rolling back in memory only covers the process that is still alive. These
+    kill one for real, at the worst moment, and check that the next command
+    finds the mess and undoes it.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="w4ve-kill-"))
+        self.root = self.tmp / "server-root"
+        (self.root / "server" / "mods").mkdir(parents=True)
+        (self.root / "w4ve").mkdir()
+        (self.root / "w4ve.toml").write_text(
+            '[server]\nkind = "server"\nmc = "1.21"\ngame_dir = "server"\n\n[pieces]\n')
+        self.server = w4ve.Server(self.root)
+
+    def a_package(self):
+        data = manifest(id="halfway", components=[
+            {"kind": "mod", "file": "mod/halfway-1.0.0+1.21.jar",
+             "mc": ">=1.21 <1.21.2", "reload": "restart"},
+            {"kind": "asset", "file": "service/app.py",
+             "install_dir": "w4ve/services/halfway", "reload": "hot"},
+            {"kind": "service", "name": "halfway",
+             "command": ["python3", "app.py"], "cwd": "w4ve/services/halfway",
+             "reload": "hot"},
+        ])
+        folder = build(self.tmp / "src", data,
+                       [("mod/halfway-1.0.0+1.21.jar", "jar"),
+                        ("service/app.py", "print('hi')\n")])
+        return package.pack(folder, self.tmp)[0]
+
+    def test_the_journal_survives_the_process_that_wrote_it(self):
+        import os
+        import signal
+        import subprocess
+
+        pkg = self.a_package()
+        # Install in another process and kill it while it works. The sleep in
+        # the middle is the only way to be sure the kill lands mid install.
+        script = self.tmp / "slow_install.py"
+        script.write_text(
+            "import sys, time\n"
+            "sys.path.insert(0, %r)\n"
+            "import package, w4ve\n"
+            "server = w4ve.Server(%r)\n"
+            "install = package.Install(%r, server)\n"
+            "actions, _ = install.plan()\n"
+            "real = install._write\n"
+            "def slow(*a, **kw):\n"
+            "    real(*a, **kw)\n"
+            "    time.sleep(5)\n"
+            "install._write = slow\n"
+            "install.apply(actions)\n"
+            "install.commit()\n" % (str(ROOT), str(self.root), str(pkg)))
+        child = subprocess.Popen([sys.executable, str(script)])
+        deadline = time.time() + 15
+        jar = self.root / "server/mods/halfway-1.0.0+1.21.jar"
+        while time.time() < deadline and not jar.exists():
+            time.sleep(0.1)
+        self.assertTrue(jar.exists(), "the install never got started")
+        os.kill(child.pid, signal.SIGKILL)
+        child.wait(timeout=10)
+
+        server = w4ve.Server(self.root)
+        found = package.interrupted(server)
+        self.assertTrue(found, "nothing recorded that an install was running")
+        self.assertEqual(found["piece"], "halfway")
+
+        result = package.roll_back_interrupted(server)
+        self.assertFalse(jar.exists(), "the half installed jar is still there")
+        self.assertIn(str(jar), result["undone"])
+        self.assertIsNone(package.interrupted(w4ve.Server(self.root)),
+                          "the journal should be gone once it is undone")
+
+    def test_a_file_that_was_replaced_comes_back(self):
+        pkg = self.a_package()
+        jar = self.root / "server/mods/halfway-1.0.0+1.21.jar"
+        jar.write_text("the version that was already there")
+
+        install = package.Install(pkg, self.server)
+        actions, _ = install.plan()
+        # Blow up after the first file, the way a kill would.
+        actions[1]["member"] = "does/not/exist"
+        with self.assertRaises(KeyError):
+            install.apply(actions)
+
+        # In memory rollback already put it back; the journal must agree.
+        self.assertEqual(jar.read_text(), "the version that was already there")
+        self.assertIsNone(package.interrupted(w4ve.Server(self.root)))
+
+    def test_state_survives_a_torn_write(self):
+        self.server.state["pieces"]["something"] = {"version": "1.0.0"}
+        self.server.save_state()
+        self.server.state["pieces"]["another"] = {"version": "2.0.0"}
+        self.server.save_state()
+        # A power cut in the middle of the third write.
+        self.server.state_path.write_text('{"schema": 1, "pieces": {"br')
+
+        recovered = w4ve.Server(self.root)
+        # The copy is the state as of the write before, so the last change is
+        # gone and the record of the server is not. Losing one line beats
+        # starting from an empty file and forgetting the whole server.
+        self.assertIn("something", recovered.state["pieces"],
+                      "it should have fallen back to the previous copy")
+        self.assertNotIn("another", recovered.state["pieces"])
+
+    def test_a_normal_write_is_never_torn_in_the_first_place(self):
+        """The real defence: write to a temp name and rename over the top."""
+        self.server.state["pieces"]["thing"] = {"version": "1.0.0"}
+        self.server.save_state()
+        leftovers = list(self.server.state_path.parent.glob("*.writing"))
+        self.assertEqual(leftovers, [], "a temp file was left behind")
+        self.assertEqual(json.loads(self.server.state_path.read_text())
+                         ["pieces"]["thing"]["version"], "1.0.0")
 
 
 class VersionCase(unittest.TestCase):

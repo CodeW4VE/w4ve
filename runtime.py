@@ -26,6 +26,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    import rcon as rcon_module
+except ImportError:          # a bare runtime.py still works, minus the fallback
+    rcon_module = None
+
 SCHEMA = 1
 
 # How long we wait for a clean stop before we start escalating, and how long
@@ -238,6 +243,9 @@ class Watched:
             info["uptime"] = int(time.time() - self.started_at)
         if self.handler:
             info["capabilities"] = self.handler.capabilities()
+        if running and not self.owned and rcon_module is not None and self.handler:
+            creds, _ = rcon_module.credentials_from(self.cwd)
+            info["rcon"] = bool(creds)
         return info
 
     # ---------------------------------------------------------------- running
@@ -297,16 +305,47 @@ class Watched:
         threading.Thread(target=self._watch_foreign, daemon=True).start()
 
     def send(self, text):
-        if not self.owned or not self.proc or not self.proc.stdin:
-            return False, "no console: this process was adopted, use RCON"
         if not alive(self.pid, self.starttime):
             return False, "%s is not running" % self.name
+        if not self.owned or not self.proc or not self.proc.stdin:
+            # No stdin of ours, which is the normal state for a server we only
+            # adopted. RFC-0001 says the fallback is RCON, so use it instead of
+            # telling the caller to go and do it themselves.
+            return self.send_over_rcon(text)
         try:
             self.proc.stdin.write(text.rstrip("\n") + "\n")
             self.proc.stdin.flush()
         except (BrokenPipeError, ValueError) as exc:
             return False, "console is gone: %s" % exc
         return True, "sent"
+
+    def rcon(self):
+        """A logged-in RCON connection to this server, or why there is none."""
+        if rcon_module is None:
+            return None, "this w4ve has no rcon.py next to it"
+        if self.handler is None:
+            return None, "%s is a service, not a server: it has no RCON" % self.name
+        creds, why = rcon_module.credentials_from(self.cwd)
+        if not creds:
+            return None, why
+        try:
+            return rcon_module.Rcon(creds["host"], creds["port"],
+                                    creds["password"]).connect(), ""
+        except rcon_module.RconError as exc:
+            return None, str(exc)
+
+    def send_over_rcon(self, text):
+        console, why = self.rcon()
+        if console is None:
+            return False, "no console and no RCON: %s" % why
+        try:
+            answer = console.command(text.strip())
+        except rcon_module.RconError as exc:
+            return False, "RCON: %s" % exc
+        finally:
+            console.close()
+        self.guardian.log("%s: sent %r over RCON" % (self.name, text.strip()))
+        return True, answer.strip() or "sent over RCON"
 
     def stop(self, grace=None):
         if not alive(self.pid, self.starttime):
@@ -316,12 +355,16 @@ class Watched:
         self.asked_to_stop = True
         self._become("stopping", "stop requested")
 
-        if self.owned and self.handler:
-            self.send(self.handler.stop_command())
-        elif self.owned:
-            self.send("stop")
+        if self.owned:
+            self.send(self.handler.stop_command() if self.handler else "stop")
         else:
-            self._signal(signal.SIGTERM, "adopted process, no console")
+            # An adopted server still knows how to save itself: ask it over
+            # RCON, and only reach for signals when there is no answer.
+            asked, message = self.send_over_rcon(
+                self.handler.stop_command() if self.handler else "stop")
+            if not asked:
+                self.guardian.log("%s: %s" % (self.name, message))
+                self._signal(signal.SIGTERM, "adopted process, no console, no RCON")
 
         if self._wait_for_exit(grace):
             return True, "%s stopped" % self.name
