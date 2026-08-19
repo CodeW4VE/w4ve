@@ -117,9 +117,13 @@ moves. **Here 1.2.2 does**, unmodified and with no MCDR installed: it writes
 its config, answers `!!here` in chat, and sends the same tellraw it sends under
 MCDR, waypoint buttons and Nether conversion included.
 
-What does not work yet is said out loud: a plugin that registers commands loads
-and is told its commands cannot be routed, because the command tree is the next
-piece. A compatibility layer that pretends is worse than one with a hole in it.
+**DigAll 4.2.1 works too**: `!!dig-all status` typed in chat walks the command
+tree the plugin built, runs its callback on its own thread, and replies to the
+player who asked, in words rather than translation keys.
+
+What does not work yet is said out loud rather than hidden. A plugin reaching
+for a name this host does not carry is told which name, which turns a
+compatibility hole into a one line fix.
 
 Everything here is reimplemented from documented behaviour, never copied. MCDR
 is LGPL-3.0 and copying its code would pull that licence onto W4VE.

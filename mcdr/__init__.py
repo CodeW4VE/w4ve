@@ -18,10 +18,14 @@ Verified against a real one: Here 1.2.2, unmodified, loads with no MCDR
 installed, writes its config, answers `!!here` in chat and produces the same
 tellraw it produces under MCDR, waypoint buttons and all.
 
-What is not here yet: the command tree, so a plugin that calls
-`register_command` loads and is told its commands cannot be routed. Saying so
-is the point. A compatibility layer that pretends is worse than one with a
-hole in it.
+Also here: the command tree (`command`), so a plugin's own commands run when a
+player types them, and a plugin's `lang/` files, so its messages come out as
+sentences rather than as the keys they were looked up by.
+
+What is not here yet: permissions read from a file, plugin hot reload, and the
+MCDR commands themselves (`!!MCDR`). A plugin that reaches for a name this host
+does not carry is told which name, which turns a compatibility hole into a one
+line fix.
 """
 
 from mcdr.loader import (Plugin, discover, duplicates, load_order,  # noqa: F401

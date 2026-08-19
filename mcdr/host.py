@@ -27,6 +27,8 @@ import zipfile
 from pathlib import Path
 
 from mcdr import loader
+from mcdr.command import (AbstractNode, CommandError, CommandContext,  # noqa: F401
+                          UnknownArgument, UnknownCommand, UnknownRootArgument)
 from mcdr.info import Info, parse_server_line
 from mcdr.interface import PermissionLevel, PluginServerInterface, ServerInterface
 from mcdr.misc import FunctionThread, Version, VersionRequirement, new_thread
@@ -118,6 +120,7 @@ class Host:
         self.translations = {}
         self._executor = threading.current_thread()
         self._help = []
+        self.commands = []               # (plugin id, root node)
 
     # ------------------------------------------------------------------ output
 
@@ -160,6 +163,26 @@ class Host:
             "Version": Version,
             "VersionRequirement": VersionRequirement,
         }
+        # The command tree, which is the half of the API plugins build their
+        # commands out of. Imported here rather than at the top so the module
+        # list stays in one readable place.
+        from mcdr import command as command_module
+
+        for name in dir(command_module):
+            value = getattr(command_module, name)
+            if name[0].isupper() and isinstance(value, type):
+                names.setdefault(name, value)
+
+        # The command sources live here rather than in the tree, because they
+        # need the host to answer with. Plugins annotate their callbacks with
+        # them (`def cmd_status(source: CommandSource)`), so they have to be
+        # importable even though nothing constructs one from a plugin.
+        names.update({
+            "CommandSource": CommandSource,
+            "ConsoleCommandSource": ConsoleCommandSource,
+            "PlayerCommandSource": PlayerCommandSource,
+            "PluginCommandSource": ConsoleCommandSource,
+        })
 
         root = types.ModuleType("mcdreforged")
         root.__path__ = []
@@ -215,6 +238,40 @@ class Host:
             self.load(plugin)
         return self.loaded
 
+    def load_translations(self, plugin):
+        """Read a plugin's `lang/` folder, so its messages are words.
+
+        Without this every message a plugin sends comes out as the key it was
+        looked up by, which is technically working and useless to read. The
+        files are YAML nested by key; the subset used is flat enough to read
+        without a YAML library, which W4VE does not have and will not add for
+        this.
+        """
+        folder = Path(plugin.path)
+        if plugin.shape != "folder":
+            return 0
+        folder = folder / "lang"
+        if not folder.is_dir():
+            return 0
+        loaded = 0
+        for path in sorted(folder.iterdir()):
+            language = path.stem
+            if path.suffix in (".yml", ".yaml"):
+                mapping = _read_simple_yaml(path)
+            elif path.suffix == ".json":
+                import json as _json
+
+                try:
+                    mapping = _flatten(_json.loads(path.read_text("utf-8")))
+                except ValueError:
+                    continue
+            else:
+                continue
+            if mapping:
+                self.register_translation(language, mapping)
+                loaded += len(mapping)
+        return loaded
+
     def load(self, plugin):
         """Load one plugin, or record why it did not load.
 
@@ -248,6 +305,9 @@ class Host:
         interface = PluginServerInterface(self, plugin)
         entry = LoadedPlugin(plugin, module, interface)
         self.loaded[plugin.id] = entry
+        # Before on_load, because a plugin translates its help message inside
+        # it and would otherwise register the key instead of the sentence.
+        self.load_translations(plugin)
 
         unsupported = [name for name in dir(module)
                        if name.startswith("on_") and name not in EVENTS
@@ -309,28 +369,16 @@ class Host:
 
     # ---------------------------------------------------------------- dispatch
 
-    # Names that only exist in the command tree, which this host does not have
-    # yet. A plugin failing on one of these is not broken: it is waiting for a
-    # piece of W4VE, and the difference matters to whoever reads the report.
-    COMMAND_NAMES = ("Literal", "Text", "QuotableText", "GreedyText", "Integer",
-                     "Float", "Number", "Boolean", "Enumeration",
-                     "SimpleCommandBuilder", "CountingLiteral", "ArgumentNode",
-                     "AbstractNode", "CommandContext", "CommandSource",
-                     "ParseResult", "IllegalArgument", "InvalidEnumeration")
-
     def _call(self, entry, event, handler, *args):
         """Call one plugin's handler, and never let it take the host down."""
         try:
             handler(*args)
         except NameError as exc:
-            wanted = str(exc).split("'")[1] if "'" in str(exc) else ""
-            if wanted in self.COMMAND_NAMES:
-                self.problems.append("%s uses the command tree (%s), which "
-                                     "this host does not have yet"
-                                     % (entry.id, wanted))
-            else:
-                self.problems.append("%s failed in %s: NameError: %s"
-                                     % (entry.id, event, exc))
+            # A name the fake `mcdreforged` module does not carry yet. Saying
+            # which one turns "it does not work" into a one line fix.
+            wanted = str(exc).split("'")[1] if "'" in str(exc) else "?"
+            self.problems.append("%s uses %s, which this host does not provide "
+                                 "yet" % (entry.id, wanted))
         except Exception as exc:
             self.problems.append("%s failed in %s: %s: %s"
                                  % (entry.id, event, type(exc).__name__, exc))
@@ -355,7 +403,17 @@ class Host:
         self.dispatch("on_info", info)
         if info.is_user:
             self.dispatch("on_user_info", info)
+            # A registered command is offered the line after the events, the
+            # way MCDR does it: a plugin listening on on_info sees everything,
+            # and a command only fires on what it claims.
+            self.run_command(self.source_for(info), info.content)
         return info
+
+    def source_for(self, info):
+        """Who is speaking, as something a plugin can reply to."""
+        if info.is_player:
+            return PlayerCommandSource(self, info.player)
+        return ConsoleCommandSource(self)
 
     def dispatch_custom(self, event, args):
         for entry in list(self.loaded.values()):
@@ -440,11 +498,40 @@ class Host:
 
     def register_command(self, plugin_id, root_node):
         entry = self.loaded.get(plugin_id)
-        if entry is not None:
-            entry.commands.append(root_node)
-        # Dispatching these needs the command tree, which is the next piece.
-        self.problems.append("%s registered a command, and this host cannot "
-                             "route commands yet" % plugin_id)
+        if entry is None:
+            return
+        entry.commands.append(root_node)
+        self.commands.append((plugin_id, root_node))
+
+    def run_command(self, source, line):
+        """Give a command line to whichever plugin claims its first word.
+
+        Returns True if a plugin ran something. A tree that raises an error it
+        did not handle is reported against the plugin that owns it, and the
+        others still get their turn, because one plugin's bad branch must not
+        eat somebody else's command.
+        """
+        line = (line or "").strip()
+        if not line:
+            return False
+        ran = False
+        for plugin_id, root in list(self.commands):
+            if not root._could_match(line):
+                continue
+            try:
+                if root.execute(source, line):
+                    ran = True
+            except CommandError as error:
+                if not error.is_handled():
+                    self.logger_for(plugin_id).warning(
+                        "%s: %s" % (type(error).__name__,
+                                    error.to_mcdr_string()))
+                ran = True
+            except Exception:
+                self.logger_for(plugin_id).exception(
+                    "error running %r" % line)
+                ran = True
+        return ran
 
     def register_listener(self, plugin_id, event, callback, priority=None):
         self.problems.append("%s registered a listener for %r, which this host "
@@ -460,12 +547,17 @@ class Host:
         return key in self.translations.get(language or self.language, {})
 
     def translate(self, key, *args, **kwargs):
-        text = self.translations.get(self.language, {}).get(key)
+        table = self.translations.get(self.language) or {}
+        text = table.get(key)
+        if text is None and self.language != "en_us":
+            text = (self.translations.get("en_us") or {}).get(key)
         if text is None:
+            # Saying the key is the honest failure: it is searchable, and it
+            # tells whoever reads it which language file is missing a line.
             return key
         try:
             return text.format(*args, **kwargs)
-        except (IndexError, KeyError):
+        except (IndexError, KeyError, ValueError):
             return text
 
     def plugin_instance(self, plugin_id):
@@ -501,6 +593,49 @@ class Host:
 
     def plugin_command_source(self):
         return ConsoleCommandSource(self)
+
+
+def _flatten(data, prefix=""):
+    """`{'a': {'b': 'x'}}` becomes `{'a.b': 'x'}`, which is how keys are used."""
+    out = {}
+    for key, value in (data or {}).items():
+        path = "%s.%s" % (prefix, key) if prefix else str(key)
+        if isinstance(value, dict):
+            out.update(_flatten(value, path))
+        else:
+            out[path] = value
+    return out
+
+
+def _read_simple_yaml(path):
+    """Enough YAML for a language file, which is all nesting and strings.
+
+    Not a YAML parser and not pretending to be one: keys, two space nesting,
+    and quoted or bare scalars. A language file that needs more than this is a
+    language file doing something a language file should not.
+    """
+    out, stack = {}, []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        line = raw.strip()
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        if not value:
+            stack.append((indent, key))
+            continue
+        if value[:1] in ('"', "'") and value[-1:] == value[:1] and len(value) > 1:
+            value = value[1:-1]
+            # The files escape quotes and newlines the way JSON does.
+            value = value.replace('\\"', '"').replace("\\n", "\n")
+        path_key = ".".join([k for _, k in stack] + [key])
+        out[path_key] = value
+    return out
 
 
 class ServerInformation:
@@ -547,6 +682,15 @@ class CommandSource:
 
     def __init__(self, host):
         self._host = host
+
+    def get_server(self):
+        """The interface, so a callback can reach the server from a source.
+
+        DigAll does `source.get_server()` inside a command rather than closing
+        over the interface it was handed in on_load, which is common enough
+        that a source without this is a source that does not work.
+        """
+        return ServerInterface._instance
 
     @property
     def is_player(self):

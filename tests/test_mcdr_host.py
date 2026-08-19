@@ -216,16 +216,63 @@ class HostCase(unittest.TestCase):
 
     # ------------------------------------------------------------- honesty
 
-    def test_a_command_registration_is_admitted_as_unsupported(self):
+    def test_a_registered_command_runs_when_somebody_types_it(self):
+        """The shape DigAll builds: a prefix with two literals under it."""
+        (self.tmp / "plugins" / "commander.py").write_text(
+            "from mcdreforged.api.all import *\n"
+            "PLUGIN_METADATA = {'id': 'commander', 'version': '1.0.0'}\n"
+            "ran = []\n"
+            "def on_load(server, old):\n"
+            "    server.register_command(\n"
+            "        Literal('!!cmd')\n"
+            "        .runs(lambda src: ran.append('root'))\n"
+            "        .then(Literal('status')\n"
+            "              .runs(lambda src: src.reply('all good')))\n"
+            "        .then(Literal('give')\n"
+            "              .then(Integer('n')\n"
+            "                    .runs(lambda src, ctx: ran.append(ctx['n'])))))\n")
+        host = self.host()
+        self.assertEqual(host.problems, [])
+
+        host.feed_line("[14:32:10] [Server thread/INFO]: <TVTvirus> !!cmd")
+        host.feed_line("[14:32:10] [Server thread/INFO]: <TVTvirus> !!cmd give 42")
+        module = host.plugin_instance("commander")
+        self.assertEqual(module.ran, ["root", 42])
+
+    def test_a_command_reply_reaches_the_player_who_typed_it(self):
         (self.tmp / "plugins" / "commander.py").write_text(
             "from mcdreforged.api.all import *\n"
             "PLUGIN_METADATA = {'id': 'commander', 'version': '1.0.0'}\n"
             "def on_load(server, old):\n"
-            "    server.register_command(None)\n")
+            "    server.register_command(Literal('!!cmd').runs(\n"
+            "        lambda src: src.reply(RText('all good', RColor.green))))\n")
         host = self.host()
-        self.assertIn("commander", host.plugin_ids())
-        self.assertTrue(any("cannot route commands yet" in p
-                            for p in host.problems), host.problems)
+        host.feed_line("[14:32:10] [Server thread/INFO]: <Karla> !!cmd")
+        answer = self.server.sent[-1]
+        self.assertTrue(answer.startswith("tellraw Karla "),
+                        "a reply goes to whoever asked, not to everyone")
+        self.assertEqual(json.loads(answer[len("tellraw Karla "):])["color"],
+                         "green")
+
+    def test_one_plugin_bad_command_does_not_eat_another_plugin_command(self):
+        (self.tmp / "plugins" / "grumpy.py").write_text(
+            "from mcdreforged.api.all import *\n"
+            "PLUGIN_METADATA = {'id': 'grumpy', 'version': '1.0.0'}\n"
+            "def boom(src):\n"
+            "    raise RuntimeError('this plugin is broken')\n"
+            "def on_load(server, old):\n"
+            "    server.register_command(Literal('!!boom').runs(boom))\n")
+        (self.tmp / "plugins" / "fine.py").write_text(
+            "from mcdreforged.api.all import *\n"
+            "PLUGIN_METADATA = {'id': 'fine', 'version': '1.0.0'}\n"
+            "ran = []\n"
+            "def on_load(server, old):\n"
+            "    server.register_command(\n"
+            "        Literal('!!fine').runs(lambda src: ran.append('yes')))\n")
+        host = self.host()
+        host.feed_line("[14:32:10] [Server thread/INFO]: <TVTvirus> !!boom")
+        host.feed_line("[14:32:10] [Server thread/INFO]: <TVTvirus> !!fine")
+        self.assertEqual(host.plugin_instance("fine").ran, ["yes"])
 
     def test_a_missing_pip_module_is_not_called_a_compatibility_hole(self):
         """MinecraftDataAPI needs hjson. That is its problem, not ours."""
@@ -237,15 +284,32 @@ class HostCase(unittest.TestCase):
         self.assertTrue(found, host.problems)
         self.assertIn("the plugin's own dependency", found[0])
 
-    def test_a_plugin_waiting_on_the_command_tree_says_that(self):
-        (self.tmp / "plugins" / "commands.py").write_text(
+    def test_a_name_the_host_does_not_have_is_named(self):
+        """The hole gets pointed at, which turns it into a one line fix."""
+        (self.tmp / "plugins" / "future.py").write_text(
             "from mcdreforged.api.all import *\n"
-            "PLUGIN_METADATA = {'id': 'commands', 'version': '1.0.0'}\n"
+            "PLUGIN_METADATA = {'id': 'future', 'version': '1.0.0'}\n"
             "def on_load(server, old):\n"
-            "    server.register_command(Literal('!!x'))\n")
+            "    SomethingNotImplementedYet()\n")
         host = self.host()
-        self.assertTrue(any("command tree (Literal)" in p
+        self.assertTrue(any("SomethingNotImplementedYet" in p
                             for p in host.problems), host.problems)
+
+    def test_a_plugins_language_file_turns_keys_into_sentences(self):
+        folder = self.tmp / "plugins" / "spoken"
+        (folder / "lang").mkdir(parents=True)
+        (folder / "mcdreforged.plugin.json").write_text(
+            '{"id": "spoken", "version": "1.0.0", "entrypoint": "spoken"}')
+        (folder / "spoken.py").write_text(
+            "from mcdreforged.api.all import *\n"
+            "def on_load(server, old):\n"
+            "    server.register_help_message('!!s', server.tr('spoken.help'))\n")
+        (folder / "lang" / "en_us.yml").write_text(
+            'spoken:\n  help: "say something useful"\n')
+        host = self.host()
+        messages = [h["message"] for h in host.help_messages
+                    if h["plugin"] == "spoken"]
+        self.assertEqual(messages, ["say something useful"])
 
     def test_the_singleton_a_plugin_reaches_for_at_module_level(self):
         """DigAll's tr() helper calls ServerInterface.get_instance()."""
