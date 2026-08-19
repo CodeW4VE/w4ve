@@ -465,13 +465,20 @@ class Server:
         comment and change by hand, in the same file as everything else about
         this server.
         """
+        self._set_block("services", name, fields, owner)
+
+    def set_watch(self, name, fields, owner=""):
+        """Same idea for `[watch.<name>]`: a line to look for and what to do."""
+        self._set_block("watch", name, fields, owner)
+
+    def _set_block(self, section, name, fields, owner=""):
         if not self.config_path.exists():
             return
         text = self.config_path.read_text(encoding="utf-8")
-        if re.search(rf"^\[services\.{re.escape(name)}\]", text, re.M):
-            self.remove_service(name)
+        if re.search(rf"^\[{section}\.{re.escape(name)}\]", text, re.M):
+            self._remove_block(section, name)
             text = self.config_path.read_text(encoding="utf-8")
-        header = f"[services.{name}]"
+        header = f"[{section}.{name}]"
         if owner:
             header += f"  # installed by {owner}"
         lines = [header]
@@ -484,13 +491,19 @@ class Server:
         self.config = read_toml(self.config_path)
 
     def remove_service(self, name):
+        self._remove_block("services", name)
+
+    def remove_watch(self, name):
+        self._remove_block("watch", name)
+
+    def _remove_block(self, section, name):
         """Take the block out, and only that block."""
         if not self.config_path.exists():
             return
         lines = self.config_path.read_text(encoding="utf-8").splitlines()
         start = None
         for i, line in enumerate(lines):
-            if re.match(rf"^\[services\.{re.escape(name)}\]", line.strip()):
+            if re.match(rf"^\[{section}\.{re.escape(name)}\]", line.strip()):
                 start = i
                 break
         if start is None:
@@ -1643,6 +1656,10 @@ def install_packages(server, paths, args):
             if action["kind"] == "service":
                 say(f"  service   {action['name']}  "
                     + Out.dim(" ".join(action["component"]["command"])))
+            elif action["kind"] == "watch":
+                component = action["component"]
+                say(f"  watch     {action['name']}  "
+                    + Out.dim(f"on {component['on']} -> {component['do']}"))
             else:
                 say(f"  {action['kind'].ljust(9)} {action['dest']}  "
                     + Out.dim(action["reload"]))
@@ -1670,6 +1687,9 @@ def install_packages(server, paths, args):
             say(Out.dim(f"    services in w4ve.toml: "
                         f"{', '.join(record['services'])}"))
             say(Out.dim("    `w4ve run` watches them like it watches the server"))
+        for name in record.get("watches") or []:
+            entry = (server.config.get("watch") or {}).get(name) or {}
+            say(Out.dim(f"    watch {name}: {entry.get('why') or entry.get('on')}"))
     return report_pending(server, changed, args)
 
 
@@ -1713,10 +1733,14 @@ def cmd_pack(args, index):
     size = target.stat().st_size
     say(f"{Out.ok('ok')}  {target}  ({size // 1024} KB)")
     for component in manifest.components:
-        if component.get("kind") == "service":
+        kind = component.get("kind", "?")
+        if kind == "service":
             say(Out.dim(f"    service  {component['name']}"))
+        elif kind == "watch":
+            say(Out.dim(f"    watch    {component['name']}  "
+                        f"-> {component.get('do')}"))
         else:
-            say(Out.dim(f"    {component['kind'].ljust(8)} {component['file']}"))
+            say(Out.dim(f"    {kind.ljust(8)} {component.get('file', '?')}"))
     return 0
 
 
@@ -1755,7 +1779,8 @@ def runtime_pieces(server, rt):
             command, game_dir,
             flavor=section.get("flavor"),
             stop_grace=int(section.get("stop_grace") or rt.STOP_GRACE),
-            restart=section.get("restart_policy") or "never")
+            restart=section.get("restart_policy") or "never",
+            watches=rt.watches_from(server.config))
     for service in rt.services_from(server.config):
         guardian.add_service(service["name"], service["command"],
                              server.root / service["cwd"], service["restart"],

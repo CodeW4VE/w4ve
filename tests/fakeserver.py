@@ -28,6 +28,8 @@ def main():
     ap.add_argument("--ignore-stop", action="store_true")
     ap.add_argument("--ignore-term", action="store_true")
     ap.add_argument("--flavor", default="fabric")
+    ap.add_argument("--ask-restart-after", type=float,
+                    help="print a piece's restart marker and exit, like RegionCast")
     args = ap.parse_args()
 
     if args.ignore_term:
@@ -43,6 +45,11 @@ def main():
         if args.crash_after and time.time() - started > args.crash_after:
             out(stamp("something went very wrong"))
             sys.exit(1)
+        if (args.ask_restart_after
+                and time.time() - started > args.ask_restart_after):
+            out(stamp("[RegionCast] copying region files"))
+            out(stamp("[RegionCast] RESTART_REQUESTED"))
+            sys.exit(0)
         # Never block on stdin: a server that only reacts when someone types
         # would never get around to crashing on its own.
         if not select.select([sys.stdin], [], [], 0.1)[0]:

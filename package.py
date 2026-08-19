@@ -36,6 +36,7 @@ KINDS = {
     "resourcepack": "resourcepacks",
     "asset": "w4ve/assets",
     "service": None,          # a process, not a file
+    "watch": None,            # a line to look for, and what to do about it
     "plugin": "plugins",
 }
 
@@ -130,6 +131,9 @@ class Manifest:
             if kind == "service":
                 out.extend("%s: %s" % (where, p)
                            for p in service_problems(component))
+            elif kind == "watch":
+                out.extend("%s: %s" % (where, p)
+                           for p in watch_problems(component))
             elif not component.get("file"):
                 out.append("%s: no file" % where)
             elif component["file"].startswith("/") or ".." in component["file"]:
@@ -178,9 +182,9 @@ class Manifest:
             kind = component.get("kind")
             if kind == "mod" and component not in mods:
                 continue
-            if kind == "service":
+            if kind in ("service", "watch"):
                 actions.append({
-                    "kind": "service",
+                    "kind": kind,
                     "name": component["name"],
                     "component": component,
                     "reload": component.get("reload", "hot"),
@@ -196,6 +200,37 @@ class Manifest:
                 "component": component,
             })
         return actions, problems
+
+
+WATCH_ACTIONS = ("restart", "note")
+
+
+def watch_problems(component):
+    """A watch is a line to look for on the console, and what to do about it.
+
+    This is what lets RegionCast stop needing an MCDR plugin of its own. The
+    mod stops the server to copy region files and prints one line on the way
+    out asking to come back; under MCDR that costs a plugin, because MCDR shuts
+    down with the server. The guardian already reads the console and already
+    knows how to start a server, so the piece can just say so.
+    """
+    out = []
+    if not component.get("name"):
+        out.append("a watch needs a name")
+    elif not ID_RE.match(component["name"]):
+        out.append("watch name %r is not lowercase letters, digits and dashes"
+                   % component["name"])
+    if not component.get("on"):
+        out.append("a watch needs `on`, the line to look for")
+    else:
+        try:
+            re.compile(component["on"])
+        except re.error as exc:
+            out.append("`on` is not a valid pattern: %s" % exc)
+    if component.get("do") not in WATCH_ACTIONS:
+        out.append("`do` is %r, not one of %s"
+                   % (component.get("do"), ", ".join(WATCH_ACTIONS)))
+    return out
 
 
 def service_problems(component):
@@ -285,6 +320,7 @@ class Install:
         self.manifest = read_manifest(package)
         self.written = []       # (destination, backup or None)
         self.services = []
+        self.watches = []
 
     def plan(self, mc=None, side=None):
         return self.manifest.install_plan(mc or self.server.mc,
@@ -305,7 +341,7 @@ class Install:
 
     def apply(self, actions):
         record = {"version": self.manifest.version, "source": "package",
-                  "files": {}, "editable": [], "services": [],
+                  "files": {}, "editable": [], "services": [], "watches": [],
                   "package": self.package.name}
         pending = False
         try:
@@ -313,6 +349,9 @@ class Install:
                 for action in actions:
                     if action["kind"] == "service":
                         self._add_service(action, record)
+                        continue
+                    if action["kind"] == "watch":
+                        self._add_watch(action, record)
                         continue
                     destination = self.base_for(action["dest"]) / action["dest"]
                     self._write(archive, action, destination, record)
@@ -379,6 +418,16 @@ class Install:
         record["services"].append(component["name"])
         self.services.append(component["name"])
 
+    def _add_watch(self, action, record):
+        component = action["component"]
+        self.server.set_watch(component["name"], {
+            "on": component["on"],
+            "do": component["do"],
+            "why": component.get("why", ""),
+        }, owner=self.manifest.id)
+        record.setdefault("watches", []).append(component["name"])
+        self.watches.append(component["name"])
+
     def rollback(self):
         """Put the folder back the way it was, then complain upwards."""
         for destination, backup in reversed(self.written):
@@ -391,7 +440,9 @@ class Install:
                 pass
         for name in self.services:
             self.server.remove_service(name)
-        self.written, self.services = [], []
+        for name in self.watches:
+            self.server.remove_watch(name)
+        self.written, self.services, self.watches = [], [], []
 
     def commit(self):
         """Drop the backups once the install stuck."""
@@ -430,7 +481,10 @@ def remove(server, piece_id):
         gone.append(relative)
     for name in entry.get("services") or []:
         server.remove_service(name)
+    for name in entry.get("watches") or []:
+        server.remove_watch(name)
     del server.state["pieces"][piece_id]
     server.save_state()
     return {"removed": gone, "changed": changed, "missing": missing,
-            "services": entry.get("services") or []}
+            "services": entry.get("services") or [],
+            "watches": entry.get("watches") or []}

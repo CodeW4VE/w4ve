@@ -231,6 +231,75 @@ class GuardianCase(unittest.TestCase):
                           "with no health check, readiness is unknown")
 
 
+class WatchCase(unittest.TestCase):
+    """A piece can ask for a restart, and stop needing a plugin to get one."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="w4ve-watch-"))
+        self.guardian = runtime.Guardian(self.tmp)
+        got_it, _ = self.guardian.claim()
+        self.assertTrue(got_it)
+
+    def tearDown(self):
+        self.guardian.shutdown()
+        self.guardian.release()
+
+    def test_the_server_comes_back_when_the_piece_asks(self):
+        watches = [{"name": "regioncast-restart",
+                    "on": r"\[RegionCast\] RESTART_REQUESTED",
+                    "do": "restart",
+                    "why": "it stops the server to copy region files"}]
+        server = self.guardian.add_server(
+            [sys.executable, FAKE, "--boot", "0.2", "--ask-restart-after", "1"],
+            str(self.tmp), flavor="fabric", watches=watches)
+        server.start()
+        first = wait_for(lambda: server.pid if server.state == "running" else None)
+        self.assertTrue(first)
+
+        second = wait_for(lambda: (server.pid if server.pid != first
+                                   and server.state == "running" else None),
+                          timeout=30)
+        self.assertTrue(second, "it never came back up")
+        self.assertNotEqual(second, first)
+        journal = (self.tmp / "w4ve" / "run" / "journal.log").read_text()
+        self.assertIn("matched 'regioncast-restart'", journal)
+        self.assertIn("asked it to come back", journal)
+        # It was not a crash, so nothing counts against the crash budget.
+        self.assertEqual(server.deaths, [])
+        self.assertFalse(server.give_up)
+        server.stop()
+
+
+class SocketPathCase(unittest.TestCase):
+    """A server folder nested deep still gets a control socket.
+
+    Unix socket paths live in a fixed size field, about 108 bytes, and a real
+    server under a container volume path plus a temp prefix goes over it. This
+    used to blow up in a thread and leave the guardian running with no way to
+    talk to it, which looks exactly like everything being fine.
+    """
+
+    def test_a_long_path_moves_the_socket_somewhere_short(self):
+        deep = Path(tempfile.mkdtemp(prefix="w4ve-long-"))
+        deep = deep / ("nested/" * 12)
+        run_dir = deep / "w4ve" / "run"
+        run_dir.mkdir(parents=True)
+        chosen = runtime.control_socket_for(run_dir)
+        self.assertNotEqual(chosen.parent, run_dir)
+        self.assertLessEqual(len(str(chosen)), runtime.SOCK_MAX)
+        self.assertEqual(runtime.control_socket_of(deep), chosen,
+                         "the client has to find the socket the guardian used")
+
+    def test_a_normal_path_keeps_the_socket_next_to_everything_else(self):
+        root = Path(tempfile.mkdtemp(prefix="w4ve-short-"))
+        run_dir = root / "w4ve" / "run"
+        run_dir.mkdir(parents=True)
+        self.assertEqual(runtime.control_socket_for(run_dir),
+                         run_dir / "control.sock")
+        self.assertEqual(runtime.control_socket_of(root),
+                         run_dir / "control.sock")
+
+
 class HandlerCase(unittest.TestCase):
 
     def test_ready_lines_of_both_flavors(self):

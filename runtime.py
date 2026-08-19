@@ -12,6 +12,7 @@ needs Python newer than 3.9, because that is what the mirror runs.
 
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,7 @@ import shlex
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -176,7 +178,7 @@ class Watched:
 
     def __init__(self, name, command, cwd, guardian, handler=None,
                  restart="never", stop_grace=STOP_GRACE, health=None,
-                 health_every=30):
+                 health_every=30, watches=()):
         self.name = name
         self.command = command
         self.cwd = Path(cwd)
@@ -186,6 +188,9 @@ class Watched:
         self.stop_grace = stop_grace
         self.health = health            # a URL, for things with no console
         self.health_every = health_every
+        # Lines a piece asked us to look for, and what to do about them.
+        self.watches = [dict(w) for w in watches]
+        self.asked_to_come_back = False
 
         self.proc = None
         self.pid = None
@@ -368,6 +373,7 @@ class Watched:
                     console = open(str(self.console_path), "a", buffering=1)
                 console.write(line + "\n")
                 self.guardian.broadcast(self.name, line)
+                self._check_watches(line)
                 if self.handler:
                     if self.state == "starting" and self.handler.ready(line):
                         self.ready = True
@@ -379,6 +385,30 @@ class Watched:
             pass
         finally:
             console.close()
+
+    def _check_watches(self, line):
+        """Act on the lines a piece told us to look for.
+
+        A piece that stops the server on purpose (RegionCast copies region
+        files while it is down) can ask for it to come back, instead of the
+        operator installing a plugin whose whole job is that one line. The
+        restart is not automatic policy, it is a request from the piece that is
+        doing the work, and it is written to the journal either way.
+        """
+        for watch in self.watches:
+            try:
+                if not re.search(watch["on"], line):
+                    continue
+            except re.error:
+                continue
+            why = watch.get("why") or watch.get("name", "a watch")
+            self.guardian.log("%s: matched %r (%s)"
+                              % (self.name, watch.get("name", "?"), why))
+            if watch.get("do") == "restart":
+                # The stop that follows is expected, so it is not a crash and
+                # does not count against the crash-loop budget.
+                self.asked_to_stop = True
+                self.asked_to_come_back = True
 
     def _poll_health(self):
         import urllib.error
@@ -413,7 +443,13 @@ class Watched:
         code = self.proc.wait()
         self.exit_code = code
         self.ready = False
-        if self.asked_to_stop or self.state in ("stopping", "killed"):
+        if self.asked_to_come_back:
+            self.asked_to_come_back = False
+            self._become("stopped", "exit %d, a piece asked it to come back" % code)
+            time.sleep(1)
+            ok, message = self.start()
+            self.guardian.log(message)
+        elif self.asked_to_stop or self.state in ("stopping", "killed"):
             self._become("stopped", "exit %d" % code)
         else:
             self._note_death()
@@ -449,6 +485,47 @@ class Watched:
 
 # -------------------------------------------------------------------- guardian
 
+# A Unix socket path lives in a fixed size field in the kernel, 108 bytes with
+# the trailing zero, and a server folder nested deep enough goes over it. Before
+# this was handled the bind blew up in a thread and the guardian ran on with no
+# control socket at all: alive, working, and unreachable. Anything that walks a
+# path length limit has to fail loudly or route around it.
+SOCK_MAX = 100
+
+
+def control_socket_for(run_dir):
+    """Where this server's control socket lives, short enough to bind.
+
+    Normally right next to the other runtime files. When that path is too long
+    for the kernel, in a temp directory instead, and `control.sock.path` in the
+    run folder says where it went so clients can still find it.
+    """
+    run_dir = Path(run_dir)
+    natural = run_dir / "control.sock"
+    if len(str(natural)) <= SOCK_MAX:
+        return natural
+    digest = hashlib.sha1(str(run_dir.resolve()).encode()).hexdigest()[:16]
+    short = Path(tempfile.gettempdir()) / ("w4ve-%s.sock" % digest)
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "control.sock.path").write_text(str(short) + "\n")
+    except OSError:
+        pass
+    return short
+
+
+def control_socket_of(root):
+    """The client side of the same question."""
+    run_dir = Path(root) / "w4ve" / "run"
+    pointer = run_dir / "control.sock.path"
+    if pointer.exists():
+        try:
+            return Path(pointer.read_text().strip())
+        except OSError:
+            pass
+    return run_dir / "control.sock"
+
+
 class Guardian:
     """One per server directory, and the lock file makes sure of it."""
 
@@ -459,7 +536,7 @@ class Guardian:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.journal = self.run_dir / "journal.log"
         self.state_path = self.run_dir / "state.json"
-        self.sock_path = self.run_dir / "control.sock"
+        self.sock_path = control_socket_for(self.run_dir)
         self.lock_path = self.run_dir / "lock"
         self.lock_fd = None
         self.watched = {}
@@ -542,11 +619,11 @@ class Guardian:
     # ------------------------------------------------------------- the server
 
     def add_server(self, command, game_dir, flavor=None, stop_grace=STOP_GRACE,
-                   restart="never"):
+                   restart="never", watches=()):
         flavor = flavor or detect_flavor(game_dir)
         proc = Watched("server", command, game_dir, self,
                        handler=handler_for(flavor), restart=restart,
-                       stop_grace=stop_grace)
+                       stop_grace=stop_grace, watches=watches)
         self.watched["server"] = proc
         return proc
 
@@ -602,7 +679,17 @@ class Guardian:
         if self.sock_path.exists():
             self.sock_path.unlink()
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(str(self.sock_path))
+        try:
+            server.bind(str(self.sock_path))
+        except OSError as exc:
+            # Say it in the journal and on the way out. A guardian nobody can
+            # talk to is worse than one that refuses to start, because it looks
+            # like it is working.
+            self.log("cannot open the control socket at %s: %s"
+                     % (self.sock_path, exc))
+            server.close()
+            self.shutdown(stop_processes=False)
+            raise
         os.chmod(str(self.sock_path), 0o660)
         server.listen(8)
         server.settimeout(0.5)
@@ -740,7 +827,7 @@ class Client:
 
     def __init__(self, root):
         self.root = Path(root).resolve()
-        self.sock_path = self.root / "w4ve" / "run" / "control.sock"
+        self.sock_path = control_socket_of(self.root)
 
     def connected(self):
         """Is there a guardian, really?
@@ -846,6 +933,21 @@ def server_command(config, root, game_dir):
             java = str((config.get("server") or {}).get("java_bin") or "java")
             return [java, "-jar", candidate, "nogui"]
     return None
+
+
+def watches_from(config):
+    """Read `[watch.<name>]` blocks: a line to look for, and what to do."""
+    out = []
+    for name, entry in (config.get("watch") or {}).items():
+        if not isinstance(entry, dict) or not entry.get("on"):
+            continue
+        out.append({
+            "name": name,
+            "on": entry["on"],
+            "do": entry.get("do", "note"),
+            "why": entry.get("why", ""),
+        })
+    return out
 
 
 def services_from(config):

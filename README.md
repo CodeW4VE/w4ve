@@ -73,6 +73,12 @@ w4ve remove mypiece                 # take out exactly what it put in
   health URL. It lands as a `[services.<name>]` block in your `w4ve.toml`, with
   a comment saying which piece put it there, and the guardian watches it like
   it watches the server.
+- **A piece can ask for a restart.** A `watch` component says which console
+  line to look for and what to do about it. RegionCast stops the server to copy
+  region files and prints one line asking to come back; under MCDR that costs a
+  plugin whose entire job is that line, and here it is three fields in the
+  manifest. The restart is a request from the piece doing the work, it goes in
+  the journal, and it does not count as a crash.
 - **Declared, not conjured.** Python dependencies are checked by `w4ve doctor`,
   against the interpreter the service will really use, so a service that would
   die on startup is known before it starts. Installing them is your call.
