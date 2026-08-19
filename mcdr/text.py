@@ -82,6 +82,39 @@ class RTextBase:
     def from_any(value):
         return value if isinstance(value, RTextBase) else RText(value)
 
+    @staticmethod
+    def format(template, *args, **kwargs):
+        """`'{} -> {}'.format(...)` where the arguments are text objects.
+
+        A plain `str.format` would flatten an RText into its plain text and
+        throw away the colour, the hover and the click. This keeps them: the
+        template is split around its placeholders and the pieces are stitched
+        back together as a list.
+
+        Here uses it for the nether coordinate conversion, which is how it
+        surfaced: without this, the arrow between two dimensions loses the
+        hover that says what it converts.
+        """
+        placeholders = []
+
+        class Slot:
+            def __init__(self, value):
+                self.value = value
+
+            def __format__(self, spec):
+                placeholders.append(self.value)
+                return "\0%d\0" % (len(placeholders) - 1)
+
+        marked = str(template).format(*[Slot(a) for a in args],
+                                      **{k: Slot(v) for k, v in kwargs.items()})
+        result = RTextList()
+        for part in marked.split("\0"):
+            if part.isdigit() and int(part) < len(placeholders):
+                result.append(placeholders[int(part)])
+            elif part:
+                result.append(RText(part))
+        return result
+
 
 class RText(RTextBase):
     """One piece of text with a colour, some styles and maybe an action."""

@@ -100,6 +100,7 @@ already run, so the first thing it learned is how to read them.
 
 ```sh
 w4ve plugins                    # every plugin, its version, and what is wrong
+w4ve plugins --load             # actually load them, to see which ones run
 ```
 
 It reads the four shapes a plugin comes in (a `.py` file, a folder with a
@@ -109,6 +110,16 @@ loading it. It works out the order dependencies force, and it says the things
 that only show up in a real server folder: two copies of the same plugin, a
 dependency nobody installed, a backup that is not a plugin, a file that does
 not parse.
+
+`--load` is the rehearsal for a cutover: the plugins are loaded for real,
+against nothing, so you find out which ones run under W4VE before anything
+moves. **Here 1.2.2 does**, unmodified and with no MCDR installed: it writes
+its config, answers `!!here` in chat, and sends the same tellraw it sends under
+MCDR, waypoint buttons and Nether conversion included.
+
+What does not work yet is said out loud: a plugin that registers commands loads
+and is told its commands cannot be routed, because the command tree is the next
+piece. A compatibility layer that pretends is worse than one with a hole in it.
 
 Everything here is reimplemented from documented behaviour, never copied. MCDR
 is LGPL-3.0 and copying its code would pull that licence onto W4VE.

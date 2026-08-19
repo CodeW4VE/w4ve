@@ -1865,6 +1865,9 @@ def cmd_plugins(args, index):
         note("MCDR keeps plugins in `plugins/` at the root of the server")
         return 1
 
+    if args.load:
+        return load_plugins(server, folder)
+
     found = mcdr.report(folder)
     plugins = found["plugins"]
     if not plugins:
@@ -1892,6 +1895,48 @@ def cmd_plugins(args, index):
     say(f"{len(plugins)} plugin{'s' if len(plugins) != 1 else ''}, "
         f"{len(found['problems'])} problem{'s' if len(found['problems']) != 1 else ''}")
     return 1 if found["problems"] else 0
+
+
+def load_plugins(server, folder):
+    """Actually load them, which is the only honest answer to "does it work".
+
+    Reading a plugin says what it declares; loading it says whether it runs.
+    This is the rehearsal for a cutover: it happens with the server untouched,
+    so a plugin that will not work under W4VE is known before anything moves.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from mcdr.host import Host
+    except ImportError as exc:
+        problem(f"this w4ve cannot run MCDR plugins ({exc})")
+        return 2
+
+    lines = []
+    host = Host(server.root, plugins_dir=folder, server=None,
+                on_output=lines.append)
+    host.load_all()
+
+    if host.loaded:
+        width = max(len(pid) for pid in host.loaded)
+        for pid in sorted(host.loaded):
+            entry = host.loaded[pid]
+            events = [e for e in ("on_info", "on_player_joined", "on_player_left",
+                                  "on_server_startup", "on_server_stop")
+                      if entry.handler(e)]
+            say(f"  {Out.ok('loaded')}  {pid.ljust(width)}  "
+                f"{entry.plugin.version}  "
+                + Out.dim(", ".join(events) if events else "no events"))
+    for line in lines:
+        if "ERROR" in line or "WARN" in line:
+            say(Out.dim("    " + line))
+    say()
+    for line in host.problems:
+        problem(line)
+    say()
+    say(f"{len(host.loaded)} loaded, {len(host.problems)} "
+        f"problem{'s' if len(host.problems) != 1 else ''}")
+    note("this was a rehearsal: nothing was connected to the server")
+    return 1 if host.problems else 0
 
 
 def runtime_module():
@@ -2188,6 +2233,8 @@ def build_parser():
                           "what MCDR plugins this server has")
     listing_plugins.add_argument("--folder",
                                  help="where they live (default: plugins)")
+    listing_plugins.add_argument("--load", action="store_true",
+                                 help="actually load them, to see which ones run")
 
     packing = add("pack", cmd_pack, "build a .w4ve out of a folder")
     packing.add_argument("folder", help="folder with a w4ve.json in it")
