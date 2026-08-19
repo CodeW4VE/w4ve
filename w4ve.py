@@ -13,6 +13,8 @@
     w4ve status               versions, pending restart, health at a glance
     w4ve doctor               find what is wrong before the server does
     w4ve profiles             curated sets of pieces
+    w4ve pack <folder>        build a .w4ve out of a folder
+    w4ve install <file.w4ve>  install a package, second half included
 
 And the runtime side, RFC-0001:
 
@@ -21,9 +23,11 @@ And the runtime side, RFC-0001:
     w4ve console              attach to the live console, detach without harm
     w4ve logs                 console and journal, with --follow
 
-Standard library only, single file, on purpose: it has to run on a server
-without installing anything first, and be editable by someone who is not a
-programmer. Same rule as the registry's build.py.
+Standard library only, on purpose: it has to run on a server without installing
+anything first, and be editable by someone who is not a programmer. Same rule
+as the registry's build.py. The catalog lives here in one file; `runtime.py`
+and `package.py` sit next to it and are imported only if they are there, so a
+bare `w4ve.py` still installs mods.
 
 Two files hold the state of a server:
 
@@ -50,7 +54,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 USER_AGENT = f"w4ve/{VERSION} (+https://w4ve.xyz)"
 
 # The published catalog. Override with --index or W4VE_INDEX, which is how you
@@ -170,7 +174,12 @@ def vtuple(version):
     chosen = chosen or VERSION_TOKEN.search(version)
     numbers = tuple(int(n) for n in chosen.group(0).split(".")) if chosen else (0,)
     numbers = numbers + (0,) * (3 - len(numbers))
-    return numbers, version[chosen.end():] if chosen else version
+    tail = version[chosen.end():] if chosen else version
+    # `shapeboard-1.7.0+26.2` is not newer than `1.7.0`: the `+` half says
+    # which Minecraft it was built for, not which release it is. A `-w4ve.1`
+    # suffix does count, because that one really is a build of ours on top.
+    tail = tail.split("+", 1)[0]
+    return numbers, tail
 
 
 def newer(a, b):
@@ -448,6 +457,58 @@ class Server:
             lines += ["", "[pieces]", f'{pid} = "{version}"']
         self._write_lines(lines)
 
+    def set_service(self, name, fields, owner=""):
+        """Write a `[services.<name>]` block a person can read and edit.
+
+        Services live in w4ve.toml and not in generated state on purpose: the
+        second half of a piece is something an operator has to be able to see,
+        comment and change by hand, in the same file as everything else about
+        this server.
+        """
+        if not self.config_path.exists():
+            return
+        text = self.config_path.read_text(encoding="utf-8")
+        if re.search(rf"^\[services\.{re.escape(name)}\]", text, re.M):
+            self.remove_service(name)
+            text = self.config_path.read_text(encoding="utf-8")
+        header = f"[services.{name}]"
+        if owner:
+            header += f"  # installed by {owner}"
+        lines = [header]
+        width = max(len(key) for key in fields)
+        for key, value in fields.items():
+            lines.append(f"{key.ljust(width)} = {json.dumps(value)}")
+        block = "\n".join(lines)
+        text = text.rstrip("\n") + "\n\n" + block + "\n"
+        self.config_path.write_text(text, encoding="utf-8")
+        self.config = read_toml(self.config_path)
+
+    def remove_service(self, name):
+        """Take the block out, and only that block."""
+        if not self.config_path.exists():
+            return
+        lines = self.config_path.read_text(encoding="utf-8").splitlines()
+        start = None
+        for i, line in enumerate(lines):
+            if re.match(rf"^\[services\.{re.escape(name)}\]", line.strip()):
+                start = i
+                break
+        if start is None:
+            return
+        end = len(lines)
+        for i in range(start + 1, len(lines)):
+            if lines[i].strip().startswith("["):
+                end = i
+                break
+        while end > start + 1 and not lines[end - 1].strip():
+            end -= 1
+        while start > 0 and not lines[start - 1].strip():
+            start -= 1
+        del lines[start:end]
+        self.config_path.write_text("\n".join(lines).rstrip("\n") + "\n",
+                                    encoding="utf-8")
+        self.config = read_toml(self.config_path)
+
     def remove_pin(self, pid):
         if not self.config_path.exists():
             return
@@ -699,6 +760,27 @@ def newest_for(piece, server):
     return release["version"] if release else None
 
 
+def entry_files(server, entry):
+    """Every file a piece owns, whichever way it got installed.
+
+    A catalog piece is one file and knows its path. A package can be several
+    files in several folders, and the ones under `w4ve/` belong to the runtime
+    rather than to the game. Everything that walks over installed files goes
+    through here so neither shape is a special case twice.
+    """
+    if entry.get("source") == "package":
+        out = []
+        for relative, digest in (entry.get("files") or {}).items():
+            base = (server.root if relative.startswith("w4ve/")
+                    else server.root / server.game_dir)
+            out.append((relative, digest, base / relative))
+        return out
+    path = entry.get("path")
+    if not path:
+        return []
+    return [(path, entry.get("sha256"), server.root / path)]
+
+
 def install_dir_for(piece, server=None):
     """Where a piece goes, relative to the folder with the w4ve.toml.
 
@@ -829,6 +911,9 @@ def install_one(server, index, pid, want=None, explicit_file=None,
         return False, f"{pid}: {why}"
 
     current = server.installed(pid)
+    if current and current.get("source") == "package":
+        return False, (f"{pid} was installed from a .w4ve package; "
+                       f"reinstall it with the package, not from the catalog")
     if current and (server.root / current["path"]).exists() \
             and vtuple(current["version"])[0] == vtuple(release["version"])[0]:
         # Right version, possibly under a different file name: an adopted
@@ -1131,6 +1216,12 @@ def cmd_profiles(args, index):
 
 def cmd_install(args, index):
     server = need_server(args)
+    packages = [t for t in args.ids if t.endswith(".w4ve")]
+    if packages:
+        if len(packages) != len(args.ids) or args.profile:
+            problem("install a .w4ve package on its own, not mixed with catalog ids")
+            return 2
+        return install_packages(server, packages, args)
     targets = list(args.ids)
     if args.profile:
         profile = index["profiles"].get(args.profile)
@@ -1222,6 +1313,9 @@ def cmd_remove(args, index):
         entry = server.installed(pid)
         if not entry:
             note(f"{pid} is not installed")
+            continue
+        if entry.get("source") == "package":
+            removed += bool(remove_package(server, pid, args))
             continue
         path = server.root / entry["path"]
         if path.exists():
@@ -1386,12 +1480,14 @@ def cmd_doctor(args, index):
 
     # 2. files that vanished or changed behind our back
     for pid, entry in entries.items():
-        path = server.root / entry["path"]
-        if not path.exists():
-            problems.append(f"{pid}: {entry['path']} is gone")
-        elif entry.get("sha256") and sha256_of(path) != entry["sha256"]:
-            warnings.append(f"{pid}: {entry['path']} changed since it was "
-                            f"installed (replaced by hand?)")
+        for relative, digest, path in entry_files(server, entry):
+            if not path.exists():
+                problems.append(f"{pid}: {relative} is gone")
+            elif relative in (entry.get("editable") or []):
+                continue        # a config the operator owns, edits expected
+            elif digest and sha256_of(path) != digest:
+                warnings.append(f"{pid}: {relative} changed since it was "
+                                f"installed (replaced by hand?)")
 
     # 3. version and side sanity
     seen_pairs = set()
@@ -1425,7 +1521,9 @@ def cmd_doctor(args, index):
                     + (f": {conflict['why']}" if conflict.get("why") else ""))
 
     # 4. what is actually sitting in mods/, according to the jars themselves
-    managed = {(server.root / e["path"]).resolve() for e in entries.values()}
+    managed = {path.resolve()
+               for entry in entries.values()
+               for _, _, path in entry_files(server, entry)}
     mods_dir = server.root / install_dir_for({"type": "fabric-mod"}, server)
     if mods_dir.is_dir():
         by_id, unmanaged = {}, 0
@@ -1460,6 +1558,34 @@ def cmd_doctor(args, index):
         except (OSError, subprocess.SubprocessError):
             warnings.append("no `java` on PATH to check against w4ve.toml")
 
+    # 6. the services a piece brought with it
+    rt = runtime_module()
+    for service in (rt.services_from(server.config) if rt else []):
+        where = server.root / service["cwd"]
+        if not where.is_dir():
+            problems.append(f"service {service['name']}: {service['cwd']} "
+                            f"is not there")
+            continue
+        program = service["command"][0]
+        if "/" in program and not Path(program).exists():
+            problems.append(f"service {service['name']}: {program} does not exist")
+        elif "/" not in program and not shutil.which(program):
+            problems.append(f"service {service['name']}: no {program} on PATH")
+        # A service that declared what it imports gets checked before it is
+        # ever started, which beats reading a traceback at three in the
+        # morning.
+        entry = (server.config.get("services") or {}).get(service["name"]) or {}
+        # Ask the interpreter the service will actually use, not the one
+        # running this command: a service pointed at a venv is the normal case.
+        interpreter = program if "python" in Path(program).name else sys.executable
+        for module in entry.get("python_requires") or []:
+            probe = subprocess.run(
+                [interpreter, "-c", f"import {module.split('[')[0]}"],
+                capture_output=True)
+            if probe.returncode != 0:
+                problems.append(f"service {service['name']} needs the Python "
+                                f"module {module}, which is not installed")
+
     if server.pending:
         warnings.append(f"waiting for a restart: {', '.join(server.pending)}")
 
@@ -1474,6 +1600,124 @@ def cmd_doctor(args, index):
         say(f"{len(problems)} problem{'s' if len(problems) != 1 else ''}, "
             f"{len(warnings)} warning{'s' if len(warnings) != 1 else ''}")
     return 1 if problems else 0
+
+
+# ------------------------------------------------------------------- packages
+
+def package_module():
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import package
+        return package
+    except ImportError:
+        return None
+
+
+def install_packages(server, paths, args):
+    """Install `.w4ve` files: a piece that arrives whole, second half included."""
+    pkg = package_module()
+    if pkg is None:
+        problem("this w4ve cannot read packages (package.py is missing)")
+        return 2
+    changed = 0
+    for path in paths:
+        path = Path(path)
+        if not path.exists():
+            problem(f"{path} does not exist")
+            return 1
+        try:
+            install = pkg.Install(path, server)
+            actions, problems = install.plan()
+        except pkg.PackageError as exc:
+            problem(str(exc))
+            return 1
+        manifest = install.manifest
+        say(f"{Out.bold(manifest.name)}  {manifest.version}")
+        for issue in problems:
+            problem(issue)
+        if problems:
+            return 1
+
+        already = server.installed(manifest.id)
+        for action in actions:
+            if action["kind"] == "service":
+                say(f"  service   {action['name']}  "
+                    + Out.dim(" ".join(action["component"]["command"])))
+            else:
+                say(f"  {action['kind'].ljust(9)} {action['dest']}  "
+                    + Out.dim(action["reload"]))
+        if args.dry_run:
+            say(Out.dim("dry run, nothing was written"))
+            continue
+        if already and already.get("version") == manifest.version and not args.force:
+            note(f"{manifest.id} {manifest.version} is already installed")
+            continue
+        if already:
+            remove_package(server, manifest.id, args, quiet=True)
+        try:
+            record = install.apply(actions)
+            install.commit()
+        except pkg.PackageError as exc:
+            problem(str(exc))
+            return 1
+        except OSError as exc:
+            problem(f"{manifest.id} was not installed, and nothing changed: {exc}")
+            return 1
+        changed += 1
+        server.set_pin(manifest.id, manifest.version)
+        say(f"{Out.ok('ok')}  {manifest.id} {manifest.version}")
+        if record.get("services"):
+            say(Out.dim(f"    services in w4ve.toml: "
+                        f"{', '.join(record['services'])}"))
+            say(Out.dim("    `w4ve run` watches them like it watches the server"))
+    return report_pending(server, changed, args)
+
+
+def remove_package(server, pid, args, quiet=False):
+    pkg = package_module()
+    if pkg is None:
+        problem("this w4ve cannot read packages (package.py is missing)")
+        return 0
+    if args.dry_run:
+        entry = server.installed(pid) or {}
+        for relative in (entry.get("files") or {}):
+            say(f"would delete {relative}")
+        return 0
+    result = pkg.remove(server, pid)
+    if result is None:
+        return 0
+    server.remove_pin(pid)
+    if not quiet:
+        say(f"{Out.ok('ok')}  removed {pid}"
+            + (f" ({len(result['removed'])} files)" if result["removed"] else ""))
+        for relative in result["changed"]:
+            note(f"left {relative} alone: it changed since we wrote it")
+        if result["services"]:
+            say(Out.dim(f"    services taken out of w4ve.toml: "
+                        f"{', '.join(result['services'])}"))
+    return 1
+
+
+def cmd_pack(args, index):
+    """Build a `.w4ve` out of a folder, so a piece can ship whole."""
+    pkg = package_module()
+    if pkg is None:
+        problem("this w4ve cannot build packages (package.py is missing)")
+        return 2
+    try:
+        target, manifest = pkg.pack(args.folder, args.out)
+    except pkg.PackageError as exc:
+        for line in str(exc).splitlines():
+            problem(line)
+        return 1
+    size = target.stat().st_size
+    say(f"{Out.ok('ok')}  {target}  ({size // 1024} KB)")
+    for component in manifest.components:
+        if component.get("kind") == "service":
+            say(Out.dim(f"    service  {component['name']}"))
+        else:
+            say(Out.dim(f"    {component['kind'].ljust(8)} {component['file']}"))
+    return 0
 
 
 # -------------------------------------------------------------------- runtime
@@ -1514,7 +1758,9 @@ def runtime_pieces(server, rt):
             restart=section.get("restart_policy") or "never")
     for service in rt.services_from(server.config):
         guardian.add_service(service["name"], service["command"],
-                             server.root / service["cwd"], service["restart"])
+                             server.root / service["cwd"], service["restart"],
+                             health=service.get("health"),
+                             health_every=service.get("health_every", 30))
     return guardian, command
 
 
@@ -1664,6 +1910,7 @@ def report_runtime(server, rt):
         guardian = False
     if not state or not state["processes"]:
         return
+    width = max(len(entry["name"]) for entry in state["processes"])
     for entry in state["processes"]:
         colour = {"running": Out.ok, "starting": Out.warn, "stopping": Out.warn,
                   "crashed": Out.bad, "killed": Out.bad}.get(entry["state"], Out.dim)
@@ -1682,7 +1929,7 @@ def report_runtime(server, rt):
             bits.append(Out.warn("adopted, no console"))
         if entry.get("give_up"):
             bits.append(Out.bad("gave up restarting it"))
-        say(f"  {entry['name'].ljust(10)} {'  '.join(bits)}")
+        say(f"  {entry['name'].ljust(width)} {'  '.join(bits)}")
         caps = entry.get("capabilities")
         if caps and caps.get("note"):
             say(Out.dim(f"    {caps['flavor']}: {caps['note']}"))
@@ -1737,7 +1984,8 @@ def build_parser():
 
     install = add("install", cmd_install, "download and place a piece")
     install.add_argument("ids", nargs="*", metavar="id[@version]",
-                         help="pieces to install; @version pins one")
+                         help="pieces to install; @version pins one; "
+                              "or the path of a .w4ve package")
     install.add_argument("--profile", help="install a whole profile at once")
     install.add_argument("--file", help="pick a specific asset by name")
     install.add_argument("--force", action="store_true",
@@ -1752,6 +2000,10 @@ def build_parser():
 
     remove = add("remove", cmd_remove, "take a piece out")
     remove.add_argument("ids", nargs="+", help="pieces to take out")
+
+    packing = add("pack", cmd_pack, "build a .w4ve out of a folder")
+    packing.add_argument("folder", help="folder with a w4ve.json in it")
+    packing.add_argument("--out", help="where to leave the package")
 
     add("sync", cmd_sync, "leave the server as w4ve.toml says")
     add("status", cmd_status, "versions, pending restarts and what is running")
@@ -1791,7 +2043,7 @@ def build_parser():
     logs.add_argument("--journal", action="store_true",
                       help="the guardian journal instead of the console")
 
-    for name in ("run", "start", "stop", "console", "logs"):
+    for name in ("run", "start", "stop", "console", "logs", "pack"):
         subparsers.choices[name].set_defaults(needs_index=False)
 
     for name, sub in subparsers.choices.items():

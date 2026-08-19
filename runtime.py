@@ -175,7 +175,8 @@ class Watched:
     """
 
     def __init__(self, name, command, cwd, guardian, handler=None,
-                 restart="never", stop_grace=STOP_GRACE):
+                 restart="never", stop_grace=STOP_GRACE, health=None,
+                 health_every=30):
         self.name = name
         self.command = command
         self.cwd = Path(cwd)
@@ -183,6 +184,8 @@ class Watched:
         self.handler = handler
         self.restart = restart
         self.stop_grace = stop_grace
+        self.health = health            # a URL, for things with no console
+        self.health_every = health_every
 
         self.proc = None
         self.pid = None
@@ -261,6 +264,14 @@ class Watched:
             self.started_at = time.time()
             threading.Thread(target=self._read_console, daemon=True).start()
             threading.Thread(target=self._reap, daemon=True).start()
+            if self.handler is None:
+                # Nothing to read a start-up line out of. A service is running
+                # the moment it is up; whether it is READY is what the health
+                # check answers, and without one we say we do not know.
+                self._become("running", "no console to wait on")
+                if self.health:
+                    threading.Thread(target=self._poll_health,
+                                     daemon=True).start()
             self.guardian.snapshot()
             return True, "%s started (pid %d)" % (self.name, self.pid)
 
@@ -368,6 +379,35 @@ class Watched:
             pass
         finally:
             console.close()
+
+    def _poll_health(self):
+        import urllib.error
+        import urllib.request
+
+        # A service is allowed to take a moment to bind its port. Calling it
+        # unhealthy while it is still starting is noise, so the first few
+        # failures only mean "not yet".
+        tries = 0
+        while alive(self.pid, self.starttime) and not self.guardian.stopping.is_set():
+            tries += 1
+            try:
+                with urllib.request.urlopen(self.health, timeout=5) as response:
+                    healthy = 200 <= response.status < 400
+            except (urllib.error.URLError, OSError, ValueError):
+                healthy = False
+            if not healthy and self.ready is None and tries < 6:
+                time.sleep(2)
+                continue
+            if healthy != self.ready:
+                self.ready = healthy
+                self.guardian.log("%s: health %s (%s)"
+                                  % (self.name, "ok" if healthy else "failing",
+                                     self.health))
+                self.guardian.snapshot()
+            # Checks come quickly until the first success, because a service
+            # that is up in a second should not read as unknown for half a
+            # minute.
+            time.sleep(self.health_every if self.ready else 2)
 
     def _reap(self):
         code = self.proc.wait()
@@ -510,8 +550,10 @@ class Guardian:
         self.watched["server"] = proc
         return proc
 
-    def add_service(self, name, command, cwd, restart="on-failure"):
-        proc = Watched(name, command, cwd, self, handler=None, restart=restart)
+    def add_service(self, name, command, cwd, restart="on-failure",
+                    health=None, health_every=30):
+        proc = Watched(name, command, cwd, self, handler=None, restart=restart,
+                       health=health, health_every=health_every)
         self.watched[name] = proc
         return proc
 
@@ -673,11 +715,15 @@ class Guardian:
         thread = threading.Thread(target=self.serve, daemon=True)
         thread.start()
 
-        if start_now and "server" in self.watched:
-            if "server" in recovered:
-                self.log("server was already running, not starting a second one")
-            else:
-                ok, message = self.watched["server"].start()
+        if start_now:
+            for name, proc in self.watched.items():
+                if name in recovered:
+                    self.log("%s was already running, not starting a second one"
+                             % name)
+                    continue
+                # Services come up with the guardian: the whole point of a
+                # piece declaring one is that nobody has to remember it.
+                ok, message = proc.start()
                 self.log(message)
 
         while not self.stopping.is_set():
@@ -818,5 +864,7 @@ def services_from(config):
             "command": list(command),
             "cwd": entry.get("cwd") or ".",
             "restart": entry.get("restart") or "on-failure",
+            "health": entry.get("health_url") or None,
+            "health_every": int(entry.get("health_every") or 30),
         })
     return out

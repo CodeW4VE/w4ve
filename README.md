@@ -52,6 +52,36 @@ w4ve doctor                     # what is wrong before the server finds out
 | `status` | what is running, versions, available updates, pending restarts |
 | `doctor` | missing dependencies, duplicate jars, wrong Java, files changed by hand |
 
+## Packages
+
+A `.w4ve` is a zip with a `w4ve.json` in it: one file that carries a piece
+whole, jars and all. It exists for the pieces a jar cannot cover, the ones
+whose second half is a process rather than a file.
+
+```sh
+w4ve pack ./mypiece                 # build mypiece-1.0.0.w4ve out of a folder
+w4ve install ./mypiece-1.0.0.w4ve   # put every part where it goes
+w4ve remove mypiece                 # take out exactly what it put in
+```
+
+- **One package, every Minecraft version.** ShapeBoard ships thirteen jars in
+  one release; the package carries all of them and the install picks the one
+  for this server. Two that match is the package being wrong, and it is said at
+  install time rather than found by Fabric at boot.
+- **A piece can bring a service.** A `service` component declares a process:
+  command, working folder, restart policy, the Python modules it needs and a
+  health URL. It lands as a `[services.<name>]` block in your `w4ve.toml`, with
+  a comment saying which piece put it there, and the guardian watches it like
+  it watches the server.
+- **Declared, not conjured.** Python dependencies are checked by `w4ve doctor`,
+  against the interpreter the service will really use, so a service that would
+  die on startup is known before it starts. Installing them is your call.
+- **Nothing half installed.** If a package fails partway through, what it wrote
+  is rolled back and the folder is left as it was.
+- **A config you edited is yours.** Components marked `keep_on_update` are
+  never overwritten and never deleted by `remove`: the new default arrives as a
+  `.new` file next to yours.
+
 ## Running the server
 
 Since 0.2.0 w4ve does not only install the files, it can own the server process

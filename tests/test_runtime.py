@@ -220,15 +220,15 @@ class GuardianCase(unittest.TestCase):
         _, client = self.guardian(
             "--boot", "0.3",
             services=[("media", [sys.executable, str(script)])])
-        guardian_view = wait_for(
-            lambda: [p for p in client.call({"cmd": "status"}).get("processes", [])
-                     if p["name"] == "media"])
-        self.assertTrue(guardian_view, "the service was never registered")
-        reply = client.call({"cmd": "start", "process": "media"})
-        self.assertTrue(reply["ok"], reply)
+        # A declared service comes up with the guardian: nobody should have to
+        # remember the second half of a piece.
         status = wait_for(lambda: [p for p in client.call({"cmd": "status"})["processes"]
                                    if p["name"] == "media" and p["pid"]])
+        self.assertTrue(status, "the service was never started")
         self.assertTrue(runtime.alive(status[0]["pid"]))
+        self.assertEqual(status[0]["state"], "running")
+        self.assertIsNone(status[0]["ready"],
+                          "with no health check, readiness is unknown")
 
 
 class HandlerCase(unittest.TestCase):
