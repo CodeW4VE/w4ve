@@ -14,6 +14,7 @@
     w4ve doctor               find what is wrong before the server does
     w4ve profiles             curated sets of pieces
     w4ve pack <folder>        build a .w4ve out of a folder
+    w4ve plugins              what MCDR plugins this server has
     w4ve install <file.w4ve>  install a package, second half included
 
 And the runtime side, RFC-0001:
@@ -129,7 +130,11 @@ def say(text=""):
 
 
 def problem(text):
+    # Flush stdout first: stderr is unbuffered and stdout is not, so without
+    # this the errors of a command arrive before the output they are about.
+    sys.stdout.flush()
     print(f"{Out.bad('error')} {text}", file=sys.stderr)
+    sys.stderr.flush()
 
 
 def note(text):
@@ -1832,6 +1837,63 @@ def cmd_pack(args, index):
 
 # -------------------------------------------------------------------- runtime
 
+def mcdr_module():
+    """The MCDR plugin reader, if this copy of w4ve ships it."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from mcdr import loader
+        return loader
+    except ImportError:
+        return None
+
+
+def cmd_plugins(args, index):
+    """What MCDR plugins this server has, and what is wrong with them.
+
+    Nothing here runs a plugin: it reads what each one declares. That is the
+    point, because the answer to "why is this plugin not loading" should not
+    require loading it.
+    """
+    mcdr = mcdr_module()
+    if mcdr is None:
+        problem("this w4ve cannot read MCDR plugins (the mcdr package is missing)")
+        return 2
+    server = need_server(args)
+    folder = server.root / (args.folder or "plugins")
+    if not folder.is_dir():
+        problem(f"{folder} is not there")
+        note("MCDR keeps plugins in `plugins/` at the root of the server")
+        return 1
+
+    found = mcdr.report(folder)
+    plugins = found["plugins"]
+    if not plugins:
+        say(f"no MCDR plugins in {folder}")
+        return 0
+
+    width = max(len(p.id or p.path.name) for p in plugins)
+    for plugin in sorted(plugins, key=lambda p: (p.id or p.path.name)):
+        label = (plugin.id or Out.dim("?")).ljust(width)
+        bits = [plugin.version or Out.dim("no version")]
+        if plugin.problems:
+            bits.append(Out.bad(plugin.problems[0]))
+        elif plugin.dependencies:
+            bits.append(Out.dim("needs " + ", ".join(sorted(plugin.dependencies))))
+        say(f"  {label}  {'  '.join(bits)}  {Out.dim(plugin.path.name)}")
+
+    say()
+    if found["order"]:
+        say(Out.dim("load order: " + " ".join(p.id for p in found["order"])))
+    real = [p for p in found["problems"]
+            if not any(p.startswith(x.path.name + ":") for x in plugins)]
+    for line in real:
+        problem(line)
+    say()
+    say(f"{len(plugins)} plugin{'s' if len(plugins) != 1 else ''}, "
+        f"{len(found['problems'])} problem{'s' if len(found['problems']) != 1 else ''}")
+    return 1 if found["problems"] else 0
+
+
 def runtime_module():
     """The guardian, if this copy of w4ve ships it (RFC-0001).
 
@@ -2122,6 +2184,11 @@ def build_parser():
 
     add("repair", cmd_repair, "undo an install that was killed halfway")
 
+    listing_plugins = add("plugins", cmd_plugins,
+                          "what MCDR plugins this server has")
+    listing_plugins.add_argument("--folder",
+                                 help="where they live (default: plugins)")
+
     packing = add("pack", cmd_pack, "build a .w4ve out of a folder")
     packing.add_argument("folder", help="folder with a w4ve.json in it")
     packing.add_argument("--out", help="where to leave the package")
@@ -2164,7 +2231,8 @@ def build_parser():
     logs.add_argument("--journal", action="store_true",
                       help="the guardian journal instead of the console")
 
-    for name in ("run", "start", "stop", "console", "logs", "pack", "repair"):
+    for name in ("run", "start", "stop", "console", "logs", "pack", "repair",
+                 "plugins"):
         subparsers.choices[name].set_defaults(needs_index=False)
 
     for name, sub in subparsers.choices.items():

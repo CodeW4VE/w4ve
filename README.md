@@ -52,6 +52,7 @@ w4ve doctor                     # what is wrong before the server finds out
 | `status` | what is running, versions, available updates, pending restarts |
 | `doctor` | missing dependencies, duplicate jars, wrong Java, files changed by hand |
 | `repair` | undo an install that was killed halfway |
+| `plugins` | what MCDR plugins this server has, and what is wrong with them |
 
 ## Packages
 
@@ -91,6 +92,27 @@ w4ve remove mypiece                 # take out exactly what it put in
 - **A config you edited is yours.** Components marked `keep_on_update` are
   never overwritten and never deleted by `remove`: the new default arrives as a
   `.new` file next to yours.
+
+## MCDR plugins
+
+W4VE is meant to replace MCDReforged without you losing the plugins you
+already run, so the first thing it learned is how to read them.
+
+```sh
+w4ve plugins                    # every plugin, its version, and what is wrong
+```
+
+It reads the four shapes a plugin comes in (a `.py` file, a folder with a
+manifest, a `.mcdr`, a `.pyz`) **without running any of them**, which is the
+point: the answer to "why is this plugin not loading" should not require
+loading it. It works out the order dependencies force, and it says the things
+that only show up in a real server folder: two copies of the same plugin, a
+dependency nobody installed, a backup that is not a plugin, a file that does
+not parse.
+
+Everything here is reimplemented from documented behaviour, never copied. MCDR
+is LGPL-3.0 and copying its code would pull that licence onto W4VE.
+`docs/mcdr-compat-surface.md` counts what running these plugins will cost.
 
 ## Running the server
 
