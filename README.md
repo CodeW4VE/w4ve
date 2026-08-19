@@ -49,8 +49,38 @@ w4ve doctor                     # what is wrong before the server finds out
 | `update [id]` | move to the newest version and write it down |
 | `remove <id>` | delete the file and forget it |
 | `sync` | leave the server exactly as `w4ve.toml` says |
-| `status` | versions, available updates, pending restarts |
+| `status` | what is running, versions, available updates, pending restarts |
 | `doctor` | missing dependencies, duplicate jars, wrong Java, files changed by hand |
+
+## Running the server
+
+Since 0.2.0 w4ve does not only install the files, it can own the server process
+itself. This is [RFC-0001](docs/rfc/RFC-0001-guardian-y-propiedad-del-proceso.md)
+and it needs `runtime.py` next to `w4ve.py`.
+
+```sh
+w4ve run                        # start the server and watch it, in the foreground
+w4ve status                     # starting / running / stopped, and whether it is ready
+w4ve console                    # attach to the live console, detach without harm
+w4ve stop                       # tell it to save and wait, escalate only if it refuses
+w4ve logs -f                    # the console, or --journal for what the guardian did
+```
+
+Three things it does on purpose:
+
+- **Killing the guardian never kills the server.** Come back and it finds the
+  process again by `(pid, starttime)`, reports it as `adopted, no console`, and
+  does not pretend to be in control it does not have.
+- **Readiness is not liveness.** A server generating a world is alive and not
+  ready, and it says so, which is the difference between a slow boot and a
+  hang.
+- **It knows what it cannot do.** On Paper it owns the process, reads the
+  console and stops it cleanly, and it tells you plainly that Bukkit plugins do
+  not come from the W4VE catalog.
+
+Services declared in `w4ve.toml` are watched the same way, which is how the
+second half of a piece (an image service, a scanner, a bridge) stops being a
+cron nobody looks at.
 
 Every command takes `-n` to say what it would do and change nothing, and `-y` to
 answer yes to everything (for scripts and cron).
@@ -110,7 +140,11 @@ read, and it is the one place where the state of a server is written down.
   so today the CLI installs jars and `.mcdr` files straight from the catalog.
 - Talk to more than one server at a time. One `w4ve.toml`, one server.
 - Reload a plugin in place. It tells you which ones can be reloaded; doing it is
-  still `!!MCDR plugin reload` until the W4VE runtime exists.
+  still `!!MCDR plugin reload` until the plugin platform exists.
+- Run MCDR plugins itself. The runtime owns the process; the compatibility host
+  for `mcdreforged.api.all` is a later milestone.
+- Update the guardian without restarting the server. The server survives the
+  guardian today, but it gets its console back on the next start W4VE does.
 
 ## Configuration
 

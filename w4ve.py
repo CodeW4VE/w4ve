@@ -14,6 +14,13 @@
     w4ve doctor               find what is wrong before the server does
     w4ve profiles             curated sets of pieces
 
+And the runtime side, RFC-0001:
+
+    w4ve run                  own the server: start it and watch it
+    w4ve start | stop         with a guardian already up
+    w4ve console              attach to the live console, detach without harm
+    w4ve logs                 console and journal, with --follow
+
 Standard library only, single file, on purpose: it has to run on a server
 without installing anything first, and be editable by someone who is not a
 programmer. Same rule as the registry's build.py.
@@ -33,15 +40,17 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import tempfile
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 USER_AGENT = f"w4ve/{VERSION} (+https://w4ve.xyz)"
 
 # The published catalog. Override with --index or W4VE_INDEX, which is how you
@@ -1273,9 +1282,18 @@ def report_pending(server, changed, args):
     say()
     say(f"{len(pending)} piece{'s' if len(pending) > 1 else ''} "
         f"waiting for a restart: {', '.join(pending)}")
+    # If we own the server, restarting it is our job and not a shell command
+    # somebody has to remember to write down.
+    rt = runtime_module()
+    if rt is not None:
+        client = rt.Client(server.root)
+        if client.connected():
+            return restart_with_guardian(server, client, args)
+
     restart = server.config.get("server", {}).get("restart")
     if not restart:
-        say(Out.dim("    no restart command in w4ve.toml, do it your way"))
+        say(Out.dim("    no restart command in w4ve.toml, and no guardian "
+                    "running, so this one is yours"))
         return 0
     if args.yes or ask(f"run `{restart}` now?", default=False):
         result = subprocess.run(restart, shell=True)
@@ -1289,6 +1307,26 @@ def report_pending(server, changed, args):
     return 0
 
 
+def restart_with_guardian(server, client, args):
+    """Stop and start through the guardian, which knows how to wait."""
+    if not (args.yes or ask("restart the server now?", default=False)):
+        say(Out.dim("    it stays pending, `w4ve status` will remind you"))
+        return 0
+    stopped = client.call({"cmd": "stop"}, timeout=180)
+    if not stopped.get("ok"):
+        problem(stopped.get("error") or stopped.get("message"))
+        return 1
+    say(f"{Out.ok('ok')}  {stopped['message']}")
+    started = client.call({"cmd": "start"}, timeout=60)
+    if not started.get("ok"):
+        problem(started.get("error") or started.get("message"))
+        return 1
+    say(f"{Out.ok('ok')}  {started['message']}")
+    server.clear_pending()
+    say(Out.dim("    `w4ve status` says when it is ready again"))
+    return 0
+
+
 def cmd_status(args, index):
     server = need_server(args)
     config = server.config.get("server", {})
@@ -1297,6 +1335,9 @@ def cmd_status(args, index):
         f"Java {server.java or '?'}")
     say(Out.dim(f"  {server.config_path}"))
     say()
+    rt = runtime_module()
+    if rt is not None:
+        report_runtime(server, rt)
     entries = server.state["pieces"]
     if not entries:
         say("nothing installed yet. `w4ve sync` installs what w4ve.toml says.")
@@ -1435,6 +1476,222 @@ def cmd_doctor(args, index):
     return 1 if problems else 0
 
 
+# -------------------------------------------------------------------- runtime
+
+def runtime_module():
+    """The guardian, if this copy of w4ve ships it (RFC-0001).
+
+    The catalog side of w4ve has to keep working on a machine where only
+    `w4ve.py` was downloaded, so the runtime is an optional import instead of
+    a hard dependency.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import runtime
+        return runtime
+    except ImportError:
+        return None
+
+
+def need_runtime():
+    module = runtime_module()
+    if module is None:
+        problem("this w4ve has no runtime next to it (runtime.py is missing)")
+    return module
+
+
+def runtime_pieces(server, rt):
+    """Turn w4ve.toml into a guardian: one server, plus declared services."""
+    game_dir = server.root / server.game_dir
+    command = rt.server_command(server.config, server.root, server.game_dir)
+    guardian = rt.Guardian(server.root, server.config)
+    section = server.config.get("server", {})
+    if command:
+        guardian.add_server(
+            command, game_dir,
+            flavor=section.get("flavor"),
+            stop_grace=int(section.get("stop_grace") or rt.STOP_GRACE),
+            restart=section.get("restart_policy") or "never")
+    for service in rt.services_from(server.config):
+        guardian.add_service(service["name"], service["command"],
+                             server.root / service["cwd"], service["restart"])
+    return guardian, command
+
+
+def cmd_run(args, index):
+    """Own the server in the foreground, which is what a container wants."""
+    rt = need_runtime()
+    if rt is None:
+        return 2
+    server = need_server(args)
+    guardian, command = runtime_pieces(server, rt)
+    if not command:
+        problem("w4ve.toml does not say how to start this server")
+        note('add `start = "java -Xms4G -Xmx4G -jar fabric-server-launch.jar nogui"` '
+             "under [server]")
+        return 2
+    guardian.echo = not args.quiet
+    say(Out.dim(f"guardian for {server.root.name}, Ctrl-C stops the server"))
+
+    def console():
+        # Whatever the operator types goes to the server, exactly like the
+        # console they are used to.
+        for line in sys.stdin:
+            proc = guardian.watched.get("server")
+            if proc:
+                proc.send(line)
+
+    threading.Thread(target=console, daemon=True).start()
+    code, message = guardian.run(start_now=not args.no_start)
+    say(message)
+    return code
+
+
+def cmd_start(args, index):
+    rt = need_runtime()
+    if rt is None:
+        return 2
+    server = need_server(args)
+    client = rt.Client(server.root)
+    reply = client.call({"cmd": "start", "process": args.process})
+    if not reply.get("ok"):
+        problem(reply.get("error") or reply.get("message"))
+        if not client.connected():
+            note("`w4ve run` starts the guardian")
+        return 1
+    say(f"{Out.ok('ok')}  {reply['message']}")
+    return 0
+
+
+def cmd_stop(args, index):
+    rt = need_runtime()
+    if rt is None:
+        return 2
+    server = need_server(args)
+    client = rt.Client(server.root)
+    if client.connected():
+        reply = client.call({"cmd": "stop", "process": args.process,
+                             "grace": args.grace}, timeout=args.grace + 60)
+        if not reply.get("ok"):
+            problem(reply.get("error") or reply.get("message"))
+            return 1
+        say(f"{Out.ok('ok')}  {reply['message']}")
+        return 0
+
+    # No guardian, but there may well be a server: it survives us on purpose.
+    offline = client.offline_status() or {"processes": []}
+    running = [p for p in offline["processes"]
+               if p["name"] == args.process and not p["stale"]]
+    if not running:
+        say("nothing running here")
+        return 0
+    pid = running[0]["pid"]
+    if not args.force:
+        problem(f"no guardian, but {args.process} is alive (pid {pid})")
+        note("start the guardian with `w4ve run` and stop it from there, "
+             "or use --force to signal it directly")
+        return 1
+    note(f"no guardian: signalling {args.process} (pid {pid}) directly")
+    os.kill(pid, signal.SIGTERM)
+    say(f"{Out.ok('ok')}  sent SIGTERM to {pid}")
+    return 0
+
+
+def cmd_console(args, index):
+    """Watch the console and type into it, without owning the process."""
+    rt = need_runtime()
+    if rt is None:
+        return 2
+    server = need_server(args)
+    client = rt.Client(server.root)
+    if not client.connected():
+        problem("no guardian here, so there is no console to attach to")
+        note("`w4ve logs` reads what was already written")
+        return 1
+
+    def typing():
+        for line in sys.stdin:
+            client.call({"cmd": "send", "process": args.process, "text": line})
+
+    threading.Thread(target=typing, daemon=True).start()
+    say(Out.dim("attached, Ctrl-C detaches (the server keeps running)"))
+    try:
+        client.tail(lambda name, line: say(line if name == "server"
+                                           else f"[{name}] {line}"))
+    except KeyboardInterrupt:
+        say("\ndetached")
+    return 0
+
+
+def cmd_logs(args, index):
+    rt = need_runtime()
+    if rt is None:
+        return 2
+    server = need_server(args)
+    run_dir = server.root / "w4ve" / "run"
+    path = (run_dir / "journal.log" if args.journal
+            else run_dir / f"{args.process}.console.log")
+    if not path.exists():
+        problem(f"{path} does not exist yet")
+        return 1
+    with open(path) as fh:
+        if not args.follow:
+            lines = fh.readlines()
+            for line in lines[-args.lines:]:
+                say(line.rstrip("\n"))
+            return 0
+        fh.seek(0, 2)
+        try:
+            while True:
+                line = fh.readline()
+                if line:
+                    say(line.rstrip("\n"))
+                else:
+                    time.sleep(0.2)
+        except KeyboardInterrupt:
+            return 0
+
+
+def report_runtime(server, rt):
+    """The runtime half of `w4ve status`, which is what people ask first."""
+    client = rt.Client(server.root)
+    live = client.call({"cmd": "status"}) if client.connected() else None
+    if live and live.get("ok"):
+        state = live
+        guardian = True
+    else:
+        state = client.offline_status()
+        guardian = False
+    if not state or not state["processes"]:
+        return
+    for entry in state["processes"]:
+        colour = {"running": Out.ok, "starting": Out.warn, "stopping": Out.warn,
+                  "crashed": Out.bad, "killed": Out.bad}.get(entry["state"], Out.dim)
+        bits = [colour(entry["state"])]
+        if entry.get("ready") is True:
+            bits.append("ready")
+        elif entry["state"] == "starting":
+            bits.append(Out.dim("not ready yet"))
+        elif entry.get("ready") is None and entry["state"] == "running":
+            bits.append(Out.dim("readiness unknown"))
+        if entry.get("pid"):
+            bits.append(Out.dim(f"pid {entry['pid']}"))
+        if entry.get("uptime"):
+            bits.append(Out.dim(f"up {entry['uptime'] // 60}m"))
+        if entry.get("pid") and not entry.get("owned"):
+            bits.append(Out.warn("adopted, no console"))
+        if entry.get("give_up"):
+            bits.append(Out.bad("gave up restarting it"))
+        say(f"  {entry['name'].ljust(10)} {'  '.join(bits)}")
+        caps = entry.get("capabilities")
+        if caps and caps.get("note"):
+            say(Out.dim(f"    {caps['flavor']}: {caps['note']}"))
+    if not guardian:
+        say(Out.dim("  no guardian running, so this is what the last one left "
+                    "written down, checked against /proc"))
+    say()
+
+
 # ----------------------------------------------------------------------- main
 
 def build_parser():
@@ -1497,12 +1754,53 @@ def build_parser():
     remove.add_argument("ids", nargs="+", help="pieces to take out")
 
     add("sync", cmd_sync, "leave the server as w4ve.toml says")
-    add("status", cmd_status, "versions and pending restarts")
+    add("status", cmd_status, "versions, pending restarts and what is running")
     add("doctor", cmd_doctor, "find what is wrong")
 
-    for sub in subparsers.choices.values():
-        sub.add_argument("-n", "--dry-run", action="store_true",
-                         help="say what would happen, change nothing")
+    # The runtime half. None of it needs the catalog, and that matters: a
+    # server has to be startable when GitHub is down.
+    run = add("run", cmd_run, "own this server and watch it, in the foreground")
+    run.add_argument("--no-start", action="store_true",
+                     help="hold the server: start the guardian only")
+    run.add_argument("--quiet", action="store_true",
+                     help="do not echo the server console here")
+
+    start = add("start", cmd_start, "start the server with the guardian already up")
+    start.add_argument("process", nargs="?", default="server",
+                       help="which process (default: the server)")
+
+    stop = add("stop", cmd_stop, "stop the server, saving first")
+    stop.add_argument("process", nargs="?", default="server",
+                      help="which process (default: the server)")
+    stop.add_argument("--grace", type=int, default=90,
+                      help="seconds to wait before escalating (default: 90)")
+    stop.add_argument("--force", action="store_true",
+                      help="signal the process directly when no guardian is up")
+
+    console = add("console", cmd_console, "attach to the live console")
+    console.add_argument("process", nargs="?", default="server",
+                         help="which process (default: the server)")
+
+    logs = add("logs", cmd_logs, "read the console or the journal")
+    logs.add_argument("process", nargs="?", default="server",
+                      help="whose console (default: the server)")
+    logs.add_argument("-f", "--follow", action="store_true",
+                      help="keep printing new lines")
+    logs.add_argument("-n", "--lines", type=int, default=40,
+                      help="how many lines to show (default: 40)")
+    logs.add_argument("--journal", action="store_true",
+                      help="the guardian journal instead of the console")
+
+    for name in ("run", "start", "stop", "console", "logs"):
+        subparsers.choices[name].set_defaults(needs_index=False)
+
+    for name, sub in subparsers.choices.items():
+        # `logs -n` is a line count, so it does not get the global short flag.
+        if name != "logs":
+            sub.add_argument("-n", "--dry-run", action="store_true",
+                             help="say what would happen, change nothing")
+        else:
+            sub.set_defaults(dry_run=False)
         sub.add_argument("-y", "--yes", action="store_true",
                          help="answer yes to every question")
     return parser
@@ -1511,7 +1809,9 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
-    index = load_index(args.index, args.refresh)
+    index = ({"schema": 1, "pieces": {}, "profiles": {}}
+             if not getattr(args, "needs_index", True)
+             else load_index(args.index, args.refresh))
     if index.get("schema", 1) > 1:
         problem(f"this catalog is schema {index['schema']}, "
                 f"this w4ve only understands 1. Update it.")
