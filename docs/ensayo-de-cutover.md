@@ -130,12 +130,54 @@ Hay copias locales de casi todos en `/mnt/games` (`MineWave/Xeri/plugins/`,
 `Filezilla Shit/shipe/1.8/plugins/`, `Program files/Descargas/Minecraft/`), así
 que el ensayo se corre sin bajar nada del servidor.
 
+## ChatBridge entero, que era lo que de verdad faltaba
+
+Detrás del plugin hay más procesos, y ahí estaba el trabajo. Corriendo, con
+**un solo `w4ve run`** y sin MCDR en ninguna parte:
+
+| Proceso | Qué es | Cómo lo lleva W4VE |
+| --- | --- | --- |
+| el plugin | dentro del guardián | como cualquier otro plugin |
+| el daemon | `ChatBridge.pyz server` | `[services.chatbridge-daemon]` |
+| el cliente `!!online` | contesta por RCON | `[services.chatbridge-online]` |
+
+⚠️ **El daemon también importa `mcdreforged`, y no es un plugin.** Es un
+proceso aparte, lanzado desde una línea de comandos, y sólo pide `Serializable`
+(en tres rutas) más `api.rcon` para el cliente `online`. Bajo MCDR la respuesta
+es `pip install mcdreforged` en esa máquina para sacarle una clase.
+
+W4VE trae el paquete: `compat/mcdreforged/` reexporta lo que ya está en
+`mcdr/`, nada reimplementado. Un servicio declara `mcdr = true` y el guardián
+se lo pone en el `PYTHONPATH`. Lo que hoy en producción es una unit de systemd
+escrita a mano pasa a ser un bloque en `w4ve.toml`.
+
+Probado de punta a punta, todo local, sin tocar producción:
+
+- El daemon arrancó y escuchó; el plugin dentro del guardián **conectó y fue
+  identificado**, y le mandó `Server has started up`.
+- Un segundo cliente mandó un chat desde fuera: el daemon lo repartió y el
+  plugin lo metió en Minecraft (se ve `No player was found` porque el servidor
+  estaba vacío, o sea que el `say` llegó).
+- El cliente `!!online` consultó el servidor **por RCON a través del shim**.
+
+⚠️ **`w4ve stop <servicio>` estaba roto y se arregló aquí.** La parada estaba
+escrita para Minecraft, que obedece la palabra `stop` escrita en su stdin. Un
+servicio no lee stdin: la palabra no iba a ninguna parte y el guardián se
+quedaba los noventa segundos enteros del grace esperando una respuesta que no
+llegaba, hasta que la llamada por el socket expiraba. Un servicio se para con
+una señal, y su grace son diez segundos, no noventa: el largo existe para que
+un mundo se guarde.
+
+⚠️ **Dos límites conocidos, no arreglados**: los servicios arrancan a la vez y
+no hay forma de decir "éste va después de aquél"; el cliente `online` arrancó
+antes que el daemon, falló al conectar y se reconectó solo diez segundos
+después. Y `!!online` desde la consola no funciona, porque el plugin pide el
+jugador que lo escribió: eso es del plugin y pasa igual bajo MCDR.
+
 ## Lo que este número no dice
 
-- **ChatBridge carga y arranca su cliente, pero el daemon y el bot no están.**
-  Detrás del plugin hay tres procesos que se hablan, y de eso sólo se ha
-  probado la punta: el cliente intenta conectar, y falla porque no hay nadie
-  al otro lado. Eso sigue siendo lo que de verdad falta para el cutover.
+- **El bot de Discord de ChatBridge sigue sin probarse.** Necesita un token de
+  verdad y cuatro paquetes más de pip, así que no entra en un ensayo local.
 - **PrimeBackup arranca deshabilitado por su propia config**, que es su
   comportamiento normal la primera vez. No se ha probado un backup suyo.
 - Sigue sin ensayarse en el **mirror**, que es el layout de verdad (MCDR,
