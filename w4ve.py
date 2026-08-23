@@ -2078,7 +2078,8 @@ def runtime_pieces(server, rt):
                              env=service.get("env"),
                              mcdr=service.get("mcdr", False),
                              stop_grace=service.get("stop_grace",
-                                                    rt.SERVICE_GRACE))
+                                                    rt.SERVICE_GRACE),
+                             after=service.get("after") or ())
     return guardian, command
 
 

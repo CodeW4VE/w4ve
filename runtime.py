@@ -42,6 +42,9 @@ TERM_GRACE = 10
 # people built; an image server or a bridge daemon has nothing to lose by
 # being asked to leave now.
 SERVICE_GRACE = 10
+# How long a service waits for what it declared it comes after. Long enough
+# for a daemon to bind a port, short enough that a boot never hangs on it.
+DEPENDENCY_WAIT = 30
 
 # Three deaths this close together and we stop trying. Retrying forever against
 # a corrupt world is how an incident becomes data loss.
@@ -187,7 +190,7 @@ class Watched:
 
     def __init__(self, name, command, cwd, guardian, handler=None,
                  restart="never", stop_grace=STOP_GRACE, health=None,
-                 health_every=30, watches=(), env=None):
+                 health_every=30, watches=(), env=None, after=()):
         self.name = name
         self.command = command
         self.cwd = Path(cwd)
@@ -203,6 +206,9 @@ class Watched:
         # replacing it: a service that lost PATH is a service that cannot find
         # its own interpreter.
         self.env = dict(env or {})
+        # Names this one wants up before it starts. Not a graph to be proud
+        # of: a straight list, resolved in the order things were declared.
+        self.after = [str(name) for name in (after or [])]
         self.asked_to_come_back = False
 
         self.proc = None
@@ -479,21 +485,41 @@ class Watched:
                 self.asked_to_stop = True
                 self.asked_to_come_back = True
 
-    def _poll_health(self):
+    def _check_health(self):
+        """Is this service answering? True, False, whichever way it is asked.
+
+        Two ways because services are not all web servers. ChatBridge's daemon
+        speaks its own protocol over a TCP port and has no health URL at all,
+        so asking it for one meant its readiness stayed unknown forever, and a
+        service whose readiness is always unknown is a service nobody can wait
+        for.
+        """
+        if str(self.health).startswith("tcp://"):
+            where = str(self.health)[len("tcp://"):]
+            host, _, port = where.rpartition(":")
+            try:
+                with socket.create_connection((host or "127.0.0.1",
+                                               int(port)), timeout=5):
+                    return True
+            except (OSError, ValueError):
+                return False
         import urllib.error
         import urllib.request
 
+        try:
+            with urllib.request.urlopen(self.health, timeout=5) as response:
+                return 200 <= response.status < 400
+        except (urllib.error.URLError, OSError, ValueError):
+            return False
+
+    def _poll_health(self):
         # A service is allowed to take a moment to bind its port. Calling it
         # unhealthy while it is still starting is noise, so the first few
         # failures only mean "not yet".
         tries = 0
         while alive(self.pid, self.starttime) and not self.guardian.stopping.is_set():
             tries += 1
-            try:
-                with urllib.request.urlopen(self.health, timeout=5) as response:
-                    healthy = 200 <= response.status < 400
-            except (urllib.error.URLError, OSError, ValueError):
-                healthy = False
+            healthy = self._check_health()
             if not healthy and self.ready is None and tries < 6:
                 time.sleep(2)
                 continue
@@ -504,6 +530,19 @@ class Watched:
                                   % (self.name, "ok" if healthy else "failing",
                                      self.health))
                 self.guardian.snapshot()
+            # ⚠️ A TCP check is asked once and then left alone. Opening a
+            # port and closing it without saying anything is not a question,
+            # it is a connection the other end has to explain: ChatBridge's
+            # daemon logged `Failed reading client's login packet` every
+            # thirty seconds, which is two thousand nine hundred false errors
+            # a day in somebody else's log. An open port answers "it started",
+            # not "it is well", and that answer does not change on its own.
+            # An HTTP health check is a real question and keeps being asked.
+            if healthy and str(self.health).startswith("tcp://"):
+                self.guardian.log("%s: port open, not asking again "
+                                  "(a TCP check says started, not healthy)"
+                                  % self.name)
+                return
             # Checks come quickly until the first success, because a service
             # that is up in a second should not read as unknown for half a
             # minute.
@@ -703,7 +742,7 @@ class Guardian:
 
     def add_service(self, name, command, cwd, restart="on-failure",
                     health=None, health_every=30, env=None, mcdr=False,
-                    stop_grace=SERVICE_GRACE):
+                    stop_grace=SERVICE_GRACE, after=()):
         env = dict(env or {})
         if mcdr:
             # The service said it imports `mcdreforged`. ChatBridge's daemon
@@ -720,9 +759,44 @@ class Guardian:
                                      if existing else str(compat))
         proc = Watched(name, command, cwd, self, handler=None, restart=restart,
                        health=health, health_every=health_every, env=env,
-                       stop_grace=stop_grace)
+                       stop_grace=stop_grace, after=after)
         self.watched[name] = proc
         return proc
+
+    def wait_for_dependencies(self, proc, timeout=DEPENDENCY_WAIT):
+        """Hold a service back until what it needs is actually up.
+
+        Starting in the right order was never the problem: `start()` returns
+        as soon as the process exists, and a daemon needs a moment more to
+        bind its port. ChatBridge's !!online client came up first, failed to
+        connect three times, and reconnected on its own ten seconds later. It
+        healed itself, and it still filled the console with errors on every
+        boot.
+
+        What counts as up: ready, if the thing has a health check that can
+        answer; alive, if it has none. Waiting for readiness that can never
+        arrive would be worse than not waiting at all, so a service with no
+        health check is not waited on beyond being alive.
+        """
+        for name in getattr(proc, "after", ()):
+            other = self.watched.get(name)
+            if other is None:
+                self.log("%s waits for %s, which is not declared here"
+                         % (proc.name, name))
+                continue
+            deadline = time.time() + timeout
+            while time.time() < deadline and not self.stopping.is_set():
+                if not alive(other.pid, other.starttime):
+                    time.sleep(0.2)
+                    continue
+                if other.health is None or other.ready:
+                    break
+                time.sleep(0.2)
+            else:
+                self.log("%s waited %ds for %s and started anyway"
+                         % (proc.name, timeout, name))
+                continue
+            self.log("%s waited for %s" % (proc.name, name))
 
     def recover(self):
         """Find processes from a previous life and take them back.
@@ -958,6 +1032,7 @@ class Guardian:
                     self.log("%s was already running, not starting a second one"
                              % name)
                     continue
+                self.wait_for_dependencies(proc)
                 # Services come up with the guardian: the whole point of a
                 # piece declaring one is that nobody has to remember it.
                 ok, message = proc.start()
@@ -1125,10 +1200,17 @@ def services_from(config):
             "command": list(command),
             "cwd": entry.get("cwd") or ".",
             "restart": entry.get("restart") or "on-failure",
-            "health": entry.get("health_url") or None,
+            # Two ways to ask, because services are not all web servers.
+            # `health_tcp = "127.0.0.1:30001"` is what a daemon speaking its
+            # own protocol can answer, and ChatBridge's is exactly that.
+            "health": (entry.get("health_url")
+                       or ("tcp://%s" % entry["health_tcp"]
+                           if entry.get("health_tcp") else None)),
             "health_every": int(entry.get("health_every") or 30),
             "env": env,
             "stop_grace": int(entry.get("stop_grace") or SERVICE_GRACE),
+            "after": ([entry["after"]] if isinstance(entry.get("after"), str)
+                      else list(entry.get("after") or [])),
             # `mcdr = true` means: this process imports `mcdreforged` even
             # though it is not a plugin. ChatBridge's daemon does, and under
             # MCDR the answer was to pip install all of MCDR on the machine to
