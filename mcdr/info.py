@@ -28,6 +28,27 @@ BUKKIT = re.compile(
 # `<TVTvirus> hello`, which is what a player saying something looks like.
 CHAT = re.compile(r"^<(?P<player>[^>]+)> (?P<message>.*)$")
 
+# `TVTvirus joined the game`, and the same with a login address in front.
+# Only ever matched against a line the *server* wrote: a player typing "X
+# joined the game" in chat arrives with `player` already set, so it cannot
+# forge somebody else's join.
+JOINED = re.compile(r"^(?P<player>[^ <\[]+)(\[[^\]]*\])? joined the game$")
+LEFT = re.compile(r"^(?P<player>[^ <\[]+)(\[[^\]]*\])? left the game$")
+
+
+def player_event(info):
+    """`("joined", name)`, `("left", name)`, or None for anything else."""
+    if info.player is not None or not info.content:
+        return None
+    match = JOINED.match(info.content)
+    if match:
+        return "joined", match.group("player")
+    match = LEFT.match(info.content)
+    if match:
+        return "left", match.group("player")
+    return None
+
+
 CONSOLE_SOURCE = 0
 SERVER_SOURCE = 1
 

@@ -156,7 +156,16 @@ class RText(RTextBase):
     h = set_hover_text
 
     def copy(self):
-        clone = RText(self.text, self.color, list(self.styles))
+        clone = type(self)(*self._copy_args())
+        self._copy_into(clone)
+        return clone
+
+    def _copy_args(self):
+        return (self.text, self.color, list(self.styles))
+
+    def _copy_into(self, clone):
+        clone.color = self.color
+        clone.styles = list(self.styles)
         clone.click_action, clone.click_value = self.click_action, self.click_value
         clone.hover_text = self.hover_text
         return clone
@@ -252,3 +261,20 @@ class RTextMCDRTranslation(RText):
         data = RText.to_json_object(self)
         data["text"] = self.to_plain_text()
         return data
+
+    def _copy_args(self):
+        return (self.key,) + tuple(self.args)
+
+    def copy(self):
+        """⚠️ A copy of a translation has to still be a translation.
+
+        Inherited straight from RText, this returned a plain RText holding the
+        key, and the translation was lost for good. It looks like nothing
+        until you meet a plugin that copies before styling: QuickBackupM's
+        `command_run()` does exactly that, so its whole help screen came out
+        as `quick_backup_multi.register.summory_help` on a server where the
+        language file was loaded and correct.
+        """
+        clone = RTextMCDRTranslation(self.key, *self.args, **self.kwargs)
+        self._copy_into(clone)
+        return clone.set_translator(self._translator)

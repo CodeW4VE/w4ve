@@ -152,6 +152,22 @@ class CommandContext(dict):
 
 # -------------------------------------------------------------------- nodes
 
+def _call_failure(failure, source, context):
+    """Ask a requirement why it said no, whatever shape the getter is.
+
+    MCDR types this one as taking nothing, and that is what plugins write:
+    `requires(pred, lambda: 'you need admin')`. Calling it with a source the
+    way callbacks are called would raise a TypeError from inside the tree,
+    turning a polite refusal into a stack trace. Both shapes are accepted.
+    """
+    if failure is None:
+        return None
+    try:
+        return failure()
+    except TypeError:
+        return _call(failure, source, context)
+
+
 def _call(callback, source, context):
     """Call a plugin's callback with what it declared it wants.
 
@@ -254,8 +270,9 @@ class AbstractNode:
 
         for predicate, failure in self._requirements:
             if not _call(predicate, source, context):
-                reason = failure(source) if failure else None
-                raise RequirementNotMet("requirement not met", reason=reason)
+                raise RequirementNotMet("requirement not met",
+                                        reason=_call_failure(failure, source,
+                                                             context))
 
         text = remaining.lstrip()
         result = self.parse(text)

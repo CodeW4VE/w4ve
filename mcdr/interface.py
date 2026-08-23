@@ -152,6 +152,40 @@ class ServerInterface:
     def dispatch_event(self, event, args):
         self._host.dispatch_custom(event, args)
 
+    # ------------------------------------------------------------ hot reload
+
+    def reload_plugin(self, plugin_id):
+        """Reload a plugin without stopping the server.
+
+        ⚠️ A plugin that reloads *itself* from inside one of its own commands
+        is asking to be unloaded while its code is running. It works, because
+        Python keeps the running function alive, but anything the old module
+        held is gone when it returns. MCDR has the same edge and so does this.
+        """
+        ok, _ = self._host.reload(plugin_id)
+        return ok
+
+    def load_plugin(self, path):
+        ok, _ = self._host.load_new(path)
+        return ok
+
+    def unload_plugin(self, plugin_id):
+        return self._host.unload(plugin_id)
+
+    def enable_plugin(self, name):
+        ok, _ = self._host.enable_plugin(name)
+        return ok
+
+    def disable_plugin(self, plugin_id):
+        ok, _ = self._host.disable_plugin(plugin_id)
+        return ok
+
+    def refresh_changed_plugins(self):
+        return self._host.refresh_changed_plugins()
+
+    def refresh_all_plugins(self):
+        return self._host.refresh_all_plugins()
+
     # -------------------------------------------------------------- the host
 
     def logger_for(self, plugin_id):
@@ -193,8 +227,34 @@ class ServerInterface:
     def get_permission_level(self, obj):
         return self._host.permission_of(obj)
 
+    def set_permission_level(self, player, value):
+        """Give a player a level, written to `permission.yml` right away.
+
+        MCDR takes a number or one of the five names here, and so does this.
+        """
+        return self._host.set_permission(player, value)
+
+    def reload_permission_file(self):
+        return self._host.reload_permissions()
+
+    def get_permission_players(self, level=None):
+        return self._host.permissions.players(level)
+
     def get_plugin_command_source(self):
         return self._host.plugin_command_source()
+
+    def as_basic_server_interface(self):
+        return self
+
+    def as_plugin_server_interface(self):
+        """The plugin-flavoured interface, if this call is coming from one.
+
+        Task reaches for it at import time through the singleton, which is a
+        plain ServerInterface, and MCDR answers with the interface of whatever
+        plugin is being loaded right now. Answering None instead would be
+        technically true and would crash it.
+        """
+        return self._host.current_plugin_interface() or self
 
 
 class PluginServerInterface(ServerInterface):
@@ -238,7 +298,7 @@ class PluginServerInterface(ServerInterface):
         self._host.register_listener(self._plugin.id, event, callback, priority)
 
     def register_translation(self, language, mapping):
-        self._host.register_translation(language, mapping)
+        self._host.register_translation(language, mapping, self._plugin.id)
 
     def unregister_event_listener(self, event, callback):
         self._host.unregister_listener(self._plugin.id, event, callback)
