@@ -34,7 +34,8 @@ from mcdr.event import (LiteralEvent, MCDREvent, MCDRPluginEvents,
                         PluginEvent, name_of as event_name)
 from mcdr.info import Info, parse_server_line, player_event
 from mcdr.interface import PermissionLevel, PluginServerInterface, ServerInterface
-from mcdr.misc import FunctionThread, Version, VersionRequirement, new_thread
+from mcdr.misc import (FunctionThread, SyncStdoutStreamHandler, Version,
+                       VersionRequirement, event_listener, new_thread)
 from mcdr.permission import PermissionFile
 from mcdr.rcon_api import RconConnection
 from mcdr.serializer import Serializable
@@ -129,6 +130,16 @@ class Logger:
                 pass
             self.file = None
 
+    def unset_file(self):
+        """The other half of `set_file`, which Task calls in `on_unload`.
+
+        Missing, an otherwise clean reload of Task ended in an AttributeError
+        every single time, which is the kind of noise that teaches an operator
+        to ignore the console.
+        """
+        self.close_file()
+        return self
+
 
 class LoadedPlugin:
     """A plugin that is in memory, with everything it put into the host.
@@ -214,7 +225,11 @@ class Host:
         self.builtins = Builtins(self)
         self._executor = threading.current_thread()
         self._loading = None
+        # Which plugin's code is running on this thread right now. Per thread
+        # because a plugin is allowed to work on its own with `@new_thread`.
+        self._current = threading.local()
         self._pending_translations = {}
+        self._pending_listeners = {}
         self._help = []
         self.commands = []               # (plugin id, root node)
 
@@ -256,6 +271,9 @@ class Host:
             # Found by loading real plugins: DigAll needs the decorator,
             # MinecraftDataAPI needs to compare versions.
             "new_thread": new_thread,
+            # ChatBridge decorates a module level function with this, so it
+            # runs during the import and needs the loading plugin to exist.
+            "event_listener": event_listener,
             # Plugin to plugin events. QuickBackupM and TimedQBM will not even
             # import without these.
             "PluginEvent": PluginEvent, "LiteralEvent": LiteralEvent,
@@ -267,6 +285,11 @@ class Host:
             "FunctionThread": FunctionThread,
             "Version": Version,
             "VersionRequirement": VersionRequirement,
+            # PrimeBackup imports Metadata to type the manifest it is handed.
+            "Metadata": Metadata,
+            # ChatBridge swaps this handler into its own logger so its lines
+            # do not land in the middle of the server's.
+            "SyncStdoutStreamHandler": SyncStdoutStreamHandler,
         }
         # The command tree, which is the half of the API plugins build their
         # commands out of. Imported here rather than at the top so the module
@@ -437,6 +460,7 @@ class Host:
         # that message is the raw key forever, and no amount of reloading
         # fixes it because the damage is done at import.
         self._pending_translations = {}
+        self._pending_listeners = {}
         self.load_translations(plugin)
         try:
             module = self._import(plugin)
@@ -456,11 +480,13 @@ class Host:
                                      "not installed (it is the plugin's own "
                                      "dependency)" % (plugin.id, missing))
             self._drop_pending_translations()
+            self._pending_listeners = {}
             return None
         except Exception as exc:
             self.problems.append("%s did not load: %s: %s"
                                  % (plugin.id, type(exc).__name__, exc))
             self._drop_pending_translations()
+            self._pending_listeners = {}
             return None
 
         interface = self._loading
@@ -471,6 +497,13 @@ class Host:
         # entry now, so unloading this plugin takes them back out again.
         entry.translations = self._pending_translations
         self._pending_translations = {}
+        # Same for listeners registered while the module was importing, which
+        # is when `@event_listener` runs. Registering them straight away was a
+        # silent no-op, because the plugin is not in `self.loaded` yet: the
+        # decorator worked, the listener existed, and nothing ever called it.
+        for name, callbacks in self._pending_listeners.items():
+            entry.listeners.setdefault(name, []).extend(callbacks)
+        self._pending_listeners = {}
 
         # Which events this plugin implements that this host never raises.
         # This used to look them up in `loader.MCDR_EVENTS`, which does not
@@ -767,6 +800,11 @@ class Host:
 
     def _call(self, entry, event, handler, *args):
         """Call one plugin's handler, and never let it take the host down."""
+        previous = getattr(self._current, "interface", None)
+        # So `psi()` answers with this plugin while its code runs, not only
+        # while its module is importing. PrimeBackup asks at import time,
+        # but a plugin is just as likely to ask inside `on_load`.
+        self._current.interface = entry.interface
         try:
             handler(*args)
         except NameError as exc:
@@ -779,6 +817,8 @@ class Host:
             self.problems.append("%s failed in %s: %s: %s"
                                  % (entry.id, event, type(exc).__name__, exc))
             entry.interface.logger.exception("error in %s" % event)
+        finally:
+            self._current.interface = previous
 
     def dispatch(self, event, *args):
         """Send an event to every plugin that implements it.
@@ -990,10 +1030,15 @@ class Host:
         that is missing, and a plugin's own event that another plugin will
         raise, which is not a hole at all. Only the first is a problem.
         """
+        name = event_name(event)
         entry = self.loaded.get(plugin_id)
         if entry is None:
+            # Still importing. Held until the entry exists, rather than
+            # dropped: `@event_listener` decorates at module level, which is
+            # before there is anything to attach it to.
+            if self._loading is not None:
+                self._pending_listeners.setdefault(name, []).append(callback)
             return
-        name = event_name(event)
         entry.listeners.setdefault(name, []).append(callback)
         if name not in EVENTS and name in MCDR_EVENT_NAMES:
             self.problems.append("%s listens for %r, which this host does not "
@@ -1115,8 +1160,16 @@ class Host:
         return ConsoleCommandSource(self)
 
     def current_plugin_interface(self):
-        """The interface of the plugin being loaded right now, if any."""
-        return getattr(self, "_loading", None)
+        """The interface of the plugin whose code is running right now.
+
+        Two ways to be that plugin: its module is importing, or one of its
+        handlers is on this thread. Both have to answer, because a plugin
+        reaches for `psi()` from either place.
+        """
+        loading = getattr(self, "_loading", None)
+        if loading is not None:
+            return loading
+        return getattr(getattr(self, "_current", None), "interface", None)
 
 
 def _flatten(data, prefix=""):

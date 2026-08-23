@@ -9,7 +9,9 @@ Reimplemented from documented behaviour, never copied: MCDR is LGPL-3.0.
 """
 
 import functools
+import logging
 import re
+import sys
 import threading
 
 
@@ -43,6 +45,60 @@ def new_thread(arg=None):
     if callable(arg):
         return decorate(arg)
     return lambda func: decorate(func, arg)
+
+
+class SyncStdoutStreamHandler(logging.StreamHandler):
+    """A stdout log handler whose writes cannot interleave with anybody's.
+
+    Plugins that keep their own logger swap in MCDR's handler so their lines
+    do not land in the middle of somebody else's: ChatBridge does it for every
+    client it opens. The lock is shared by every instance, which is the whole
+    point of it.
+    """
+
+    _write_lock = threading.RLock()
+
+    def __init__(self, stream=None):
+        logging.StreamHandler.__init__(self, stream or sys.stdout)
+
+    def emit(self, record):
+        with SyncStdoutStreamHandler._write_lock:
+            logging.StreamHandler.emit(self, record)
+
+    @classmethod
+    def update_stdout(cls, stream=None):
+        """Point future writes at another stream, as MCDR's does."""
+        cls._stream = stream or sys.stdout
+        return cls._stream
+
+
+def event_listener(event, priority=None):
+    """`@event_listener('some.event')`: register a listener by decorating.
+
+    Registered while the plugin's module is being imported, which is when
+    MCDR does it too, so the host has to know which plugin is loading right
+    now. That is exactly what `as_plugin_server_interface()` already answers.
+
+    ChatBridge listens for `more_apis.death_message` this way, and without the
+    name existing it did not even import: `NameError: name 'event_listener'
+    is not defined`.
+    """
+
+    def decorate(func):
+        from mcdr.interface import PluginServerInterface, ServerInterface
+
+        server = ServerInterface.get_instance()
+        interface = server and server.as_plugin_server_interface()
+        if not isinstance(interface, PluginServerInterface):
+            # Outside a plugin being loaded there is nobody to register for.
+            # Saying so beats a listener that silently never fires.
+            raise RuntimeError(
+                "@event_listener works while a plugin is loading, and no "
+                "plugin is loading right now")
+        interface.register_event_listener(event, func, priority)
+        return func
+
+    return decorate
 
 
 class FunctionThread(threading.Thread):

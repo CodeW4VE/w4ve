@@ -22,6 +22,7 @@ boots and tells them.
 import copy
 import enum
 import json
+import re
 
 _MISSING = object()
 
@@ -31,7 +32,8 @@ class Serializable:
 
     def __init__(self, **fields):
         for name, default in self.__field_defaults().items():
-            setattr(self, name, copy.deepcopy(default))
+            if default is not _MISSING:
+                setattr(self, name, copy.deepcopy(default))
         for name, value in fields.items():
             setattr(self, name, value)
 
@@ -51,18 +53,37 @@ class Serializable:
 
     @classmethod
     def __field_defaults(cls):
+        """Field to default, or `_MISSING` for a field declared without one.
+
+        A field with no default is left unset rather than set to None, and
+        `serialize` skips it. WhereIs declares `here_use_broadcast: bool` with
+        no value and reads it back as `self.serialize().get(key, False)`: with
+        a None in there the written config had `"here_use_broadcast": null`,
+        which then failed its own type check on the next load.
+        """
         defaults = {}
         for name in cls.__field_types():
             value = getattr(cls, name, _MISSING)
             if value is not _MISSING and not callable(value):
                 defaults[name] = value
             else:
-                defaults[name] = None
+                defaults[name] = _MISSING
         return defaults
 
     @classmethod
     def get_field_annotations(cls):
         return dict(cls.__field_types())
+
+    @classmethod
+    def get_default(cls):
+        """An instance with nothing but the defaults in it.
+
+        Plugins reach for this when they need the untouched config to compare
+        against or to write out: Task builds its default file with it, and
+        WhereIs asks for the default command prefixes. Missing, both died at
+        load with `type object 'Config' has no attribute 'get_default'`.
+        """
+        return cls()
 
     # --------------------------------------------------------------- reading
 
@@ -79,33 +100,17 @@ class Serializable:
         key nobody reads is usually a typo or a leftover from an older
         version, and deleting somebody's line without telling them is rude.
         """
-        instance = cls()
-        problems = []
-        types = cls.__field_types()
-        for name, wanted in types.items():
-            if name not in (data or {}):
-                continue
-            value = data[name]
-            fixed, why = _coerce(value, wanted, name)
-            if why:
-                problems.append(why)
-                # A partial result is still a result. A collection that lost
-                # one bad element keeps the other nineteen; a value that could
-                # not be read at all comes back as None and keeps the default.
-                if fixed is None:
-                    continue
-            setattr(instance, name, fixed)
-        for name in (data or {}):
-            if name not in types:
-                problems.append("%s is not a setting this plugin reads" % name)
-        return instance, problems
+        return _build(cls, data)
 
     # --------------------------------------------------------------- writing
 
     def serialize(self):
         out = {}
-        for name in type(self).__field_types():
-            out[name] = _serialize_value(getattr(self, name, None))
+        for name in type(self).get_field_annotations():
+            value = getattr(self, name, _MISSING)
+            if value is _MISSING:
+                continue
+            out[name] = _serialize_value(value)
         return out
 
     def to_json_str(self, indent=4):
@@ -120,6 +125,38 @@ class Serializable:
     def __repr__(self):
         fields = ", ".join("%s=%r" % (k, v) for k, v in self.serialize().items())
         return "%s(%s)" % (type(self).__name__, fields)
+
+
+def _build(cls, data):
+    """Fill a Serializable out of plain data. The generic path, always.
+
+    Kept apart from `Serializable.deserialize` on purpose, because a plugin is
+    allowed to override that classmethod and call this back: Task's
+    `Task.deserialize` pulls the sub-tasks out of the dict and then asks for
+    the rest with `deserialize(data=data, cls=cls)`. If the generic function
+    answered by calling the classmethod again, the two would call each other
+    until `RecursionError`, which is exactly what happened.
+    """
+    instance = cls()
+    problems = []
+    types = cls.get_field_annotations()
+    for name, wanted in types.items():
+        if name not in (data or {}):
+            continue
+        value = data[name]
+        fixed, why = _coerce(value, wanted, name)
+        if why:
+            problems.append(why)
+            # A partial result is still a result. A collection that lost one
+            # bad element keeps the other nineteen; a value that could not be
+            # read at all comes back as None and keeps the default.
+            if fixed is None:
+                continue
+        setattr(instance, name, fixed)
+    for name in (data or {}):
+        if name not in types:
+            problems.append("%s is not a setting this plugin reads" % name)
+    return instance, problems
 
 
 def _serialize_value(value):
@@ -137,8 +174,18 @@ def _serialize_value(value):
         return {key: _serialize_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_serialize_value(item) for item in value]
+    # An enum is written as its name, not its value. The name is the word a
+    # person types in the file, and the value can be anything at all:
+    # PrimeBackup's HashMethod holds a dataclass, so writing the value failed
+    # with "Object of type _HashMethodItem is not JSON serializable".
     if isinstance(value, enum.Enum):
-        return value.value
+        return value.name
+    # A compiled regex is written as the pattern it was compiled from, which
+    # is what a person edits in the file. MinecraftDataAPI declares its
+    # `list_output_regex` this way, and without this its very first save
+    # failed with "Object of type Pattern is not JSON serializable".
+    if isinstance(value, re.Pattern):
+        return value.pattern
     return value
 
 
@@ -149,7 +196,7 @@ def _coerce(value, wanted, name):
     if isinstance(wanted, type) and issubclass(wanted, Serializable):
         if not isinstance(value, dict):
             return None, "%s should be a block of settings" % name
-        return wanted.deserialize(value), ""
+        return _build(wanted, value)[0], ""
     if wanted is bool:
         if isinstance(value, bool):
             return value, ""
@@ -163,6 +210,23 @@ def _coerce(value, wanted, name):
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None, "%s should be a number, not %r" % (name, value)
         return float(value), ""
+    if isinstance(wanted, type) and issubclass(wanted, enum.Enum):
+        if isinstance(value, wanted):
+            return value, ""
+        try:
+            return wanted[value], ""
+        except (KeyError, TypeError):
+            return None, "%s should be one of %s, not %r" % (
+                name, ", ".join(member.name for member in wanted), value)
+    if _is_pattern_type(wanted):
+        if isinstance(value, re.Pattern):
+            return value, ""
+        if not isinstance(value, str):
+            return None, "%s should be a regular expression, not %r" % (name, value)
+        try:
+            return re.compile(value), ""
+        except re.error as bad:
+            return None, "%s is not a valid regular expression: %s" % (name, bad)
     if wanted is str:
         if not isinstance(value, str):
             return None, "%s should be text, not %r" % (name, value)
@@ -228,6 +292,17 @@ def _coerce_inside(value, wanted, outer, name):
     return out, "; ".join(problems)
 
 
+def _is_pattern_type(wanted):
+    """Is this field declared as a compiled regex?
+
+    Both spellings count: `re.Pattern`, and the `typing.Pattern` alias that
+    older plugins still use.
+    """
+    if wanted is re.Pattern:
+        return True
+    return getattr(wanted, "__origin__", None) is re.Pattern
+
+
 def _worth_coercing(inner):
     """Only convert element types that actually need converting.
 
@@ -247,11 +322,19 @@ def serialize(obj):
     return _serialize_value(obj)
 
 
-def deserialize(data, target_class, **kwargs):
-    """`deserialize(data, SomeClass)`: build an object out of plain JSON."""
-    if isinstance(target_class, type) and issubclass(target_class, Serializable):
-        return target_class.deserialize(data, **kwargs)
-    value, problem = _coerce(data, target_class, "value")
+def deserialize(data, cls, **kwargs):
+    """`deserialize(data, SomeClass)`: build an object out of plain JSON.
+
+    The second argument is named `cls` because plugins pass it by keyword:
+    Task calls `deserialize(data=data, cls=cls)` from inside its own
+    classmethod, and a parameter named anything else is a TypeError at load.
+    """
+    if isinstance(cls, type) and issubclass(cls, Serializable):
+        instance, problems = _build(cls, data)
+        if kwargs.get("with_problems"):
+            return instance, problems
+        return instance
+    value, problem = _coerce(data, cls, "value")
     if problem:
         raise ValueError(problem)
     return value

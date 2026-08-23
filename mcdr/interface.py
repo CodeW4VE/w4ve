@@ -66,11 +66,19 @@ class ServerInterface:
 
     @classmethod
     def psi(cls):
-        return cls._instance
+        """The interface of the plugin asking, not the shared one.
+
+        `si()` and `psi()` are not the same call: PrimeBackup asks for `psi()`
+        at import time and immediately calls `get_self_metadata()` on it, so
+        handing back the plain shared interface fails with
+        `'ServerInterface' object has no attribute 'get_self_metadata'`.
+        """
+        instance = cls._instance
+        return instance.as_plugin_server_interface() if instance else None
 
     @classmethod
     def psi_opt(cls):
-        return cls._instance
+        return cls.psi()
 
     # ------------------------------------------------------------ the server
 

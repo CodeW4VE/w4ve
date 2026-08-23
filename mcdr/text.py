@@ -83,6 +83,21 @@ class RTextBase:
         return value if isinstance(value, RTextBase) else RText(value)
 
     @staticmethod
+    def join(divider, items):
+        """`RTextBase.join('\n', [...])`, which keeps every piece's styling.
+
+        `'\n'.join(...)` would flatten each element to plain text and lose the
+        colours and the clicks. Task builds its whole `!!task` screen this way
+        and died with `type object 'RTextBase' has no attribute 'join'`.
+        """
+        result = RTextList()
+        for index, item in enumerate(items):
+            if index > 0:
+                result.append(divider)
+            result.append(item)
+        return result
+
+    @staticmethod
     def format(template, *args, **kwargs):
         """`'{} -> {}'.format(...)` where the arguments are text objects.
 
@@ -187,7 +202,13 @@ class RText(RTextBase):
         return data
 
     def to_plain_text(self):
-        return self.text
+        # ⚠️ Whatever a plugin put in there, a string comes out. `RText(...)`
+        # takes any object, and plugins do pass text objects to it: Task
+        # builds one line of `!!task` that way, and the RTextList around it
+        # then failed with "expected str instance, RTextList found".
+        if isinstance(self.text, RTextBase):
+            return self.text.to_plain_text()
+        return self.text if isinstance(self.text, str) else str(self.text)
 
 
 class RTextList(RTextBase):
@@ -255,7 +276,15 @@ class RTextMCDRTranslation(RText):
     def to_plain_text(self):
         if self._translator is None:
             return self.key
-        return self._translator(self.key, *self.args, **self.kwargs)
+        translated = self._translator(self.key, *self.args, **self.kwargs)
+        # ⚠️ Always a string, whatever the translator hands back. A
+        # translation is allowed to resolve to a text object rather than a
+        # line: Task's `!!task` screen has one, and an RTextList that carried
+        # it blew up on the way out with "sequence item 6: expected str
+        # instance, RTextList found".
+        if isinstance(translated, RTextBase):
+            return translated.to_plain_text()
+        return translated if isinstance(translated, str) else str(translated)
 
     def to_json_object(self):
         data = RText.to_json_object(self)
