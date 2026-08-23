@@ -8,8 +8,8 @@ Lo que sigue no es un plan: es lo que pasó, en el orden en que pasó. Cada paso
 se ejecutó tal como está escrito, y lo que el documento no decía se descubrió
 por las malas y está corregido abajo.
 
-En el mirror de verdad falta una cosa que aquí no se pudo probar: **el
-contenedor**. Va al final, en lo que hay que mirar con los ojos abiertos.
+El contenedor también, en uno con Java y Python como el que el mirror ya usa:
+sección aparte más abajo.
 
 ---
 
@@ -116,11 +116,33 @@ mira ninguno de los dos.
 
 ---
 
+## El contenedor
+
+Probado el mismo día, en un contenedor con Java 21 y Python 3, que es lo que la
+imagen del mirror ya tiene (`registry.h4l.ch/luxius/mcdr-pterodactyl:1.0.0`
+lleva Python 3.12 y Java 21, porque MCDR es Python).
+
+- **El guardián arranca como PID 1** y el servidor queda listo. Eso es
+  exactamente lo que wings quiere: un proceso en primer plano, no un wrapper
+  dentro de otro.
+- **`podman stop` (SIGTERM, que es lo que manda el panel) hace lo correcto**:
+  el guardián lo recibe, para el servidor, el mundo se guarda entero
+  ("All dimensions are saved") y sale con código 0. Sin `SIGKILL`, sin esperar
+  el timeout.
+- Se le puede hablar desde fuera con `docker exec ... w4ve status`.
+
+⚠️ **W4VE necesita Python dentro del contenedor.** No es un problema aquí
+(la imagen de MCDR lo trae por definición), pero **una imagen de Minecraft a
+secas no lo tiene**: `ghcr.io/pterodactyl/yolks:java_21` es solo Java, y ahí el
+guardián no arranca. Para el mirror da igual; para cualquiera que venga de
+fuera es lo primero que hay que decirle.
+
+Lo que sigue sin probarse del contenedor es el `chown` previo al arranque que
+ya dio un disgusto una vez (el gotcha del bind read-only), porque eso lo hace
+wings y no podman.
+
 ## Lo que no está probado, y hay que mirar con los ojos abiertos
 
-- **El contenedor.** El guardián en primer plano dentro de wings, con el `chown`
-  previo al arranque que ya dio un disgusto una vez (el gotcha del bind
-  read-only). Se arranca desde el panel, no a mano. Es lo único grande que queda.
 - **El bot de ChatBridge contra Discord de verdad.** Sus cuatro procesos corren
   sin MCDR; el login con un token real, no se ha hecho.
 - **`!!online` desde la consola** no funciona, ni aquí ni bajo MCDR: el plugin

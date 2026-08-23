@@ -304,6 +304,9 @@ read, and it is the one place where the state of a server is written down.
 - A native plugin platform. MCDR plugins run; a `plugin` component in a package
   is refused on purpose, because accepting one would mean installing code
   nothing can run.
+- Run without Python in the container. The guardian is Python, so an image
+  that is only Java (`yolks:java_21` and friends) cannot start it. An MCDR image
+  already has both, because MCDR is Python too.
 - Update the guardian without restarting the server. The server survives the
   guardian today, but it gets its console back on the next start W4VE does.
 - Reload a web server by itself. `w4ve http` writes the configuration and tells
