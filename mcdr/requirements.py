@@ -53,8 +53,47 @@ def parse_requirements(text):
     return out
 
 
+# The interpreter these questions are asked of. None means "this one", which
+# is right when w4ve is being run by the same Python the server will use, and
+# wrong the rest of the time: a server with its own virtualenv is the normal
+# case, not the exception, and asking the wrong interpreter reports packages as
+# missing that are sitting right there.
+_INTERPRETER = None
+
+PROBE = """
+import importlib.metadata as meta, sys
+for name in sys.argv[1:]:
+    try:
+        meta.distribution(name)
+        sys.exit(0)
+    except Exception:
+        pass
+sys.exit(1)
+"""
+
+
+def use_interpreter(path):
+    """Ask a different Python from now on. `None` goes back to this one."""
+    global _INTERPRETER
+    _INTERPRETER = str(path) if path else None
+
+
+def interpreter():
+    return _INTERPRETER
+
+
 def installed(name):
     """Is this distribution installed? None when we cannot tell."""
+    if _INTERPRETER:
+        import subprocess
+
+        try:
+            probe = subprocess.run(
+                [_INTERPRETER, "-c", PROBE, name, name.replace("_", "-")],
+                capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return probe.returncode == 0
     if _metadata is None:
         return None
     try:

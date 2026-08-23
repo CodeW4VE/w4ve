@@ -1296,18 +1296,44 @@ def cmd_init(args, index):
     # PATH is not the one the server runs, and a wrong value here makes
     # `doctor` cry wolf forever.
     java = ""
-    # An MCDR install has the game in `server/`. Guessing this right matters:
-    # get it wrong and every jar lands in a folder Minecraft never reads.
-    game_dir = "server" if (root / "server" / "mods").is_dir() else "."
-    path.write_text(TEMPLATE.format(
+    # Where the game runs. Getting this wrong is the quiet kind of wrong: jars
+    # land where Minecraft never reads, and a plugin writing a relative path
+    # writes it into the wrong folder and says nothing.
+    #
+    # ⚠️ MCDR's own config is asked FIRST, and it is the only one of these that
+    # is a statement rather than a guess. Looking for `server/mods` was the
+    # only test for a while, and it says "." for a vanilla server under MCDR,
+    # which is every one that runs no mods.
+    mcdr = read_mcdr_config(root)
+    start = (mcdr or {}).get("start_command") or ""
+    if mcdr and mcdr.get("working_directory"):
+        game_dir = str(mcdr["working_directory"]).strip("/") or "."
+        found = "MCDR's config.yml says so"
+    elif (root / "server" / "mods").is_dir():
+        game_dir, found = "server", "there is a server/mods here"
+    elif (root / "server").is_dir() and any(
+            (root / "server").glob("*.jar")):
+        game_dir, found = "server", "the jar is in server/"
+    else:
+        game_dir, found = ".", ""
+    body = TEMPLATE.format(
         name=args.name or root.name,
         kind="client" if args.client else "server",
         mc=args.mc or "1.21",
         java=java or "21",
-        game_dir=game_dir))
+        game_dir=game_dir)
+    if start:
+        # Copied, never rewritten: the flags on it are somebody's tuning, and
+        # a start command that is nearly right is a different server.
+        body = body.replace(
+            '# start = "java -Xms8G -Xmx8G -jar fabric-server-launch.jar nogui"',
+            'start    = %s' % json.dumps(start))
+    path.write_text(body)
     say(f"{Out.ok('ok')}  wrote {path}")
-    if game_dir != ".":
-        say(Out.dim(f"    found an MCDR layout, game_dir = \"{game_dir}\""))
+    if found:
+        say(Out.dim(f"    game_dir = \"{game_dir}\", because {found}"))
+    if start:
+        say(Out.dim("    start command copied from MCDR's config.yml"))
     say(Out.dim("    `w4ve adopt` writes down what is already installed"))
     return 0
 
@@ -2972,6 +2998,20 @@ LIVE_PLUGIN_ACTIONS = {
 }
 
 
+def guess_interpreter(root):
+    """A virtualenv sitting in the server folder, if there is one.
+
+    Looked for rather than demanded: somebody migrating from MCDR almost
+    certainly has one, because that is how MCDR is installed, and making them
+    pass a flag to be told the truth is a good way to be told a lie.
+    """
+    for name in ("venv", ".venv", "env"):
+        candidate = Path(root) / name / "bin" / "python"
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def cmd_plugins(args, index):
     """What MCDR plugins this server has, and what is wrong with them.
 
@@ -2989,8 +3029,26 @@ def cmd_plugins(args, index):
     if mcdr is None:
         problem("this w4ve cannot read MCDR plugins (the mcdr package is missing)")
         return 2
-    server = need_server(args)
-    folder = server.root / (args.folder or "plugins")
+    # ⚠️ Works with no w4ve.toml, on purpose, and `preflight` works the same
+    # way for the same reason. The honest moment to ask "will my plugins run
+    # under this?" is while MCDR is still the thing running, before anything
+    # has been converted. A check that demands you convert first is a check
+    # that arrives after the decision it was supposed to inform.
+    server = Server.find(args.dir) or _rootlike(Path(args.dir or ".").resolve())
+    folder = Path(server.root) / (args.folder or "plugins")
+    # Which Python the plugins will really run under. A server with its own
+    # virtualenv is the normal case, and asking this one instead reports as
+    # missing whatever is installed over there. Guessed from the folder when
+    # nobody says, because that guess is right nearly every time.
+    chosen = getattr(args, "python", None) or guess_interpreter(server.root)
+    if chosen:
+        try:
+            from mcdr import requirements as _requirements
+            _requirements.use_interpreter(chosen)
+            if chosen != sys.executable:
+                say(Out.dim(f"asking {chosen} what is installed"))
+        except ImportError:
+            pass
     if not folder.is_dir():
         problem(f"{folder} is not there")
         note("MCDR keeps plugins in `plugins/` at the root of the server")
@@ -3011,8 +3069,14 @@ def cmd_plugins(args, index):
         bits = [plugin.version or Out.dim("no version")]
         if plugin.problems:
             bits.append(Out.bad(plugin.problems[0]))
-        elif plugin.dependencies:
-            bits.append(Out.dim("needs " + ", ".join(sorted(plugin.dependencies))))
+        else:
+            # Only what is actually missing. Printing every dependency made a
+            # plugin whose dependency was sitting right there in the same list
+            # read as broken, which is the opposite of what this command is for.
+            here = {p.id for p in plugins if p.id}
+            absent = sorted(d for d in plugin.dependencies if d not in here)
+            if absent:
+                bits.append(Out.bad("needs " + ", ".join(absent)))
         say(f"  {label}  {'  '.join(bits)}  {Out.dim(plugin.path.name)}")
 
     say()
@@ -3513,6 +3577,10 @@ def build_parser():
                           "what MCDR plugins this server has")
     listing_plugins.add_argument("--folder",
                                  help="where they live (default: plugins)")
+    listing_plugins.add_argument("--python",
+                                 help="the interpreter the plugins will run "
+                                      "under (default: a venv in the server "
+                                      "folder, or this one)")
     listing_plugins.add_argument("--load", action="store_true",
                                  help="actually load them, to see which ones run")
     listing_plugins.add_argument("action", nargs="?",

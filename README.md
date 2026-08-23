@@ -159,7 +159,24 @@ not parse.
 
 `--load` is the rehearsal for a cutover: the plugins are loaded for real,
 against nothing, so you find out which ones run under W4VE before anything
-moves.
+moves. Both work with **no `w4ve.toml`**, on purpose: the honest moment to ask
+"will my plugins run under this?" is while MCDR is still the thing running.
+
+It asks the interpreter the plugins will really run under, finding a
+virtualenv in the server folder by itself (`--python` to say where). MCDR is
+installed in one, so asking this one instead reports as missing whatever is
+sitting right there.
+
+The migration has been walked end to end against **MCDReforged 2.15.7 really
+installed**, a real 1.21 world and the real plugins: stop MCDR, `init`, `run`,
+backup, `stop`, and then **start MCDR again and watch it list the backup W4VE
+made**. [docs/cutover-del-mirror.md](docs/cutover-del-mirror.md) is what
+happened, in the order it happened.
+
+The sharpest thing that came out of it: the one plugin that fails to load fails
+**identically under both**, with the same `AttributeError` on an API MCDR
+removed versions ago. A plugin that does not work today will not work after the
+cutover either, and that is not a regression.
 
 **Thirteen out of thirteen of the plugins MineWave runs load, and they work.**
 Against a real 1.21 world, with no MCDR installed anywhere: QuickBackupM makes

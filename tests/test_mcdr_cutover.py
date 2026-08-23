@@ -12,6 +12,7 @@ underneath it, and the real plugins already proved the API is what breaks.
 
 import enum
 import re
+import argparse
 import sys
 import tempfile
 import unittest
@@ -20,6 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import w4ve  # noqa: E402
 from mcdr.host import Host, Logger  # noqa: E402
 from mcdr.serializer import Serializable, deserialize  # noqa: E402
 from mcdr.text import (RColor, RText, RTextBase, RTextList,  # noqa: E402
@@ -387,3 +389,58 @@ class UnsetFileCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class InitReadsMcdrCase(unittest.TestCase):
+    """What `w4ve init` takes from MCDR's own config, and what it does not.
+
+    Found by walking the cutover document on a real MCDR install: `init` had
+    been guessing the layout from whether `server/mods` existed, which says "."
+    for a vanilla server under MCDR, which is every one that runs no mods. A
+    wrong game_dir is the quiet failure of the whole migration: plugins write
+    to relative paths, so a backup lands in an empty folder and reports success.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="w4ve-init-"))
+        (self.tmp / "server").mkdir()
+        (self.tmp / "server" / "server.jar").write_text("not really")
+
+    def init(self, force=False):
+        args = argparse.Namespace(dir=str(self.tmp), name="mirror", mc="1.21",
+                                  client=False, force=force, dry_run=False,
+                                  yes=True)
+        w4ve.cmd_init(args, None)
+        return (self.tmp / "w4ve.toml").read_text()
+
+    def test_the_layout_comes_from_mcdr_when_mcdr_says_so(self):
+        (self.tmp / "config.yml").write_text(
+            "working_directory: server\n"
+            "start_command: java -Xmx4G -jar server.jar nogui\n")
+        text = self.init()
+        self.assertIn('game_dir = "server"', text)
+
+    def test_the_start_command_is_copied_and_not_rewritten(self):
+        # Somebody's flags are somebody's tuning. A start command that is
+        # nearly right is a different server.
+        command = "/opt/jdk-21/bin/java -Xms8G -Xmx8G -XX:+UseG1GC -jar fabric.jar nogui"
+        (self.tmp / "config.yml").write_text(
+            "working_directory: server\nstart_command: %s\n" % command)
+        text = self.init()
+        self.assertIn(command, text)
+
+    def test_a_vanilla_server_under_mcdr_is_not_read_as_flat(self):
+        # No `server/mods`, because it runs no mods. The old test said "." here.
+        (self.tmp / "config.yml").write_text("working_directory: server\n")
+        self.assertIn('game_dir = "server"', self.init())
+
+    def test_with_no_mcdr_the_jar_in_server_is_enough(self):
+        self.assertIn('game_dir = "server"', self.init())
+
+    def test_a_plain_folder_stays_plain(self):
+        empty = Path(tempfile.mkdtemp(prefix="w4ve-plain-"))
+        args = argparse.Namespace(dir=str(empty), name="x", mc="1.21",
+                                  client=False, force=False, dry_run=False,
+                                  yes=True)
+        w4ve.cmd_init(args, None)
+        self.assertIn('game_dir = "."', (empty / "w4ve.toml").read_text())
