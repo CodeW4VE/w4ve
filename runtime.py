@@ -222,7 +222,8 @@ class Watched:
             self.guardian.log("%s: %s -> %s%s" % (self.name, old, state,
                                                   "  (%s)" % why if why else ""))
             self.guardian.snapshot()
-            self.guardian.plugins_state(self.name, state, self.ready)
+            self.guardian.plugins_state(self.name, state, self.ready,
+                                        self.exit_code)
 
     def status(self):
         running = alive(self.pid, self.starttime)
@@ -748,9 +749,9 @@ class Guardian:
         if self.plugins is not None:
             self.plugins.feed(name, line)
 
-    def plugins_state(self, name, state, ready):
+    def plugins_state(self, name, state, ready, exit_code=None):
         if self.plugins is not None:
-            self.plugins.state_changed(name, state, ready)
+            self.plugins.state_changed(name, state, ready, exit_code)
 
     def plugins_console(self, text):
         """Offer a typed line to the plugins. `(claimed, what it answered)`."""

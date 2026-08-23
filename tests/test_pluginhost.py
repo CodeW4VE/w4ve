@@ -34,6 +34,7 @@ from mcdreforged.api.all import *
 PLUGIN_METADATA = {'id': 'talker', 'version': '1.0.0'}
 
 heard = []
+codes = []
 events = []
 
 def on_load(server, prev):
@@ -49,8 +50,13 @@ def on_player_joined(server, player, info):
 def on_server_startup(server):
     events.append('startup')
 
-def on_server_stop(server):
+def on_server_stop(server, code):
+    # ⚠️ Two arguments, the way MCDR calls it and the way every real plugin
+    # declares it. This fixture used to take one, which is why dispatching
+    # without the exit code passed here and failed against ChatBridge,
+    # PrimeBackup and Task all at once.
     events.append('stop')
+    codes.append(code)
 
 def on_unload(server):
     events.append('unloaded')
@@ -140,6 +146,22 @@ class PluginRuntimeTest(unittest.TestCase):
         events = self.module(plugins, "talker").events
         self.assertIn("startup", events)
         self.assertIn("stop", events)
+
+    def test_the_stop_event_carries_the_exit_code(self):
+        """MCDR hands the exit code over, and plugins declare it as required.
+
+        Every real plugin that listens for the server going down takes it:
+        ChatBridge, PrimeBackup and Task all died with `on_server_stop()
+        missing 1 required positional argument` on the way down, which is the
+        worst moment to lose a handler, because that is where a plugin saves
+        what it was holding.
+        """
+        self.plugin("talker.py", TALKER)
+        plugins = self.start()
+        plugins.state_changed("server", "running", True)
+        plugins.state_changed("server", "stopped", False, 0)
+        self.settle(plugins)
+        self.assertEqual([0], self.module(plugins, "talker").codes)
 
     def test_the_same_state_twice_is_one_event(self):
         self.plugin("talker.py", TALKER)

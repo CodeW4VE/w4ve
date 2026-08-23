@@ -206,7 +206,7 @@ class PluginRuntime:
             return False, ["the plugins did not answer in five seconds"]
         return bool(result.get("ran")), list(result.get("lines") or [])
 
-    def state_changed(self, name, state, ready):
+    def state_changed(self, name, state, ready, exit_code=None):
         """The guardian's process changed state: turn it into MCDR events."""
         if self.host is None or name != self.server_name:
             return
@@ -219,7 +219,13 @@ class PluginRuntime:
             self.submit(self.host.dispatch, "on_server_startup")
         if state in ("stopped", "crashed") and \
                 (previous or (None, None))[0] not in ("stopped", "crashed", None):
-            self.submit(self.host.dispatch, "on_server_stop")
+            # ⚠️ With the exit code. MCDR hands it over as the second
+            # argument and plugins declare it as required, so dispatching
+            # without it is a TypeError in every one of them at once:
+            # ChatBridge, PrimeBackup and Task all died on the way down, which
+            # is the worst possible moment to lose a handler, because
+            # `on_server_stop` is where a plugin saves what it was holding.
+            self.submit(self.host.dispatch, "on_server_stop", exit_code)
 
     # ------------------------------------------------------------------ output
 
