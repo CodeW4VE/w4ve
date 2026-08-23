@@ -71,10 +71,15 @@ w4ve remove mypiece                 # take out exactly what it put in
   for this server. Two that match is the package being wrong, and it is said at
   install time rather than found by Fabric at boot.
 - **A piece can bring a service.** A `service` component declares a process:
-  command, working folder, restart policy, the Python modules it needs and a
-  health URL. It lands as a `[services.<name>]` block in your `w4ve.toml`, with
-  a comment saying which piece put it there, and the guardian watches it like
-  it watches the server.
+  command, working folder, restart policy, the Python modules it needs and how
+  to ask whether it is up. It lands as a `[services.<name>]` block in your
+  `w4ve.toml`, with a comment saying which piece put it there, and the guardian
+  watches it like it watches the server. A service that needs another one first
+  says `after = "the-other"` and is held back until it is really up, not merely
+  started. `health_url` asks over HTTP; `health_tcp` is for a daemon that
+  speaks its own protocol and could never answer a URL. What a service is asked
+  with is a signal, not a console command, and its grace is ten seconds rather
+  than the ninety a world needs to save.
 - **A piece can ask for a restart.** A `watch` component says which console
   line to look for and what to do about it. RegionCast stops the server to copy
   region files and prints one line asking to come back; under MCDR that costs a
@@ -113,17 +118,34 @@ not parse.
 
 `--load` is the rehearsal for a cutover: the plugins are loaded for real,
 against nothing, so you find out which ones run under W4VE before anything
-moves. **Here 1.2.2 does**, unmodified and with no MCDR installed: it writes
-its config, answers `!!here` in chat, and sends the same tellraw it sends under
-MCDR, waypoint buttons and Nether conversion included.
+moves.
 
-**DigAll 4.2.1 works too**: `!!dig-all status` typed in chat walks the command
-tree the plugin built, runs its callback on its own thread, and replies to the
-player who asked, in words rather than translation keys.
+**Thirteen out of thirteen of the plugins MineWave runs load, and they work.**
+Against a real 1.21 world, with no MCDR installed anywhere: QuickBackupM makes
+a real backup, TimedQBM hears about it through the plugin-to-plugin event,
+`!!help` mixes everyone's help in words rather than translation keys, and a
+plugin reloads in place and picks up a config you edited by hand.
+[docs/ensayo-de-cutover.md](docs/ensayo-de-cutover.md) is the report, including
+every hole a real plugin fell into on the way.
 
-What does not work yet is said out loud rather than hidden. A plugin reaching
-for a name this host does not carry is told which name, which turns a
-compatibility hole into a one line fix.
+Two kinds of failure are said with different words, because they are different
+problems. A plugin reaching for a name this host does not carry is **our** hole,
+and it is told which name. A plugin missing a pip package of its own would be
+missing it under MCDR too, and `w4ve plugins` prints the exact `pip install`
+line for it. It never installs anything itself.
+
+### A process that is not a plugin
+
+ChatBridge is four processes: the plugin, a daemon, a client that answers
+`!!online` over RCON, and a Discord bot. **The daemon imports `mcdreforged`
+too**, and it is not a plugin: it is a separate process started from a command
+line. Under MCDR the answer is to pip install all of MCDR on that machine to
+get one class out of it.
+
+W4VE ships the package instead. `compat/mcdreforged/` re-exports what the host
+already has, nothing reimplemented, so the daemon and the plugin hold the same
+`Serializable` and a fix in one is a fix in both. A service declares `mcdr =
+true` and the guardian puts it on that process's `PYTHONPATH`.
 
 Everything here is reimplemented from documented behaviour, never copied. MCDR
 is LGPL-3.0 and copying its code would pull that licence onto W4VE.
@@ -161,7 +183,10 @@ Three things it does on purpose:
 
 Services declared in `w4ve.toml` are watched the same way, which is how the
 second half of a piece (an image service, a scanner, a bridge) stops being a
-cron nobody looks at.
+cron nobody looks at. ChatBridge's daemon and its `!!online` client are two
+blocks in the file rather than two systemd units written by hand, and one
+`w4ve run` brings up the server, both of them and the plugins that talk to
+them.
 
 Every command takes `-n` to say what it would do and change nothing, and `-y` to
 answer yes to everything (for scripts and cron).
