@@ -64,11 +64,16 @@ whole, jars and all. It exists for the pieces a jar cannot cover, the ones
 whose second half is a process rather than a file.
 
 ```sh
+w4ve install wavechat-server        # from the catalog, like anything else
 w4ve pack ./mypiece                 # build mypiece-1.0.0.w4ve out of a folder
-w4ve install ./mypiece-1.0.0.w4ve   # put every part where it goes
+w4ve install ./mypiece-1.0.0.w4ve   # or install one you have on disk
 w4ve remove mypiece                 # take out exactly what it put in
 ```
 
+- **The catalog can hand you one.** A piece whose release is a `.w4ve` is
+  installed by name, the same as a jar: it is downloaded, unpacked into its
+  places, and the archive is not left lying around. Without that the catalog
+  could only ever offer the half of a piece that happens to be a file.
 - **One package, every Minecraft version.** ShapeBoard ships thirteen jars in
   one release; the package carries all of them and the install picks the one
   for this server. Two that match is the package being wrong, and it is said at

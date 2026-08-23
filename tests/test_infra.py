@@ -8,6 +8,7 @@ and that the two rules that cost real time on a real machine are kept: the
 exact route wins over the prefix, and a cache never throws away what people use.
 """
 
+import argparse
 import json
 import os
 import sys
@@ -484,3 +485,65 @@ class UpdateKeepsAnswersCase(unittest.TestCase):
         self.server.set_setting("demo", "token", "hunter2", declarations, "demo")
         package.remove(self.server, "demo")
         self.assertEqual(self.server.secrets_of("demo"), {})
+
+
+class CatalogPackageCase(unittest.TestCase):
+    """A package the catalog offers, which is what makes it one command.
+
+    Without this the catalog can only hand you the half of a piece that
+    happens to be a jar, and installing the other half means finding a file
+    somewhere and typing its path. The whole format exists to close that gap.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="w4ve-cat-"))
+        self.server = a_server(self.tmp)
+        data = dict(FULL, id="demo", version="1.0.0", settings=[], components=[
+            {"kind": "service", "name": "demo-api", "command": ["true"]},
+            {"kind": "storage", "name": "demo-media",
+             "dir": "w4ve/storage/demo/media", "quota": "1G"},
+        ])
+        self.pkg = build_package(self.tmp / "src", data)
+        digest = package.sha256_of(self.pkg)
+        self.index = {
+            "schema": 1, "profiles": {},
+            "pieces": {"demo": {
+                "id": "demo", "name": "Demo", "type": "w4ve-package",
+                "side": "server", "summary": "s", "mc": "*",
+                "releases": [{"version": "1.0.0", "source": "github", "files": [
+                    {"name": self.pkg.name, "url": self.pkg.as_uri(),
+                     "hashes": {"sha256": digest}}]}],
+            }},
+        }
+        self.args = argparse.Namespace(dry_run=False, force=False, yes=True,
+                                       dir=str(self.server.root))
+
+    def test_a_package_from_the_catalog_installs_like_any_other(self):
+        changed, message = w4ve.install_one(self.server, self.index, "demo",
+                                            quiet=True)
+        self.assertTrue(changed, message)
+        again = w4ve.Server(self.server.root)
+        self.assertIn("[services.demo-api]",
+                      (again.root / "w4ve.toml").read_text())
+        self.assertEqual(again.state["pieces"]["demo"]["source"], "package")
+
+    def test_the_package_file_is_not_left_lying_around(self):
+        w4ve.install_one(self.server, self.index, "demo", quiet=True)
+        leftovers = list(Path(self.server.root).rglob("*.w4ve"))
+        self.assertEqual(leftovers, [],
+                         "a delivery format kept on disk is one more thing "
+                         "nobody knows whether they can delete")
+
+    def test_installing_the_same_version_twice_does_nothing(self):
+        w4ve.install_one(self.server, self.index, "demo", quiet=True)
+        again = w4ve.Server(self.server.root)
+        changed, _ = w4ve.install_one(again, self.index, "demo", quiet=True)
+        self.assertFalse(changed)
+
+    def test_a_dry_run_says_what_it_would_do_and_writes_nothing(self):
+        changed, message = w4ve.install_one(self.server, self.index, "demo",
+                                            dry_run=True, quiet=True)
+        self.assertTrue(changed)
+        self.assertIn("package", message)
+        self.assertNotIn("[services.demo-api]",
+                         (self.server.root / "w4ve.toml").read_text())

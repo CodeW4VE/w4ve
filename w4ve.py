@@ -80,6 +80,9 @@ DEFAULT_DIRS = {
 # elsewhere, not something you drop into a server folder.
 NOT_INSTALLABLE = {
     "discord-bot": "a bot you host yourself, not a server file",
+    # `service` used to mean "infrastructure, not a product". A piece whose
+    # second half is a process is now installable like anything else, so the
+    # word it needed is `w4ve-package`, below.
     "service": "infrastructure, not a product",
     "runtime": "install it with pip, not into a server folder",
     "library": "a dependency for building mods, not for running one",
@@ -913,6 +916,9 @@ def mc_sensitive(piece):
     on every version, and filtering it by the numbers in its own file name is
     how it got dropped from a 1.21 server that could run it fine.
     """
+    # A `.w4ve` carries every version at once and picks at install time, so
+    # filtering its release by the server's Minecraft would hide the one file
+    # that was going to work.
     return piece.get("type") in ("fabric-mod", "library", "datapack",
                                  "resourcepack")
 
@@ -1077,6 +1083,43 @@ def download(url, dest, expected_hashes=None, quiet=False):
         return None, str(err)
 
 
+def install_catalog_package(server, pid, release, asset, dry_run, quiet):
+    """Download a `.w4ve` from the catalog and install it as a package.
+
+    Downloaded to a temporary file and never kept: the package is a delivery
+    format, and leaving a copy of it in the server folder would be one more
+    thing nobody knows whether they can delete.
+    """
+    current = server.installed(pid)
+    if current and current.get("version") == release["version"]:
+        return False, None
+    if dry_run:
+        version_from = current["version"] if current else "-"
+        return True, f"{pid}  {version_from} -> {release['version']}  (package)"
+
+    pkg = package_module()
+    if pkg is None:
+        return False, f"{pid}: this w4ve cannot read packages (package.py is missing)"
+
+    folder = Path(tempfile.mkdtemp(prefix="w4ve-pkg-"))
+    try:
+        target = folder / asset["name"]
+        _digest, err = download(asset["url"], target, asset.get("hashes"),
+                                quiet=quiet)
+        if err:
+            return False, f"{pid}: {err}"
+        # Straight through the same path as a package on disk, so a piece from
+        # the catalog and a piece from a file cannot behave differently.
+        args = argparse.Namespace(dry_run=False, force=True, yes=True,
+                                  dir=str(server.root))
+        code = install_packages(server, [target], args, report=False)
+        if code:
+            return False, f"{pid}: the package did not install"
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    return True, None
+
+
 def install_one(server, index, pid, want=None, explicit_file=None,
                 dry_run=False, quiet=False):
     """Install or move a single piece. Returns (changed, message)."""
@@ -1105,6 +1148,14 @@ def install_one(server, index, pid, want=None, explicit_file=None,
     asset, why = pick_file(piece, release, mc, explicit_file)
     if not asset:
         return False, f"{pid}: {why}"
+
+    # A piece whose release is a `.w4ve` is a whole piece, not a file, and it
+    # is what makes `w4ve install wavechat-server` mean the same as installing
+    # the package by hand. Without this the catalog can only offer the half of
+    # a piece that happens to be a jar, which is the gap this whole format
+    # exists to close.
+    if asset["name"].endswith(".w4ve"):
+        return install_catalog_package(server, pid, release, asset, dry_run, quiet)
 
     current = server.installed(pid)
     if current and current.get("source") == "package":
@@ -2427,8 +2478,13 @@ def package_module():
         return None
 
 
-def install_packages(server, paths, args):
-    """Install `.w4ve` files: a piece that arrives whole, second half included."""
+def install_packages(server, paths, args, report=True):
+    """Install `.w4ve` files: a piece that arrives whole, second half included.
+
+    `report=False` is for the catalog path, which installs a package on its way
+    through and reports once at the end for everything it installed. Without
+    it the pending-restart notice comes out twice.
+    """
     pkg = package_module()
     if pkg is None:
         problem("this w4ve cannot read packages (package.py is missing)")
@@ -2521,7 +2577,7 @@ def install_packages(server, paths, args):
             say(Out.dim(f"    public routes: {', '.join(record['http'])}  "
                         f"(`w4ve http` writes the web server config)"))
         finish_install(server, manifest.id, args)
-    return report_pending(server, changed, args)
+    return report_pending(server, changed, args) if report else 0
 
 
 def finish_install(server, pid, args):
