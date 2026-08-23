@@ -78,6 +78,7 @@ respuesta.
 | --- | --- | --- |
 | `hello` | primero, siempre | `plugin`, `version`, `protocol`, `capabilities` |
 | `command` | al arrancar, para registrar | `name`, `help`, `permission` |
+| `ready` | cuando ha terminado de arrancar | (ninguno) |
 | `log` | cuando quiera | `level`, `message` |
 | `say` | decir algo en el juego | `text`, `player` (opcional) |
 | `call` | pedir algo al núcleo | `method`, `params` |
@@ -97,6 +98,13 @@ respuesta.
 sus primeros segundos no está vivo, esté su proceso vivo o no: eso distingue
 "arrancó" de "funciona", que es la misma distinción entre liveness y readiness
 del RFC-0001.
+
+**Y `hello` tampoco es estar listo.** El orden completo es `hello` → `welcome`
+→ `command`\* → `ready`. Entre el saludo y el `ready` el plugin registra sus
+comandos y hace lo suyo; sin ese último paso el núcleo devuelve el control en
+cuanto oye el `hello`, y el primer comando llega antes de que el plugin haya
+dicho que es suyo. Eso pasó de verdad, lo encontró la suite la primera vez que
+le preguntó sus comandos a un plugin recién arrancado.
 
 **La versión del protocolo se negocia en el handshake.** El núcleo dice cuál
 habla; un worker que pide una que no existe se rechaza al arrancar y no a
@@ -138,7 +146,24 @@ saludo = "hola"
 Menos campos de los que el manifiesto enumera, a propósito: los que están son
 los que el núcleo usa hoy. Un campo que no se lee es documentación que miente.
 
-## 7. Lo que este RFC no hace
+## 7. Dos cosas que sólo salieron de implementarlo
+
+Se anotan porque son errores fáciles de repetir en cualquier SDK que hable
+este protocolo, y el conformance kit los persigue por eso.
+
+**Leer y ejecutar no pueden ser el mismo hilo.** Es lo natural de escribir y
+funciona hasta que un handler le pregunta algo al núcleo: manda la pregunta y
+se queda esperando la respuesta **en el hilo por el que la respuesta va a
+llegar**. El plugin se queda conversando consigo mismo para siempre. El SDK
+oficial lee en un hilo y ejecuta handlers en otro, en orden, que mantiene la
+promesa de "uno a la vez" y permite esperar al núcleo.
+
+**El núcleo tiene que contestar lo que un plugin le pregunta, también cuando
+es un banco de pruebas.** El conformance kit no lo hacía, así que suspendía a
+cualquier plugin que usara la API y aprobaba sólo a los que no la usan. Ahora
+contesta, con respuestas obviamente falsas que lo dicen.
+
+## 8. Lo que este RFC no hace
 
 - **No aísla dependencias todavía.** Un worker de Python usa el intérprete que
   su `command` diga, y apuntar a un virtualenv es cosa de quien lo instala. El
