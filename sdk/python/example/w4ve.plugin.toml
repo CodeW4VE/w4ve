@@ -12,6 +12,13 @@ protocol = 1
 # virtualenv points at that python here, and nothing else has to know.
 command = ["python3", "main.py"]
 
+# What this plugin needs installed. Declared and checked, never installed by
+# W4VE: fetching code from the internet and running it is your decision, not a
+# side effect of starting a server. Checked against the interpreter in
+# `run.command`, so a virtualenv is asked rather than whatever runs w4ve.
+[python]
+requires = []
+
 [config]
 # Whatever is here arrives as `plugin.config`. Edit it and reload the plugin.
 greeting = "welcome back"

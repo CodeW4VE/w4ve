@@ -101,6 +101,10 @@ def read_manifest(folder):
                         % (wanted, PROTOCOL))
     if problems:
         raise WorkerError("%s: %s" % (folder.name, "; ".join(problems)))
+    python = data.get("python") or {}
+    requires = python.get("requires") or []
+    if isinstance(requires, str):
+        requires = [requires]
     return {
         "id": plugin["id"],
         "name": plugin.get("name") or plugin["id"],
@@ -108,8 +112,47 @@ def read_manifest(folder):
         "protocol": wanted,
         "command": list(command),
         "config": dict(data.get("config") or {}),
+        # Declared and checked, never installed. Same rule as a service, and
+        # for the same reason: fetching code from the internet and running it
+        # is the operator's decision, not a side effect of starting a server.
+        "requires": [str(name) for name in requires],
         "folder": folder,
     }
+
+
+def missing_requirements(manifest):
+    """What a plugin says it needs and its interpreter does not have.
+
+    Asked of **the interpreter in its own `command`**, not this one. A plugin
+    with a virtualenv is the normal case, and asking the wrong Python reports
+    as missing whatever is sitting right there.
+    """
+    wanted = manifest.get("requires") or []
+    if not wanted:
+        return []
+    interpreter = manifest["command"][0]
+    if "python" not in Path(interpreter).name:
+        # Not a Python plugin, or one started through a wrapper. Saying
+        # nothing beats guessing about somebody else's runtime.
+        return []
+    probe = ("import importlib.metadata as meta, sys\n"
+             "missing = []\n"
+             "for name in sys.argv[1:]:\n"
+             "    for spelling in (name, name.replace('_', '-')):\n"
+             "        try:\n"
+             "            meta.distribution(spelling)\n"
+             "            break\n"
+             "        except Exception:\n"
+             "            pass\n"
+             "    else:\n"
+             "        missing.append(name)\n"
+             "print('\\n'.join(missing))\n")
+    try:
+        result = subprocess.run([interpreter, "-c", probe] + list(wanted),
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line for line in result.stdout.splitlines() if line.strip()]
 
 
 def discover(folder):
@@ -524,6 +567,15 @@ class WorkerHost:
         self.problems = list(problems)
         started = []
         for manifest in found:
+            # Said before starting it, because a plugin that dies on its first
+            # import gives an error about a module and not about a plugin, and
+            # the two send somebody looking in different places.
+            absent = missing_requirements(manifest)
+            if absent:
+                self.problems.append(
+                    "%s needs %s, which %s does not have: pip install %s"
+                    % (manifest["id"], ", ".join(absent),
+                       manifest["command"][0], " ".join(absent)))
             worker = Worker(manifest, self.root, host=self)
             self.workers[worker.id] = worker
             ok, message = worker.start()
