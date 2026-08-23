@@ -2173,14 +2173,14 @@ def cmd_console(args, index):
         for line in sys.stdin:
             reply = client.call({"cmd": "send", "process": args.process,
                                  "text": line})
-            # Over RCON the answer comes back here rather than on the console
-            # stream, so print it instead of dropping it on the floor.
-            for answer in reply.get("lines") or []:
-                say(answer)
-            if (reply.get("ok") and reply.get("message") not in ("sent", None)
-                    and not reply.get("lines")):
-                say(Out.dim(reply["message"]))
-            elif not reply.get("ok"):
+            # ⚠️ The answer is NOT printed here. A plugin's reply reaches this
+            # terminal twice: once in `lines`, and once through the console
+            # stream this command is already attached to. Printing both is how
+            # `!!help` came out with every line of it duplicated, the two
+            # copies interleaved so the title landed in the middle.
+            # `w4ve plugins reload <id>` is the other caller, and that one is
+            # not attached to anything, so it still prints `lines` itself.
+            if not reply.get("ok"):
                 problem(reply.get("message") or reply.get("error"))
 
     threading.Thread(target=typing, daemon=True).start()
