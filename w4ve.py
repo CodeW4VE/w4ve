@@ -1626,7 +1626,9 @@ def cmd_remove(args, index):
         say(f"{Out.ok('ok')}  removed {pid}")
         removed += 1
     if removed and not args.dry_run:
-        note("removing a mod also needs a restart to take effect")
+        # A jar needs a restart; a plugin does not. Saying "mod" for both is
+        # how somebody restarts a server full of people for no reason.
+        note("anything that was a jar needs a restart to take effect")
     return 0
 
 

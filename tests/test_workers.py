@@ -16,6 +16,7 @@ Everything below uses real processes. A mock cannot fail to answer.
 """
 
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -322,3 +323,85 @@ class ProtocolCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FromAPackageCase(unittest.TestCase):
+    """A native plugin that arrives inside a `.w4ve`, which is the whole point.
+
+    Until the platform existed, a `plugin` component was refused on purpose:
+    accepting one would have meant installing code nothing could run. Now it
+    runs, so it installs, and what has to be right is that each plugin lands in
+    a folder of its own. All of them piling into `w4ve/plugins/` would leave
+    nothing for the loader to find.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="w4ve-pkgplug-"))
+        self.root = self.tmp / "server-root"
+        (self.root / "server").mkdir(parents=True)
+        (self.root / "w4ve").mkdir()
+        (self.root / "w4ve.toml").write_text(
+            '[server]\nkind = "server"\nmc = "1.21"\ngame_dir = "server"\n\n'
+            '[pieces]\n')
+        sys.path.insert(0, str(ROOT))
+        import package
+        import w4ve as cli
+        self.package = package
+        self.cli = cli
+        self.server = cli.Server(self.root)
+
+    def build(self):
+        source = self.tmp / "src"
+        (source / "plugin" / "greeter").mkdir(parents=True)
+        for name in ("main.py", "w4ve.plugin.toml"):
+            shutil.copy(EXAMPLE / name, source / "plugin" / "greeter" / name)
+        (source / "w4ve.json").write_text(json.dumps({
+            "schema": 1, "id": "greeter", "version": "1.0.0", "side": "server",
+            "summary": "The reference plugin, in a package.",
+            "components": [
+                {"kind": "plugin", "name": "greeter",
+                 "file": "plugin/greeter/main.py", "reload": "hot"},
+                {"kind": "plugin", "name": "greeter",
+                 "file": "plugin/greeter/w4ve.plugin.toml", "reload": "hot"},
+            ],
+        }))
+        return self.package.pack(source, self.tmp)[0]
+
+    def install(self):
+        install = self.package.Install(self.build(), self.server)
+        actions, problems = install.plan()
+        self.assertEqual(problems, [])
+        record = install.apply(actions)
+        install.commit()
+        return record
+
+    def test_a_plugin_component_is_no_longer_refused(self):
+        self.assertEqual(self.package.NOT_YET, {},
+                         "nothing is refused outright any more")
+
+    def test_each_plugin_lands_in_a_folder_of_its_own(self):
+        self.install()
+        folder = self.root / "w4ve" / "plugins" / "greeter"
+        self.assertTrue((folder / "main.py").exists())
+        self.assertTrue((folder / "w4ve.plugin.toml").exists())
+
+    def test_and_the_loader_then_finds_it(self):
+        self.install()
+        found, problems = worker.discover(self.root / "w4ve" / "plugins")
+        self.assertEqual([m["id"] for m in found], ["greeter"], problems)
+
+    def test_a_plugin_with_no_name_is_refused_before_installing(self):
+        # Without a name there is no folder, and every file of every plugin
+        # would land in the same place.
+        bad = self.package.Manifest({
+            "schema": 1, "id": "x", "version": "1", "summary": "s",
+            "components": [{"kind": "plugin", "file": "plugin/a/main.py"}],
+        })
+        self.assertTrue(any("needs a `name`" in p for p in bad.problems()),
+                        bad.problems())
+
+    def test_removing_it_takes_the_whole_folder_with_it(self):
+        self.install()
+        self.package.remove(self.server, "greeter")
+        left = list((self.root / "w4ve" / "plugins").rglob("*.py"))
+        self.assertEqual(left, [], left)

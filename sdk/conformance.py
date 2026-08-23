@@ -56,6 +56,14 @@ class Conversation:
         environment = dict(os.environ)
         environment["W4VE_PLUGIN"] = self.manifest["id"]
         environment["W4VE_DATA_DIR"] = str(self.data)
+        # The same PYTHONPATH the core gives a worker. Without it the kit
+        # fails every Python plugin that does not carry its own copy of the
+        # SDK, which is all of them once they are installed from a package.
+        sdk = worker_module.sdk_path()
+        if sdk:
+            existing = environment.get("PYTHONPATH")
+            environment["PYTHONPATH"] = (str(sdk) + os.pathsep + existing
+                                         if existing else str(sdk))
         self.proc = subprocess.Popen(
             self.manifest["command"], cwd=str(self.folder), env=environment,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,

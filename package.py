@@ -38,18 +38,22 @@ KINDS = {
     "resourcepack": "resourcepacks",
     "asset": "w4ve/assets",
     "client": "w4ve/client",  # a jar for the players, served rather than loaded
+    # A native plugin (RFC-0003). Its own folder under w4ve/plugins, because
+    # a plugin is a folder with a manifest in it and not a single file.
+    "plugin": "w4ve/plugins",
     "service": None,          # a process, not a file
     "watch": None,            # a line to look for, and what to do about it
     "http": None,             # a path on the public side, served or proxied
     "storage": None,          # a folder this piece writes to, with a ceiling
     "timer": None,            # something to run again every so often
-    "plugin": "plugins",
 }
 
 # Kinds that are declarations rather than files, and so land in w4ve.toml.
 DECLARED = ("service", "watch", "http", "storage", "timer")
 
-NOT_YET = {"plugin": "the native plugin platform does not exist yet"}
+# Nothing is refused outright any more. `plugin` was, until there was a
+# platform to run one on.
+NOT_YET = {}
 
 RELOADS = ("hot", "restart", "never")
 
@@ -178,6 +182,15 @@ class Manifest:
             elif kind == "timer":
                 out.extend("%s: %s" % (where, p)
                            for p in timer_problems(component))
+            elif kind == "plugin" and not component.get("install_dir"):
+                if not component.get("name"):
+                    out.append("%s: a plugin needs a `name`, which is the "
+                               "folder it lands in" % where)
+                elif not ID_RE.match(component["name"]):
+                    out.append("%s: plugin name %r is not lowercase letters, "
+                               "digits and dashes" % (where, component["name"]))
+                if not component.get("file"):
+                    out.append("%s: no file" % where)
             elif not component.get("file"):
                 out.append("%s: no file" % where)
             elif component["file"].startswith("/") or ".." in component["file"]:
@@ -235,6 +248,12 @@ class Manifest:
                 })
                 continue
             target = component.get("install_dir") or KINDS.get(kind) or "."
+            if kind == "plugin" and not component.get("install_dir"):
+                # A native plugin is a folder with a manifest in it, not a
+                # loose file, so every file of one lands under its own name.
+                # Without this they would all pile into w4ve/plugins/ and no
+                # plugin would have a folder to be found in.
+                target = "%s/%s" % (target, component.get("name") or "")
             actions.append({
                 "kind": kind,
                 "member": component["file"],

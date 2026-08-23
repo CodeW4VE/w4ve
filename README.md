@@ -90,6 +90,10 @@ w4ve remove mypiece                 # take out exactly what it put in
   template at all. A service with an unanswered `${secret:...}` in it is not
   started, because starting it with a hole where the token goes fails later and
   unreadably.
+- **A piece can bring a plugin.** A `plugin` component carries a native plugin
+  (RFC-0003) and lands it in a folder of its own under `w4ve/plugins/`, where
+  the loader finds it. It used to be refused outright, which was the honest
+  answer while there was nothing to run one on.
 - **A piece can bring a service.** A `service` component declares a process:
   command, working folder, restart policy, the Python modules it needs and how
   to ask whether it is up. It lands as a `[services.<name>]` block in your
@@ -398,9 +402,6 @@ read, and it is the one place where the state of a server is written down.
   what a piece shared by a whole network still needs.
 - Long-running jobs over the API. Everything it does answers now or fails now;
   a backup that takes four minutes needs a job to poll, and that is not here.
-- Install a native plugin from a package. They run (see above) and the
-  `plugin` component of a `.w4ve` still refuses to install: wiring the two
-  together is the next thing, not a thing that quietly half works.
 - Run without Python in the container. The guardian is Python, so an image
   that is only Java (`yolks:java_21` and friends) cannot start it. An MCDR image
   already has both, because MCDR is Python too.

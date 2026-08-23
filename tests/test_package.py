@@ -85,10 +85,20 @@ class PackCase(unittest.TestCase):
         problems = package.Manifest(bad).problems()
         self.assertTrue(any("escapes the package" in p for p in problems))
 
-    def test_plugins_are_refused_while_there_is_nothing_to_run_them(self):
+    def test_a_plugin_still_needs_a_name_to_land_anywhere(self):
+        # This used to check that a `plugin` component was refused outright,
+        # which was true while there was no platform to run one on. There is
+        # one now (RFC-0003), so what is left to get wrong is the folder: a
+        # plugin without a name has nowhere of its own to go, and every file
+        # of every plugin would pile into w4ve/plugins/.
         bad = manifest(components=[{"kind": "plugin", "file": "plugin/x.py"}])
         problems = package.Manifest(bad).problems()
-        self.assertTrue(any("does not exist yet" in p for p in problems))
+        self.assertTrue(any("needs a `name`" in p for p in problems), problems)
+
+    def test_a_named_plugin_is_accepted(self):
+        good = manifest(components=[{"kind": "plugin", "name": "mine",
+                                     "file": "plugin/mine/main.py"}])
+        self.assertEqual(package.Manifest(good).problems(), [])
 
 
 class InstallCase(unittest.TestCase):
