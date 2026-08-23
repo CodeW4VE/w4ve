@@ -1982,6 +1982,90 @@ def cmd_doctor(args, index):
     return 1 if problems else 0
 
 
+# ---------------------------------------------------------------------- api
+
+def api_module():
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import api
+        return api
+    except ImportError:
+        return None
+
+
+def cmd_api(args, index):
+    """The local API: tokens, and asking it things from the command line."""
+    module = api_module()
+    if module is None:
+        problem("this w4ve has no API next to it (api.py is missing)")
+        return 2
+    server = need_server(args)
+    if server is None:
+        return 2
+    tokens = module.Tokens(server.root)
+
+    if args.action == "token":
+        if not args.name:
+            problem("give the token a name: w4ve api token dashboard --scope read")
+            return 2
+        try:
+            token = tokens.issue(args.name, args.scope)
+        except ValueError as exc:
+            problem(str(exc))
+            return 1
+        say(f"{Out.ok('ok')}  {args.name}  ({args.scope})")
+        say()
+        say(token)
+        say()
+        # Said once, here, because it is not stored anywhere it can be read
+        # back from: what is on disk is the token, and this is the only moment
+        # it is on a screen next to its name.
+        say(Out.dim("  Copy it now. `w4ve api tokens` lists names, never this."))
+        return 0
+
+    if args.action == "tokens":
+        listing = tokens.listing()
+        if not listing:
+            say("no tokens here")
+            return 0
+        for entry in listing:
+            say(f"  {entry['name']:<20} {entry['scope']:<8} "
+                f"{Out.dim(entry.get('issued') or '')}")
+        if tokens.insecure():
+            problem("w4ve/api-tokens.json is readable by other users: chmod 600 it")
+            return 1
+        return 0
+
+    if args.action == "revoke":
+        if not args.name:
+            problem("which one? w4ve api revoke dashboard")
+            return 2
+        gone = tokens.revoke(args.name)
+        say(f"{Out.ok('ok')}  {gone} revoked" if gone
+            else f"{Out.warn('none')}  nothing called {args.name!r}")
+        return 0 if gone else 1
+
+    if args.action == "get":
+        # Asking the API from here is how somebody checks it works without
+        # writing a client first.
+        instance = module.Api(server.root)
+        path = args.name or "/v1/status"
+        if not path.startswith("/"):
+            path = "/v1/" + path
+        route = ("GET", path.rstrip("/"))
+        if route not in module.ROUTES:
+            problem(f"no such thing: GET {path}")
+            say(Out.dim("  " + ", ".join(sorted(p for m, p in module.ROUTES
+                                                if m == "GET"))))
+            return 1
+        code, payload = instance.run(route, {})
+        say(json.dumps(payload, indent=2))
+        return 0 if code < 400 else 1
+
+    problem("api takes token, tokens, revoke or get")
+    return 2
+
+
 # ---------------------------------------------------------------------- dev
 
 PLUGIN_TEMPLATE = """# {name}, a W4VE plugin.
@@ -3799,6 +3883,15 @@ def build_parser():
     storage.add_argument("--purge", action="store_true",
                          help="make room now, following what each piece declared")
 
+    api_cmd = add("api", cmd_api, "the local API: tokens, and asking it things")
+    api_cmd.add_argument("action", choices=["token", "tokens", "revoke", "get"],
+                         help="token: issue one. tokens: list them. "
+                              "revoke: take one away. get: ask a route")
+    api_cmd.add_argument("name", nargs="?",
+                         help="the token's name, or the route for `get`")
+    api_cmd.add_argument("--scope", default="read", choices=["read", "write", "admin"],
+                         help="what the token may do (default: read)")
+
     dev = add("dev", cmd_dev, "write a plugin: scaffold it, check it, try it")
     dev.add_argument("action", choices=["new", "check", "run"],
                      help="new: scaffold one. check: conformance. run: try it")
@@ -3850,7 +3943,7 @@ def build_parser():
                       help="the guardian journal instead of the console")
 
     for name in ("run", "start", "stop", "console", "logs", "pack", "repair",
-                 "plugins", "configure", "http", "storage", "dev"):
+                 "plugins", "configure", "http", "storage", "dev", "api"):
         subparsers.choices[name].set_defaults(needs_index=False)
 
     for name, sub in subparsers.choices.items():

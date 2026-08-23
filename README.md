@@ -303,6 +303,47 @@ them.
 Every command takes `-n` to say what it would do and change nothing, and `-y` to
 answer yes to everything (for scripts and cron).
 
+## The local API
+
+Something that is not the CLI can ask W4VE to do things. It listens on a **Unix
+socket**, not a port, because a socket is a file with an owner and a mode and
+that is a permission system the operating system already implements correctly.
+
+```toml
+[api]
+enabled = true
+# listen = "127.0.0.1:8790"   # a port instead. Then a token is required.
+```
+
+```sh
+w4ve api token dashboard --scope read    # issue one, printed once
+w4ve api tokens                          # names and scopes, never the tokens
+w4ve api get status                      # ask a route from the command line
+
+curl --unix-socket <server>/w4ve/run/api.sock http://localhost/v1/status
+```
+
+```python
+from w4ve_client import W4VE
+
+w4ve = W4VE("/path/to/server")
+print(w4ve.running())
+w4ve.command("say hello")
+```
+
+- **Scopes, and `read` is the floor.** A dashboard that can only look cannot
+  stop a world by accident, and the way to guarantee that is not documentation.
+  `read` < `write` < `admin`, cumulative.
+- **Nothing reads private files on a client's behalf.** Every answer comes from
+  asking the guardian, the same way the CLI does. A second reader of the same
+  files is a second thing to keep in step.
+- **It is an extra, and it behaves like one.** If it cannot listen, the
+  guardian says so and the server starts anyway. A bug inside it is a 500, not
+  a dead guardian.
+- **`sdk/client/conformance.py`** stands up a fake W4VE and checks a client
+  against it: that a read token really cannot stop a server, that a wrong token
+  and an absent W4VE are told apart, and that nothing is being read off disk.
+
 ## The two files
 
 ```
@@ -355,6 +396,8 @@ read, and it is the one place where the state of a server is written down.
 
 - Talk to more than one server at a time. One `w4ve.toml`, one server, which is
   what a piece shared by a whole network still needs.
+- Long-running jobs over the API. Everything it does answers now or fails now;
+  a backup that takes four minutes needs a job to poll, and that is not here.
 - Install a native plugin from a package. They run (see above) and the
   `plugin` component of a `.w4ve` still refuses to install: wiring the two
   together is the next thing, not a thing that quietly half works.

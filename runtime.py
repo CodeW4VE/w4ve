@@ -748,6 +748,8 @@ class Guardian:
         self.plugins = None
         # Native plugins (RFC-0003), each one a process of its own.
         self.workers = None
+        # The local API (M8), if this w4ve carries it and the server wants it.
+        self.api = None
 
     # ------------------------------------------------------------------ setup
 
@@ -1073,6 +1075,35 @@ class Guardian:
         self.log("native plugins: " + message)
         return True, message
 
+    def start_api(self):
+        """The local API, if this server asked for one.
+
+        ⚠️ Never fatal. A server that will not boot because something wanted
+        to watch it is worse than a server nobody can watch, and this is the
+        kind of optional extra that has to prove it knows that.
+        """
+        section = self.config.get("api") or {}
+        if not section.get("enabled", False):
+            return False, "the api is off for this server"
+        try:
+            from api import Api
+        except ImportError as exc:
+            self.log("api: not available (%s)" % exc)
+            return False, str(exc)
+        instance = Api(self.root, guardian=self,
+                       address=section.get("listen") or None,
+                       tokens_required=section.get("tokens"))
+        ok, message = instance.start()
+        self.log("api: " + message)
+        if ok:
+            self.api = instance
+        return ok, message
+
+    def stop_api(self):
+        if self.api is not None:
+            self.api.stop()
+            self.api = None
+
     def stop_plugins(self):
         if self.workers is not None:
             self.workers.stop_all()
@@ -1242,6 +1273,7 @@ class Guardian:
         self.log("guardian shutting down")
         # Plugins first: `on_unload` is where a plugin saves what it was
         # keeping, and it is worth having a server to talk to while it does.
+        self.stop_api()
         self.stop_plugins()
         if stop_processes:
             for proc in list(self.watched.values()):
@@ -1291,6 +1323,7 @@ class Guardian:
         # is easier to give once it is.
         self.start_plugins()
         self.start_workers()
+        self.start_api()
 
         while not self.stopping.is_set():
             time.sleep(0.3)
