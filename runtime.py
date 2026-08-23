@@ -222,6 +222,7 @@ class Watched:
             self.guardian.log("%s: %s -> %s%s" % (self.name, old, state,
                                                   "  (%s)" % why if why else ""))
             self.guardian.snapshot()
+            self.guardian.plugins_state(self.name, state, self.ready)
 
     def status(self):
         running = alive(self.pid, self.starttime)
@@ -417,6 +418,10 @@ class Watched:
                 console.write(line + "\n")
                 self.guardian.broadcast(self.name, line)
                 self._check_watches(line)
+                # Handed over, never called here: plugins run on their own
+                # thread so a slow one cannot delay the guardian noticing that
+                # the server is ready, or that it died.
+                self.guardian.feed_plugins(self.name, line)
                 if self.handler:
                     if self.state == "starting" and self.handler.ready(line):
                         self.ready = True
@@ -473,6 +478,7 @@ class Watched:
                 continue
             if healthy != self.ready:
                 self.ready = healthy
+                self.guardian.plugins_state(self.name, self.state, self.ready)
                 self.guardian.log("%s: health %s (%s)"
                                   % (self.name, "ok" if healthy else "failing",
                                      self.health))
@@ -587,6 +593,10 @@ class Guardian:
         self.listeners_lock = threading.Lock()
         self.echo = False           # print the console here, for `w4ve run`
         self.stopping = threading.Event()
+        # The MCDR compatible plugin host, if this server has plugins and this
+        # w4ve carries the compatibility layer. None means "no plugins", which
+        # is a normal server, not a broken one.
+        self.plugins = None
 
     # ------------------------------------------------------------------ setup
 
@@ -702,6 +712,52 @@ class Guardian:
 
     # ----------------------------------------------------------- control sock
 
+    # ------------------------------------------------------------- the plugins
+
+    def start_plugins(self):
+        """Load this server's MCDR plugins, if it has any and we can.
+
+        Every failure here is a note, never a stop: a server whose plugins
+        will not load still has to start. That is the difference between a
+        wrapper and a dependency, and W4VE is meant to be the first one.
+        """
+        if self.plugins is not None:
+            return False, "plugins are already loaded"
+        if not self.config.get("plugins", True):
+            return False, "plugins are turned off for this server"
+        try:
+            from pluginhost import PluginRuntime
+        except ImportError as exc:
+            self.log("plugins: not available (%s)" % exc)
+            return False, str(exc)
+        runtime = PluginRuntime(self, server_name="server")
+        ok, message = runtime.start()
+        self.log("plugins: " + message if not message.startswith("plugins")
+                 else message)
+        if ok:
+            self.plugins = runtime
+        return ok, message
+
+    def stop_plugins(self):
+        if self.plugins is None:
+            return
+        self.plugins.stop()
+        self.plugins = None
+
+    def feed_plugins(self, name, line):
+        if self.plugins is not None:
+            self.plugins.feed(name, line)
+
+    def plugins_state(self, name, state, ready):
+        if self.plugins is not None:
+            self.plugins.state_changed(name, state, ready)
+
+    def plugins_console(self, text):
+        """Offer a typed line to the plugins. `(claimed, what it answered)`."""
+        if self.plugins is None:
+            return False, []
+        return self.plugins.console(text)
+
     def broadcast(self, name, line):
         if self.echo:
             print(line if name == "server" else "[%s] %s" % (name, line),
@@ -796,8 +852,11 @@ class Guardian:
         if cmd == "ping":
             return {"ok": True, "pong": True, "guardian_pid": os.getpid()}
         if cmd == "status":
-            return {"ok": True, "root": str(self.root),
-                    "processes": [p.status() for p in self.watched.values()]}
+            answer = {"ok": True, "root": str(self.root),
+                      "processes": [p.status() for p in self.watched.values()]}
+            if self.plugins is not None:
+                answer["plugins"] = self.plugins.status()
+            return answer
         if proc is None:
             return {"ok": False, "error": "no process called %r" % name}
         if cmd == "start":
@@ -807,7 +866,15 @@ class Guardian:
             ok, message = proc.stop(request.get("grace"))
             return {"ok": ok, "message": message}
         if cmd == "send":
-            ok, message = proc.send(request.get("text", ""))
+            text = request.get("text", "")
+            # `!!something` is a plugin command, not a Minecraft one. Sending
+            # it to the server would only produce "Unknown command".
+            if text.strip().startswith("!!"):
+                claimed, lines = self.plugins_console(text)
+                if claimed:
+                    return {"ok": True, "message": "handled by the plugins",
+                            "lines": lines}
+            ok, message = proc.send(text)
             return {"ok": ok, "message": message}
         if cmd == "shutdown":
             threading.Thread(target=self.shutdown, daemon=True).start()
@@ -820,6 +887,9 @@ class Guardian:
         if self.stopping.is_set():
             return
         self.log("guardian shutting down")
+        # Plugins first: `on_unload` is where a plugin saves what it was
+        # keeping, and it is worth having a server to talk to while it does.
+        self.stop_plugins()
         if stop_processes:
             for proc in list(self.watched.values()):
                 if alive(proc.pid, proc.starttime):
@@ -855,6 +925,11 @@ class Guardian:
                 # piece declaring one is that nobody has to remember it.
                 ok, message = proc.start()
                 self.log(message)
+
+        # After the server is started, not before: a plugin's `on_load` is
+        # allowed to ask whether the server is running, and the honest answer
+        # is easier to give once it is.
+        self.start_plugins()
 
         while not self.stopping.is_set():
             time.sleep(0.3)

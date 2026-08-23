@@ -1847,13 +1847,34 @@ def mcdr_module():
         return None
 
 
+# What `w4ve plugins <action>` sends to a running guardian. Kept as a table
+# rather than an if-chain because the command names are the same ones typed in
+# game, and one list is how they stay that way.
+LIVE_PLUGIN_ACTIONS = {
+    "reload": ("!!w4ve plugin reload %s", "which plugin"),
+    "unload": ("!!w4ve plugin unload %s", "which plugin"),
+    "load": ("!!w4ve plugin load %s", "which file"),
+    "enable": ("!!w4ve plugin enable %s", "which file"),
+    "disable": ("!!w4ve plugin disable %s", "which plugin"),
+    "refresh": ("!!w4ve refresh", None),
+    "list": ("!!w4ve plugin list", None),
+    "status": ("!!w4ve status", None),
+}
+
+
 def cmd_plugins(args, index):
     """What MCDR plugins this server has, and what is wrong with them.
 
-    Nothing here runs a plugin: it reads what each one declares. That is the
-    point, because the answer to "why is this plugin not loading" should not
-    require loading it.
+    With no action, nothing here runs a plugin: it reads what each one
+    declares. That is the point, because the answer to "why is this plugin not
+    loading" should not require loading it.
+
+    With an action, it is the opposite: it talks to the guardian that is
+    already running them, so `w4ve plugins reload here` is the same command as
+    typing `!!w4ve plugin reload here` in game, and answers in the terminal.
     """
+    if getattr(args, "action", None):
+        return live_plugins(args)
     mcdr = mcdr_module()
     if mcdr is None:
         problem("this w4ve cannot read MCDR plugins (the mcdr package is missing)")
@@ -1885,6 +1906,7 @@ def cmd_plugins(args, index):
         say(f"  {label}  {'  '.join(bits)}  {Out.dim(plugin.path.name)}")
 
     say()
+    report_requirements(plugins)
     if found["order"]:
         say(Out.dim("load order: " + " ".join(p.id for p in found["order"])))
     real = [p for p in found["problems"]
@@ -1895,6 +1917,74 @@ def cmd_plugins(args, index):
     say(f"{len(plugins)} plugin{'s' if len(plugins) != 1 else ''}, "
         f"{len(found['problems'])} problem{'s' if len(found['problems']) != 1 else ''}")
     return 1 if found["problems"] else 0
+
+
+def report_requirements(plugins):
+    """What these plugins need from pip that is not installed here.
+
+    Declared and checked, never installed: W4VE does not run pip at anybody.
+    It is here because the alternative is finding out one crash at a time on
+    the day of the cutover, and because a plugin can load fine and still be
+    missing something it only imports when somebody uses it. DayCountNBT does
+    exactly that: it loads without `nbtlib` and dies the first time a player
+    types `!!day`.
+    """
+    try:
+        from mcdr import requirements
+    except ImportError:
+        return []
+
+    wanted = {}
+    for plugin in plugins:
+        for name in requirements.missing(plugin):
+            wanted.setdefault(name, []).append(plugin.id or plugin.path.name)
+    if not wanted:
+        return []
+    say(Out.dim("not installed, and some plugin asked for it:"))
+    width = max(len(name) for name in wanted)
+    for name in sorted(wanted, key=str.lower):
+        say(f"  {name.ljust(width)}  {Out.dim(', '.join(sorted(wanted[name])))}")
+    say()
+    say(Out.dim("  " + requirements.install_line(wanted)))
+    say()
+    return sorted(wanted)
+
+
+def live_plugins(args):
+    """Act on the plugins of a server that is running right now."""
+    action = args.action
+    if action not in LIVE_PLUGIN_ACTIONS:
+        problem(f"no such action {action!r}")
+        note("try: " + ", ".join(sorted(LIVE_PLUGIN_ACTIONS)))
+        return 2
+    template, wants = LIVE_PLUGIN_ACTIONS[action]
+    if wants and not args.target:
+        problem(f"say {wants}: w4ve plugins {action} <name>")
+        return 2
+
+    rt = need_runtime()
+    if rt is None:
+        return 2
+    server = need_server(args)
+    client = rt.Client(server.root)
+    if not client.connected():
+        problem("no guardian is running this server, so nothing is loaded")
+        note("`w4ve plugins --load` rehearses the same thing without a server")
+        return 1
+
+    command = template % args.target if wants else template
+    reply = client.call({"cmd": "send", "process": "server", "text": command})
+    for line in reply.get("lines") or []:
+        say("  " + line)
+    if not reply.get("ok"):
+        problem(reply.get("message") or reply.get("error") or "no answer")
+        return 1
+    if not reply.get("lines"):
+        # The guardian took it but the plugins said nothing, which usually
+        # means this w4ve has no compatibility layer loaded over there.
+        note("the guardian sent it to the server instead: this server's "
+             "plugins are not loaded by w4ve")
+    return 0
 
 
 def load_plugins(server, folder):
@@ -1933,6 +2023,12 @@ def load_plugins(server, folder):
     for line in host.problems:
         problem(line)
     say()
+    try:
+        from mcdr import loader as _loader
+
+        report_requirements(_loader.discover(folder))
+    except ImportError:
+        pass
     say(f"{len(host.loaded)} loaded, {len(host.problems)} "
         f"problem{'s' if len(host.problems) != 1 else ''}")
     note("this was a rehearsal: nothing was connected to the server")
@@ -2079,7 +2175,10 @@ def cmd_console(args, index):
                                  "text": line})
             # Over RCON the answer comes back here rather than on the console
             # stream, so print it instead of dropping it on the floor.
-            if reply.get("ok") and reply.get("message") not in ("sent", None):
+            for answer in reply.get("lines") or []:
+                say(answer)
+            if (reply.get("ok") and reply.get("message") not in ("sent", None)
+                    and not reply.get("lines")):
                 say(Out.dim(reply["message"]))
             elif not reply.get("ok"):
                 problem(reply.get("message") or reply.get("error"))
@@ -2235,6 +2334,12 @@ def build_parser():
                                  help="where they live (default: plugins)")
     listing_plugins.add_argument("--load", action="store_true",
                                  help="actually load them, to see which ones run")
+    listing_plugins.add_argument("action", nargs="?",
+                                 help="reload, unload, load, enable, disable, "
+                                      "refresh, list, status (on the running "
+                                      "server)")
+    listing_plugins.add_argument("target", nargs="?",
+                                 help="which plugin the action is about")
 
     packing = add("pack", cmd_pack, "build a .w4ve out of a folder")
     packing.add_argument("folder", help="folder with a w4ve.json in it")
