@@ -207,7 +207,15 @@ MCDR.
 ## Lo que este número no dice
 - **PrimeBackup arranca deshabilitado por su propia config**, que es su
   comportamiento normal la primera vez. No se ha probado un backup suyo.
-- Sigue sin ensayarse en el **mirror**, que es el layout de verdad (MCDR,
-  contenedor, `mods/` bajo `server/`).
+- El **mirror de verdad** sigue sin tocarse, y eso es una decisión, no un
+  olvido: hay que parar MCDR en una máquina viva. Lo que sí se ensayó es **su
+  layout**, en una copia: `game_dir = "server"`, `plugins/` y `config/`
+  colgando de la raíz y un `permission.yml` de MCDR sin tocar. QuickBackupM
+  hizo un backup real **sin cambiarle una línea de config**, porque su
+  `server_path: ./server` por defecto es el correcto ahí, y `!!w4ve permission
+  list` contestó con la lista de staff de siempre. El plan del cutover, con su
+  vuelta atrás, está en [cutover-del-mirror.md](cutover-del-mirror.md).
+- **El contenedor** no se ha probado: el guardián en primer plano dentro de
+  wings es otra cosa que mirar con calma.
 - `!!day` y `!!here` contestan en chino porque DayCountNBT y Here 1.2.2 **no
   traen inglés**. Eso no es nuestro.
