@@ -140,6 +140,7 @@ Detrás del plugin hay más procesos, y ahí estaba el trabajo. Corriendo, con
 | el plugin | dentro del guardián | como cualquier otro plugin |
 | el daemon | `ChatBridge.pyz server` | `[services.chatbridge-daemon]` |
 | el cliente `!!online` | contesta por RCON | `[services.chatbridge-online]` |
+| el bot de Discord | `ChatBridge.pyz discord_bot` | probado suelto, ver abajo |
 
 ⚠️ **El daemon también importa `mcdreforged`, y no es un plugin.** Es un
 proceso aparte, lanzado desde una línea de comandos, y sólo pide `Serializable`
@@ -168,16 +169,42 @@ llegaba, hasta que la llamada por el socket expiraba. Un servicio se para con
 una señal, y su grace son diez segundos, no noventa: el largo existe para que
 un mundo se guarde.
 
-⚠️ **Dos límites conocidos, no arreglados**: los servicios arrancan a la vez y
-no hay forma de decir "éste va después de aquél"; el cliente `online` arrancó
-antes que el daemon, falló al conectar y se reconectó solo diez segundos
-después. Y `!!online` desde la consola no funciona, porque el plugin pide el
-jugador que lo escribió: eso es del plugin y pasa igual bajo MCDR.
+**El bot de Discord llega hasta donde puede llegar sin un token.** Con sus
+paquetes instalados (`discord.py`, `pillow`, `imgbbpy`; el traductor
+`google_trans_new` está dentro de un `try` suyo y el bot avisa y sigue sin él),
+arranca, **conecta al daemon y es identificado**, y falla exactamente en el
+login de Discord, con el token de mentira que se le dio. Todo lo que es nuestro
+funciona; lo que falta por probar necesita el token de verdad y no lo lleva un
+ensayo local.
+
+### Dos cosas que se arreglaron mirando cómo arranca
+
+⚠️ **El orden nunca fue el problema.** El cliente `!!online` estaba declarado
+después del daemon y aun así subía primero, porque `start()` vuelve en cuanto
+el proceso existe y un daemon tarda un momento más en abrir su puerto. Fallaba
+al conectar tres veces y se reconectaba solo diez segundos después: se curaba
+a sí mismo llenando la consola de errores en cada arranque. Ahora
+`after = "chatbridge-daemon"` lo retiene hasta que el otro está de verdad
+arriba, con techo de treinta segundos, porque un arranque colgado es peor que
+un servicio que madruga.
+
+Y para poder esperar hace falta algo que esperar: el daemon habla su propio
+protocolo por un puerto TCP y nunca podría contestar a un health HTTP, así que
+su readiness era desconocida para siempre. `health_tcp = "127.0.0.1:30001"` le
+pregunta lo que sí sabe contestar.
+
+⚠️ **Y se le pregunta una sola vez.** Cada comprobación TCP es una conexión que
+el otro extremo tiene que explicarse: el daemon escribía `Failed reading
+client's login packet` por cada una, o sea unos dos mil novecientos errores
+falsos al día en el log de otro. Un puerto abierto dice "arrancó", no "está
+bien", y esa respuesta no cambia sola. Los health HTTP sí son una pregunta de
+verdad y se siguen haciendo.
+
+⚠️ **Lo que sigue sin funcionar y no es nuestro**: `!!online` escrito en la
+consola, porque el plugin pide el jugador que lo escribió. Pasa igual bajo
+MCDR.
 
 ## Lo que este número no dice
-
-- **El bot de Discord de ChatBridge sigue sin probarse.** Necesita un token de
-  verdad y cuatro paquetes más de pip, así que no entra en un ensayo local.
 - **PrimeBackup arranca deshabilitado por su propia config**, que es su
   comportamiento normal la primera vez. No se ha probado un backup suyo.
 - Sigue sin ensayarse en el **mirror**, que es el layout de verdad (MCDR,
