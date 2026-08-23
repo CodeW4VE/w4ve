@@ -179,6 +179,19 @@ class ClientJarCase(unittest.TestCase):
                          "chat-1.0.0+1.21.jar")
         self.assertEqual(len(index["minecraft"]["1.21"]["sha256"]), 64)
 
+    def test_the_version_in_it_is_the_jar_s_and_not_the_package_s(self):
+        # They are different numbers on purpose: WaveChat's piece is at 1.0.0
+        # while the mod is at 4.7.0. Writing the package's version here tells
+        # every player they are running something newer than what is published.
+        self.assertEqual(package.client_version(
+            {}, "wavechat-4.7.0+1.21.jar", "1.0.0"), "4.7.0")
+        self.assertEqual(package.client_version(
+            {"version": "9.9"}, "whatever.jar", "1.0.0"), "9.9",
+            "a manifest that says so wins over a file name")
+        self.assertEqual(package.client_version(
+            {}, "nothing-parseable.jar", "1.0.0"), "1.0.0",
+            "and a name that says nothing falls back rather than guessing")
+
     def test_the_hash_in_the_index_is_the_hash_of_the_jar_beside_it(self):
         folder = self.server.root / "w4ve" / "client"
         index = json.loads((folder / "latest.json").read_text())

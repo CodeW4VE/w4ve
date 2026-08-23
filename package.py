@@ -457,6 +457,25 @@ def sha256_of(path):
     return digest.hexdigest()
 
 
+def client_version(component, filename, fallback):
+    """What version a client jar is, from the manifest or from its name.
+
+    `wavechat-4.7.0+1.21.jar` -> `4.7.0`. Declared wins over guessed, because a
+    file name is a convention and a manifest is a statement.
+    """
+    declared = component.get("version")
+    if declared:
+        return str(declared)
+    stem = Path(filename).stem
+    if "+" in stem:
+        stem = stem.split("+")[0]
+    if "-" in stem:
+        tail = stem.rsplit("-", 1)[1]
+        if tail and tail[0].isdigit():
+            return tail
+    return fallback
+
+
 class Install:
     """One installation, applied whole or not at all.
 
@@ -576,7 +595,12 @@ class Install:
             if relative not in jars:
                 continue
             index["minecraft"][str(component.get("mc") or "*")] = {
-                "version": self.manifest.version,
+                # ⚠️ The version of the JAR, not of the package. They are
+                # different numbers on purpose: the piece is at 1.0.0 while the
+                # mod is at 4.7.0. A client compares this against its own
+                # version, so writing the package's here tells everybody they
+                # are running something newer than what is published.
+                "version": client_version(component, name, self.manifest.version),
                 "file": name,
                 "sha256": jars[relative],
             }
