@@ -2074,7 +2074,9 @@ def runtime_pieces(server, rt):
         guardian.add_service(service["name"], service["command"],
                              server.root / service["cwd"], service["restart"],
                              health=service.get("health"),
-                             health_every=service.get("health_every", 30))
+                             health_every=service.get("health_every", 30),
+                             env=service.get("env"),
+                             mcdr=service.get("mcdr", False))
     return guardian, command
 
 

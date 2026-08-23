@@ -183,7 +183,7 @@ class Watched:
 
     def __init__(self, name, command, cwd, guardian, handler=None,
                  restart="never", stop_grace=STOP_GRACE, health=None,
-                 health_every=30, watches=()):
+                 health_every=30, watches=(), env=None):
         self.name = name
         self.command = command
         self.cwd = Path(cwd)
@@ -195,6 +195,10 @@ class Watched:
         self.health_every = health_every
         # Lines a piece asked us to look for, and what to do about them.
         self.watches = [dict(w) for w in watches]
+        # Added to the environment this process is started with, never
+        # replacing it: a service that lost PATH is a service that cannot find
+        # its own interpreter.
+        self.env = dict(env or {})
         self.asked_to_come_back = False
 
         self.proc = None
@@ -263,9 +267,14 @@ class Watched:
             # No shell in the middle. A `/bin/sh -c` steals the signals meant
             # for the server and lies about the process tree, which is exactly
             # the shape MCDR has today.
+            environment = None
+            if self.env:
+                environment = dict(os.environ)
+                environment.update(self.env)
             self.proc = subprocess.Popen(
                 self.command,
                 cwd=str(self.cwd),
+                env=environment,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -682,9 +691,23 @@ class Guardian:
         return proc
 
     def add_service(self, name, command, cwd, restart="on-failure",
-                    health=None, health_every=30):
+                    health=None, health_every=30, env=None, mcdr=False):
+        env = dict(env or {})
+        if mcdr:
+            # The service said it imports `mcdreforged`. ChatBridge's daemon
+            # does, and it is not a plugin: it is a separate process started
+            # from a command line. Rather than asking somebody to pip install
+            # all of MCDR for one class, W4VE puts its own on the path.
+            compat = mcdr_compat_path()
+            if compat is None:
+                self.log("%s asked for the mcdreforged compatibility package, "
+                         "which is not next to this runtime" % name)
+            else:
+                existing = env.get("PYTHONPATH") or os.environ.get("PYTHONPATH")
+                env["PYTHONPATH"] = (str(compat) + os.pathsep + existing
+                                     if existing else str(compat))
         proc = Watched(name, command, cwd, self, handler=None, restart=restart,
-                       health=health, health_every=health_every)
+                       health=health, health_every=health_every, env=env)
         self.watched[name] = proc
         return proc
 
@@ -1080,6 +1103,10 @@ def services_from(config):
             command = shlex.split(command)
         if not command:
             continue
+        env = {}
+        declared = entry.get("env")
+        if isinstance(declared, dict):
+            env.update({str(k): str(v) for k, v in declared.items()})
         out.append({
             "name": name,
             "command": list(command),
@@ -1087,5 +1114,22 @@ def services_from(config):
             "restart": entry.get("restart") or "on-failure",
             "health": entry.get("health_url") or None,
             "health_every": int(entry.get("health_every") or 30),
+            "env": env,
+            # `mcdr = true` means: this process imports `mcdreforged` even
+            # though it is not a plugin. ChatBridge's daemon does, and under
+            # MCDR the answer was to pip install all of MCDR on the machine to
+            # get one class out of it.
+            "mcdr": bool(entry.get("mcdr")),
         })
     return out
+
+
+def mcdr_compat_path():
+    """Where the importable `mcdreforged` package lives, or None.
+
+    Beside the runtime, so a server that only downloaded `w4ve.py` does not
+    have it. Saying None here is what lets the caller explain that instead of
+    starting a service that will die on its first import.
+    """
+    folder = Path(__file__).resolve().parent / "compat"
+    return folder if (folder / "mcdreforged" / "__init__.py").exists() else None
