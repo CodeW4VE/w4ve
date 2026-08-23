@@ -284,6 +284,52 @@ def read_toml(path):
         return _toml_lite(Path(path).read_text(encoding="utf-8"))
 
 
+def toml_value(value):
+    """One value, written as TOML rather than as JSON.
+
+    They agree on strings, numbers, booleans and lists, and they disagree on
+    exactly one thing that matters here: a table. JSON says `{"A": "b"}` and
+    TOML says `{A = "b"}`, and writing the JSON one into w4ve.toml does not
+    break that line, it breaks **the whole file** for every reader after it.
+    Found by a test the day `env` became something a package could declare.
+    """
+    if isinstance(value, dict):
+        inside = ", ".join("%s = %s" % (key, toml_value(item))
+                           for key, item in value.items())
+        return "{%s}" % inside
+    if isinstance(value, (list, tuple)):
+        return "[%s]" % ", ".join(toml_value(item) for item in value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return json.dumps(value)
+    return json.dumps(str(value))
+
+
+def _inline_table(text):
+    """`{A = "b", C = 1}` -> dict, for Python 3.9 which has no tomllib."""
+    out, depth, current = {}, 0, ""
+    parts = []
+    for char in text[1:-1]:
+        if char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+        if char == "," and depth == 0:
+            parts.append(current)
+            current = ""
+            continue
+        current += char
+    if current.strip():
+        parts.append(current)
+    for part in parts:
+        if "=" not in part:
+            continue
+        key, raw = part.split("=", 1)
+        out[key.strip().strip('"')] = raw.strip().strip('"')
+    return out
+
+
 def _toml_lite(text):
     """Enough TOML for w4ve.toml, for Python older than 3.11.
 
@@ -304,6 +350,11 @@ def _toml_lite(text):
             continue
         key, value = (part.strip() for part in line.split("=", 1))
         key = key.strip('"')
+        if value.startswith("{") and value.endswith("}"):
+            # An inline table: `env = {A = "b"}`. This is what lets a service
+            # carry an environment on Python 3.9, which is what the mirror runs.
+            (section if section is not None else data)[key] = _inline_table(value)
+            continue
         if value.startswith("[") and value.endswith("]"):
             parsed = [v.strip().strip('"\'') for v in value[1:-1].split(",") if v.strip()]
         elif value.lower() in ("true", "false"):
@@ -501,6 +552,108 @@ class Server:
         """Same idea for `[watch.<name>]`: a line to look for and what to do."""
         self._set_block("watch", name, fields, owner)
 
+    def set_http(self, name, fields, owner=""):
+        """`[http.<name>]`: a path on the public side, served or proxied."""
+        self._set_block("http", name, fields, owner)
+
+    def set_storage(self, name, fields, owner=""):
+        """`[storage.<name>]`: a folder with a ceiling and a way to make room."""
+        self._set_block("storage", name, fields, owner)
+
+    def set_timer(self, name, fields, owner=""):
+        """`[timer.<name>]`: something to run again, watched instead of cron'd."""
+        self._set_block("timer", name, fields, owner)
+
+    def remove_block(self, section, name):
+        """Take out any one block, whatever section it is in."""
+        self._remove_block(section, name)
+
+    # ---------------------------------------------------------------- settings
+
+    def settings_module(self):
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import piecesettings
+            return piecesettings
+        except ImportError:
+            return None
+
+    def settings_of(self, pid):
+        """What has already been answered for this piece, secrets included.
+
+        Secrets come back too because the caller is usually about to decide
+        whether anything is still missing, and a token that is set is not
+        missing. Nothing here prints them.
+        """
+        values = dict((self.config.get("settings") or {}).get(pid) or {})
+        module = self.settings_module()
+        if module:
+            values.update(module.Secrets(self.root).all_for(pid))
+        return values
+
+    def plain_settings(self, pid):
+        """Only what is in the toml: safe to print, safe to log."""
+        return dict((self.config.get("settings") or {}).get(pid) or {})
+
+    def secrets_of(self, pid):
+        module = self.settings_module()
+        return module.Secrets(self.root).all_for(pid) if module else {}
+
+    def set_setting(self, pid, name, value, declarations=(), owner=""):
+        """Write one answer where it belongs, and nowhere else."""
+        module = self.settings_module()
+        declaration = next((d for d in declarations if d.name == name), None)
+        if declaration is not None and declaration.secret:
+            module.Secrets(self.root).set(pid, name, value)
+            return
+        values = self.plain_settings(pid)
+        values[name] = value
+        self.write_settings(pid, values, declarations, owner)
+
+    def write_settings(self, pid, values, declarations=(), owner=""):
+        """Rewrite `[settings.<piece>]` with the help text as comments.
+
+        Comments and layout are not preserved here, unlike everywhere else in
+        this file, because this block **is** generated from the declarations:
+        the comments are the piece's own help, and regenerating them is how a
+        new version of a piece explains a new option to somebody who installed
+        the old one.
+        """
+        module = self.settings_module()
+        if module is None or not self.config_path.exists():
+            return
+        declarations = list(declarations)
+        # Anything with a default is written out with it, even if nobody was
+        # asked. A value you cannot see is a value you cannot change, and the
+        # whole point of this file is that somebody opens it and edits it.
+        values = dict(values)
+        for declaration in declarations:
+            if (not declaration.secret and declaration.name not in values
+                    and declaration.default is not None):
+                values[declaration.name] = declaration.default
+        known = {d.name for d in declarations}
+        # Anything the operator added by hand that the piece does not declare
+        # is kept: guessing it is rubbish is how a tool eats somebody's work.
+        extra = {k: v for k, v in values.items() if k not in known}
+        block = module.toml_block(pid, declarations, values, owner)
+        if extra:
+            block += "\n\n# Kept as you left it (not declared by this piece):\n"
+            block += "\n".join("%s = %s" % (k, toml_value(v))
+                               for k, v in sorted(extra.items()))
+        self._replace_section("settings", pid, block)
+
+    def forget_secrets(self, pid):
+        module = self.settings_module()
+        if module:
+            module.Secrets(self.root).forget(pid)
+
+    def _replace_section(self, section, name, block):
+        self._remove_block(section, name)
+        text = self.config_path.read_text(encoding="utf-8")
+        self.config_path.write_text(text.rstrip("\n") + "\n\n" + block + "\n",
+                                    encoding="utf-8")
+        self.config = read_toml(self.config_path)
+
     def _set_block(self, section, name, fields, owner=""):
         if not self.config_path.exists():
             return
@@ -514,7 +667,7 @@ class Server:
         lines = [header]
         width = max(len(key) for key in fields)
         for key, value in fields.items():
-            lines.append(f"{key.ljust(width)} = {json.dumps(value)}")
+            lines.append(f"{key.ljust(width)} = {toml_value(value)}")
         block = "\n".join(lines)
         text = text.rstrip("\n") + "\n\n" + block + "\n"
         self.config_path.write_text(text, encoding="utf-8")
@@ -1512,12 +1665,34 @@ def cmd_status(args, index):
             flag = Out.warn(f"update -> {latest}")
         if entry.get("pending_restart"):
             flag = (flag + "  " if flag else "") + Out.warn("waits for restart")
+        if missing_settings(server, pid):
+            flag = (flag + "  " if flag else "") + Out.warn("not configured")
         say(f"  {pid.ljust(width)}  {entry['version']:<20} {flag}")
     pending = server.pending
     if pending:
         say()
         say(Out.warn(f"{len(pending)} waiting for a restart"))
+    unconfigured = [pid for pid in entries if missing_settings(server, pid)]
+    if unconfigured:
+        say()
+        for pid in unconfigured:
+            say(Out.warn(f"`w4ve configure {pid}` before it can run"))
     return 0
+
+
+# Asked of the interpreter the service will really use. One process, both
+# spellings, and no import: a distribution that is installed answers here even
+# when its import name is nothing like it.
+DISTRIBUTION_PROBE = """
+import importlib.metadata as meta, sys
+for name in sys.argv[1:]:
+    try:
+        meta.distribution(name)
+        sys.exit(0)
+    except Exception:
+        pass
+sys.exit(1)
+"""
 
 
 def cmd_doctor(args, index):
@@ -1635,6 +1810,15 @@ def cmd_doctor(args, index):
     # 7. the services a piece brought with it
     rt = runtime_module()
     for service in (rt.services_from(server.config) if rt else []):
+        # Expanded first, or every check below is run against the literal
+        # `${setting:python_bin}` rather than against the program that will
+        # really be started.
+        owner = owner_of(server, "services", service["name"])
+        service, _answers = with_answers(server, owner, service)
+        pending_answers = settings_module().unresolved(service["command"]) \
+            if settings_module() else []
+        if pending_answers:
+            continue        # already reported as "not configured yet"
         where = server.root / service["cwd"]
         if not where.is_dir():
             problems.append(f"service {service['name']}: {service['cwd']} "
@@ -1653,12 +1837,57 @@ def cmd_doctor(args, index):
         # running this command: a service pointed at a venv is the normal case.
         interpreter = program if "python" in Path(program).name else sys.executable
         for module in entry.get("python_requires") or []:
-            probe = subprocess.run(
-                [interpreter, "-c", f"import {module.split('[')[0]}"],
-                capture_output=True)
+            # Asked as a **distribution**, not as an importable module: the pip
+            # name and the import name disagree often enough that checking the
+            # import reports things as missing that are installed (`pillow` is
+            # imported as `PIL`, `python-multipart` as `multipart`).
+            name = module.split("[")[0].split("=")[0].split(">")[0].strip()
+            probe = subprocess.run([interpreter, "-c", DISTRIBUTION_PROBE,
+                                    name, name.replace("_", "-")],
+                                   capture_output=True)
             if probe.returncode != 0:
                 problems.append(f"service {service['name']} needs the Python "
-                                f"module {module}, which is not installed")
+                                f"package {module}, which is not installed "
+                                f"for {Path(interpreter).name}")
+
+    # 8. pieces that were installed and never answered. This is the most
+    # common way a piece is "broken": it was never told what it needed.
+    module = settings_module()
+    for pid in entries:
+        for declaration in missing_settings(server, pid):
+            problems.append(f"{pid} has no {declaration.name} yet "
+                            f"(`w4ve configure {pid}`)")
+    if module and module.Secrets(server.root).insecure():
+        problems.append("w4ve/secrets.json is readable by other users on this "
+                        "machine: chmod 600 it")
+
+    # 9. the disk, which fills up over days and is nobody's job until it is
+    for area in storage_areas(server):
+        folder = server.root / area["dir"]
+        if not folder.is_dir():
+            warnings.append(f"storage {area['name']}: {area['dir']} is not there")
+            continue
+        if not area.get("quota") or not module or not rt:
+            continue
+        used, _count = rt.folder_usage(folder)
+        quota = module.parse_size(area["quota"])
+        if quota and used > quota:
+            problems.append(f"storage {area['name']} is over its ceiling "
+                            f"({module.human_size(used)} of {area['quota']}): "
+                            f"`w4ve storage --purge`")
+        elif quota and used > quota * 0.9:
+            warnings.append(f"storage {area['name']} is nearly full "
+                            f"({module.human_size(used)} of {area['quota']})")
+
+    # 10. routes that exist in w4ve.toml and in nobody's web server
+    routes = http_routes(server)
+    if routes:
+        applied = server.state.get("http_applied") or {}
+        current = {route["name"]: route["path"] for route in routes}
+        if applied != current:
+            warnings.append(f"{len(routes)} public route"
+                            f"{'s' if len(routes) != 1 else ''} declared here "
+                            f"are not in any web server yet (`w4ve http`)")
 
     if server.pending:
         warnings.append(f"waiting for a restart: {', '.join(server.pending)}")
@@ -1674,6 +1903,517 @@ def cmd_doctor(args, index):
         say(f"{len(problems)} problem{'s' if len(problems) != 1 else ''}, "
             f"{len(warnings)} warning{'s' if len(warnings) != 1 else ''}")
     return 1 if problems else 0
+
+
+# ------------------------------------------------------------------ configure
+
+def settings_module():
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import piecesettings
+        return piecesettings
+    except ImportError:
+        return None
+
+
+def discover_module():
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import discover
+        return discover
+    except ImportError:
+        return None
+
+
+def declarations_for(server, pid):
+    """What this piece needs told to it, from the state written at install."""
+    module = settings_module()
+    entry = server.state["pieces"].get(pid) or {}
+    if module is None:
+        return []
+    return module.declarations_of({"settings": entry.get("settings") or []})
+
+
+def missing_settings(server, pid):
+    """Required answers nobody has given yet, in declaration order."""
+    values = server.settings_of(pid)
+    out = []
+    for declaration in declarations_for(server, pid):
+        if declaration.when and not values.get(declaration.when):
+            continue
+        if declaration.required and declaration.name not in values:
+            out.append(declaration)
+    return out
+
+
+def _prompt(text, default=None):
+    """One line of input, or the default when nobody is at the keyboard."""
+    if not sys.stdin.isatty():
+        return default
+    shown = f" [{default}]" if default not in (None, "") else ""
+    try:
+        answer = input(f"{text}{shown}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        say()
+        raise SystemExit(1)
+    return answer or default
+
+
+def _pick(options, title, current=None):
+    """Choose from a numbered list of names. Ids never get typed."""
+    say()
+    say(Out.bold(title))
+    for number, (value, label) in enumerate(options, 1):
+        mark = "  <- set now" if current and value == current else ""
+        say(f"  {number:>2}. {label}{Out.dim(mark)}")
+    say()
+    while True:
+        answer = _prompt("number", "1" if not current else None)
+        if answer is None:
+            return current
+        try:
+            chosen = options[int(answer) - 1]
+        except (ValueError, IndexError):
+            problem("pick one of the numbers above")
+            continue
+        return chosen[0]
+
+
+def _ask_one(declaration, current, context, server, pid, args):
+    """Ask for one setting, going and looking first when it can."""
+    module = settings_module()
+    say()
+    say(Out.bold(declaration.title))
+    for line in module._wrap(declaration.help, 74):
+        say(f"  {line}")
+    if declaration.example:
+        say(Out.dim(f"  for example: {declaration.example}"))
+
+    if declaration.discover:
+        found = _discovered(declaration, context, server, pid)
+        if found is not None:
+            if declaration.type == "list":
+                return _pick_many(found, "pick the ones that apply", current)
+            return _pick(found, "pick one", current)
+
+    if declaration.type == "bool":
+        return ask("  yes or no?", default=bool(current if current is not None
+                                                else declaration.default))
+    if declaration.type == "choice":
+        return _pick([(o, o) for o in declaration.options], "pick one", current)
+    while True:
+        shown = "(set)" if declaration.secret and current else current
+        answer = _prompt("  value", shown if shown != "(set)" else None)
+        if answer is None or (declaration.secret and answer == ""):
+            return current if current is not None else declaration.default
+        try:
+            return declaration.coerce(answer)
+        except module.SettingError as exc:
+            problem(f"  {exc}")
+
+
+def _pick_many(options, title, current):
+    say()
+    say(Out.bold(title))
+    chosen = set(current or [])
+    for number, (value, label) in enumerate(options, 1):
+        mark = " *" if value in chosen else ""
+        say(f"  {number:>2}. {label}{Out.bold(mark)}")
+    say()
+    answer = _prompt("  numbers, separated by commas", "")
+    if not answer:
+        return list(current or [])
+    out = []
+    for part in answer.split(","):
+        try:
+            out.append(options[int(part.strip()) - 1][0])
+        except (ValueError, IndexError):
+            problem(f"  ignoring {part.strip()!r}, it is not one of the numbers")
+    return out
+
+
+def _discovered(declaration, context, server, pid):
+    """Go and ask Discord (or whoever) for the possible answers."""
+    module = discover_module()
+    if module is None:
+        return None
+    token_name = module.token_setting_for(declaration.discover)
+    token = context.get(token_name) if token_name else None
+    try:
+        return module.options_for(declaration.discover, token, context)
+    except module.DiscoveryError as exc:
+        note(f"  {exc}")
+        note("  falling back to typing it by hand")
+        return None
+
+
+def cmd_configure(args, index):
+    """Answer what a piece needs, without anybody copying an id by hand.
+
+    This is the command that decides whether a big piece is installable by
+    somebody who is not its author. Everything it does is in service of one
+    rule: **an id is discovered, never asked for**.
+    """
+    server = need_server(args)
+    if server is None:
+        return 2
+    module = settings_module()
+    if module is None:
+        problem("this w4ve cannot handle settings (piecesettings.py is missing)")
+        return 2
+
+    pid = args.id
+    entry = server.state["pieces"].get(pid)
+    if entry is None:
+        problem(f"{pid} is not installed here")
+        return 1
+    declarations = declarations_for(server, pid)
+    if not declarations:
+        say(f"{pid} has nothing to configure")
+        return 0
+
+    values = server.settings_of(pid)
+    if args.show:
+        return _show_settings(server, pid, declarations, values)
+
+    if args.set:
+        return _set_settings(server, pid, declarations, values, args)
+
+    # An application id in the manifest means the piece can print its own
+    # invite link, which is the step people get wrong when they do it by hand.
+    _print_bot_hint(server, pid, declarations, values)
+
+    asked = 0
+    for declaration in declarations:
+        if declaration.when and not values.get(declaration.when):
+            continue
+        known = declaration.name in values
+        if known and not args.all:
+            continue
+        if not declaration.required and not args.all and not sys.stdin.isatty():
+            continue
+        answer = _ask_one(declaration, values.get(declaration.name), values,
+                          server, pid, args)
+        if answer is None:
+            continue
+        values[declaration.name] = answer
+        asked += 1
+        if declaration.secret:
+            server.set_setting(pid, declaration.name, answer, declarations, pid)
+        if declaration.name == "discord_token" and answer:
+            _print_invite(answer)
+        # Written after each answer, not at the end: a session interrupted
+        # halfway keeps what was already answered instead of starting over.
+        server.write_settings(pid, {k: v for k, v in values.items()
+                                    if k not in {d.name for d in declarations
+                                                 if d.secret}},
+                              declarations, pid)
+
+    say()
+    if asked:
+        say(f"{Out.ok('saved')}  {pid}: {asked} answered")
+    still = missing_settings(server, pid)
+    if still:
+        problem("still missing: " + ", ".join(d.name for d in still))
+        say(Out.dim(f"  run `w4ve configure {pid}` again when you have them"))
+        return 1
+    say(Out.dim(f"  values in w4ve.toml under [settings.{pid}]"))
+    if any(d.secret for d in declarations):
+        say(Out.dim("  secrets in w4ve/secrets.json (mode 600)"))
+    for line in (entry.get("guide") or []):
+        say(f"  {line}")
+    return 0
+
+
+def _print_bot_hint(server, pid, declarations, values):
+    """If a piece needs a Discord token, say exactly how to get one."""
+    if not any(d.name == "discord_token" for d in declarations):
+        return
+    if values.get("discord_token"):
+        return
+    say()
+    say(Out.bold("Getting the Discord token (two minutes, once)"))
+    say("  1. https://discord.com/developers/applications  ->  New Application")
+    say("  2. Bot tab  ->  Reset Token  ->  copy it")
+    say("  3. Bot tab  ->  Message Content Intent  ->  ON")
+    say(Out.dim("     (without that last one the bridge sees empty messages)"))
+    say("  4. paste it here when asked")
+    module = discover_module()
+    if module:
+        say(Out.dim("     w4ve will print the invite link with the right "
+                    "permissions once it has the token"))
+
+
+def _print_invite(token):
+    """Say who the token belongs to, and hand over the invite link.
+
+    Two things at once on purpose: the first call also proves the token works,
+    so a typo is caught here rather than when the service refuses to start.
+    """
+    module = discover_module()
+    if module is None:
+        return
+    try:
+        me = module.discord_me(token)
+    except module.DiscoveryError as exc:
+        problem(f"  {exc}")
+        return
+    say(f"  {Out.ok('token ok')}  the bot is {me.get('username', '?')}")
+    try:
+        guilds = module.discord_guilds(token)
+    except module.DiscoveryError:
+        guilds = []
+    if not guilds:
+        say()
+        say("  It is not in any Discord server yet. Invite it with this link, "
+            "then keep going:")
+        say(f"  {module.invite_url(me.get('id'))}")
+        _prompt("  press enter when it is in", "")
+
+
+def _show_settings(server, pid, declarations, values):
+    say(Out.bold(f"settings for {pid}"))
+    for declaration in declarations:
+        name = declaration.name
+        if declaration.secret:
+            shown = Out.ok("set") if values.get(name) else Out.warn("not set")
+        elif name in values:
+            shown = json.dumps(values[name])
+        else:
+            shown = Out.warn("not set") if declaration.required else Out.dim("default")
+        say(f"  {name:<20} {shown}")
+    return 0
+
+
+def _set_settings(server, pid, declarations, values, args):
+    """`--set name=value`, for scripts and for anybody who hates prompts."""
+    module = settings_module()
+    changed = 0
+    for pair in args.set:
+        if "=" not in pair:
+            problem(f"{pair!r} is not name=value")
+            return 2
+        name, raw = pair.split("=", 1)
+        name = name.strip()
+        declaration = next((d for d in declarations if d.name == name), None)
+        if declaration is None:
+            problem(f"{pid} has no setting called {name!r}")
+            return 1
+        try:
+            value = declaration.coerce(raw)
+        except module.SettingError as exc:
+            problem(f"{name}: {exc}")
+            return 1
+        if args.dry_run:
+            say(f"would set {name}")
+            continue
+        server.set_setting(pid, name, value, declarations, pid)
+        if not declaration.secret:
+            values[name] = value
+        changed += 1
+    if changed and not args.dry_run:
+        server.write_settings(pid, {k: v for k, v in values.items()
+                                    if k not in {d.name for d in declarations
+                                                 if d.secret}},
+                              declarations, pid)
+        say(f"{Out.ok('saved')}  {changed} changed")
+    return 0
+
+
+# ----------------------------------------------------------------------- http
+
+CACHE_HEADERS = {
+    "immutable": 'add_header Cache-Control "public, max-age=604800, immutable";',
+    "short": 'add_header Cache-Control "public, max-age=60";',
+    "none": 'add_header Cache-Control "no-store";',
+}
+
+
+def http_routes(server):
+    """`[http.<name>]` blocks, longest path first.
+
+    Sorted here rather than left to the operator because nginx picks the
+    longest matching prefix but an exact `location =` beats every prefix, and
+    getting that order wrong is what made `/v1/upload` get eaten by `/v1` on a
+    real machine.
+    """
+    out = []
+    for name, entry in (server.config.get("http") or {}).items():
+        if not isinstance(entry, dict) or not entry.get("path"):
+            continue
+        out.append({
+            "name": name,
+            "path": entry["path"],
+            "serve": entry.get("serve"),
+            "proxy": entry.get("proxy"),
+            "cache": entry.get("cache", "none"),
+            "max_body": entry.get("max_body"),
+            "exact": bool(entry.get("exact")),
+            "why": entry.get("why", ""),
+        })
+    return sorted(out, key=lambda r: (not r["exact"], -len(r["path"])))
+
+
+def render_nginx(server, routes):
+    """A block to paste into an nginx server, or to include from one.
+
+    Generated rather than documented: the four things that go wrong here (the
+    order, the body size, the cache header, the trailing slash of an alias) are
+    all things a program can get right every time and a person gets right most
+    times.
+    """
+    root = Path(server.root).resolve()
+    lines = [
+        "# Generated by w4ve. Paste inside the `server { }` that serves your",
+        "# public domain, or save it and `include` it from there.",
+        "#",
+        "# The order matters: exact matches (`location =`) first, then the",
+        "# longest prefixes. w4ve already sorted them for you.",
+        "",
+    ]
+    for route in routes:
+        if route["why"]:
+            lines.append(f"# {route['why']}")
+        marker = "= " if route["exact"] else ""
+        lines.append(f"location {marker}{route['path']} {{")
+        if route["max_body"]:
+            lines.append(f"    client_max_body_size {route['max_body']};")
+        if route["serve"]:
+            folder = (root / route["serve"]).as_posix().rstrip("/") + "/"
+            lines.append(f"    alias {folder};")
+            lines.append("    autoindex off;")
+            # Its own header, always: without it this location inherits
+            # whatever the parent one says, and a Content-Disposition from a
+            # neighbour turns every image into a download.
+            lines.append(f"    {CACHE_HEADERS.get(route['cache'], CACHE_HEADERS['none'])}")
+        else:
+            lines.append(f"    proxy_pass http://{route['proxy']}{route['path']};")
+            lines.append("    proxy_set_header Host $host;")
+            lines.append("    proxy_set_header X-Forwarded-For $remote_addr;")
+            lines.append("    proxy_read_timeout 120s;")
+        lines.append("}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def render_caddy(server, routes):
+    """The same thing for Caddy, which is what a first timer should be using.
+
+    Caddy gets its own renderer and not a footnote because it does the part
+    that stops people cold (a certificate) by itself.
+    """
+    root = Path(server.root).resolve()
+    lines = ["# Generated by w4ve. Put this in your Caddyfile, under the site",
+             "# block for your domain. Caddy gets the certificate by itself.",
+             ""]
+    for route in routes:
+        if route["why"]:
+            lines.append(f"# {route['why']}")
+        matcher = route["path"]
+        if route["serve"]:
+            folder = (root / route["serve"]).as_posix()
+            lines.append(f"handle_path {matcher.rstrip('/')}/* {{")
+            lines.append(f"    root * {folder}")
+            if route["cache"] == "immutable":
+                lines.append('    header Cache-Control "public, max-age=604800, immutable"')
+            lines.append("    file_server")
+            lines.append("}")
+        else:
+            lines.append(f"handle {matcher} {{")
+            if route["max_body"]:
+                lines.append(f"    request_body {{ max_size {route['max_body']} }}")
+            lines.append(f"    reverse_proxy {route['proxy']}")
+            lines.append("}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def cmd_http(args, index):
+    """Print the web server configuration the installed pieces need."""
+    server = need_server(args)
+    if server is None:
+        return 2
+    routes = http_routes(server)
+    if not routes:
+        say("no piece here asks for anything on the public side")
+        return 0
+    text = (render_caddy if args.flavour == "caddy" else render_nginx)(server, routes)
+    if args.out:
+        Path(args.out).write_text(text + "\n", encoding="utf-8")
+        say(f"{Out.ok('written')}  {args.out}")
+        if args.flavour == "nginx":
+            say(Out.dim("  then: nginx -t && systemctl reload nginx"))
+        # Written down so `doctor` stops nagging about routes that are in
+        # place, and starts again the day a piece adds a new one.
+        server.state["http_applied"] = {r["name"]: r["path"] for r in routes}
+        server.save_state()
+        return 0
+    say(text)
+    return 0
+
+
+# -------------------------------------------------------------------- storage
+
+def storage_areas(server):
+    out = []
+    for name, entry in (server.config.get("storage") or {}).items():
+        if not isinstance(entry, dict) or not entry.get("dir"):
+            continue
+        out.append({"name": name, "dir": entry["dir"],
+                    "quota": entry.get("quota"), "keep": entry.get("keep"),
+                    "by": entry.get("by", "mtime"), "why": entry.get("why", "")})
+    return out
+
+
+def cmd_storage(args, index):
+    """What the pieces are keeping on this disk, and whether it fits."""
+    server = need_server(args)
+    if server is None:
+        return 2
+    module = settings_module()
+    rt = runtime_module()
+    areas = storage_areas(server)
+    if not areas:
+        say("no piece here declares any storage")
+        return 0
+    trouble = 0
+    for area in areas:
+        folder = Path(server.root) / area["dir"]
+        used, files = (rt.folder_usage(folder) if rt
+                       else _usage_fallback(folder))
+        quota = module.parse_size(area["quota"]) if area["quota"] else None
+        label = module.human_size(used)
+        if quota:
+            share = used * 100 // quota if quota else 0
+            label += f" of {module.human_size(quota)} ({share}%)"
+            if used > quota:
+                trouble += 1
+        head = Out.warn(area["name"]) if quota and used > quota else Out.ok(area["name"])
+        say(f"{head}  {label}  {files} files  {Out.dim(area['dir'])}")
+        if area["why"]:
+            say(Out.dim(f"   {area['why']}"))
+        if args.purge and rt:
+            if args.dry_run:
+                say(Out.dim("   would make room now"))
+                continue
+            freed, gone = rt.purge_area(folder, quota,
+                                        module.parse_time(area["keep"]) if area["keep"] else None,
+                                        area["by"])
+            if gone:
+                say(f"   {Out.ok('freed')} {module.human_size(freed)} in {gone} files")
+    if trouble:
+        problem(f"{trouble} over its ceiling: `w4ve storage --purge` makes room")
+        return 1
+    return 0
+
+
+def _usage_fallback(folder):
+    total, count = 0, 0
+    for path in Path(folder).rglob("*"):
+        if path.is_file():
+            total += path.stat().st_size
+            count += 1
+    return total, count
 
 
 # ------------------------------------------------------------------- packages
@@ -1723,6 +2463,21 @@ def install_packages(server, paths, args):
                 component = action["component"]
                 say(f"  watch     {action['name']}  "
                     + Out.dim(f"on {component['on']} -> {component['do']}"))
+            elif action["kind"] == "http":
+                component = action["component"]
+                where = component.get("serve") or component.get("proxy")
+                say(f"  http      {component['path']}  "
+                    + Out.dim(f"-> {where}"))
+            elif action["kind"] == "storage":
+                component = action["component"]
+                say(f"  storage   {action['name']}  "
+                    + Out.dim(f"{component['dir']}"
+                              f"{', up to ' + component['quota'] if component.get('quota') else ''}"
+                              f"{', kept ' + component['keep'] if component.get('keep') else ''}"))
+            elif action["kind"] == "timer":
+                component = action["component"]
+                say(f"  timer     {action['name']}  "
+                    + Out.dim(f"every {component['every']}"))
             else:
                 say(f"  {action['kind'].ljust(9)} {action['dest']}  "
                     + Out.dim(action["reload"]))
@@ -1733,7 +2488,9 @@ def install_packages(server, paths, args):
             note(f"{manifest.id} {manifest.version} is already installed")
             continue
         if already:
-            remove_package(server, manifest.id, args, quiet=True)
+            # An update, not a removal: what was answered stays.
+            remove_package(server, manifest.id, args, quiet=True,
+                           keep_settings=True)
         try:
             record = install.apply(actions)
             install.commit()
@@ -1753,10 +2510,46 @@ def install_packages(server, paths, args):
         for name in record.get("watches") or []:
             entry = (server.config.get("watch") or {}).get(name) or {}
             say(Out.dim(f"    watch {name}: {entry.get('why') or entry.get('on')}"))
+        for name in record.get("timers") or []:
+            entry = (server.config.get("timer") or {}).get(name) or {}
+            say(Out.dim(f"    timer {name} every {entry.get('every')}"
+                        f"{': ' + entry['why'] if entry.get('why') else ''}"))
+        if record.get("storage"):
+            say(Out.dim(f"    storage: {', '.join(record['storage'])}  "
+                        f"(`w4ve storage` says how full)"))
+        if record.get("http"):
+            say(Out.dim(f"    public routes: {', '.join(record['http'])}  "
+                        f"(`w4ve http` writes the web server config)"))
+        finish_install(server, manifest.id, args)
     return report_pending(server, changed, args)
 
 
-def remove_package(server, pid, args, quiet=False):
+def finish_install(server, pid, args):
+    """The last stretch: answer what it needs, then say what is left to do.
+
+    A piece that installs and then sits there unconfigured is a piece that
+    looks broken. Asking here, while the person is still watching the command
+    they just ran, is the difference between five minutes and a support thread.
+    """
+    entry = server.state["pieces"].get(pid) or {}
+    missing = missing_settings(server, pid)
+    if missing and sys.stdin.isatty() and not args.dry_run:
+        say()
+        say(Out.bold(f"{pid} needs {len(missing)} thing"
+                     f"{'s' if len(missing) != 1 else ''} told to it."))
+        if ask("answer them now?", default=True):
+            configure_args = argparse.Namespace(
+                id=pid, all=False, show=False, set=None,
+                dir=getattr(args, "dir", None), dry_run=False, yes=True)
+            cmd_configure(configure_args, None)
+            return
+    if missing:
+        say(Out.warn(f"    not configured yet: `w4ve configure {pid}`"))
+    for line in entry.get("guide") or []:
+        say(f"    {line}")
+
+
+def remove_package(server, pid, args, quiet=False, keep_settings=False):
     pkg = package_module()
     if pkg is None:
         problem("this w4ve cannot read packages (package.py is missing)")
@@ -1766,7 +2559,7 @@ def remove_package(server, pid, args, quiet=False):
         for relative in (entry.get("files") or {}):
             say(f"would delete {relative}")
         return 0
-    result = pkg.remove(server, pid)
+    result = pkg.remove(server, pid, keep_settings=keep_settings)
     if result is None:
         return 0
     server.remove_pin(pid)
@@ -1825,17 +2618,278 @@ def cmd_pack(args, index):
     say(f"{Out.ok('ok')}  {target}  ({size // 1024} KB)")
     for component in manifest.components:
         kind = component.get("kind", "?")
-        if kind == "service":
-            say(Out.dim(f"    service  {component['name']}"))
-        elif kind == "watch":
+        if kind == "watch":
             say(Out.dim(f"    watch    {component['name']}  "
                         f"-> {component.get('do')}"))
+        elif kind == "http":
+            where = component.get("serve") or component.get("proxy")
+            say(Out.dim(f"    http     {component['path']}  -> {where}"))
+        elif kind in ("service", "storage", "timer"):
+            say(Out.dim(f"    {kind.ljust(8)} {component['name']}"))
         else:
             say(Out.dim(f"    {kind.ljust(8)} {component.get('file', '?')}"))
     return 0
 
 
 # -------------------------------------------------------------------- runtime
+
+def read_mcdr_config(root):
+    """The handful of keys MCDR's `config.yml` holds that a cutover needs.
+
+    Read by hand rather than with a YAML library, for the same reason the rest
+    of this program has none: it must run on a server where nothing was
+    installed first. The keys wanted are flat strings at the top level, which
+    is the easy half of YAML.
+    """
+    path = Path(root) / "config.yml"
+    if not path.is_file():
+        return None
+    wanted = ("working_directory", "start_command", "handler", "encoding",
+              "decoding", "language")
+    found = {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for raw in text.splitlines():
+        if raw[:1].isspace() or raw.lstrip().startswith("#"):
+            continue                     # nested, or a comment
+        key, sep, value = raw.partition(":")
+        if not sep or key.strip() not in wanted:
+            continue
+        value = value.split(" #", 1)[0].strip()
+        if len(value) > 1 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if value:
+            found[key.strip()] = value
+    return found or None
+
+
+def rcon_of(game_dir):
+    """(enabled, port) from a server.properties, or (None, None)."""
+    path = Path(game_dir) / "server.properties"
+    if not path.is_file():
+        return None, None
+    enabled, port = False, None
+    try:
+        for line in path.read_text(errors="replace").splitlines():
+            key, sep, value = line.partition("=")
+            if not sep:
+                continue
+            if key.strip() == "enable-rcon":
+                enabled = value.strip().lower() == "true"
+            elif key.strip() == "rcon.port":
+                port = value.strip()
+    except OSError:
+        return None, None
+    return enabled, port
+
+
+def cmd_preflight(args, index):
+    """Can this server move to W4VE today? One command, one answer.
+
+    Everything else in this program answers a piece of that question: which
+    plugins load, what pip is missing, whether the layout is what it looks
+    like. Asked separately they are five commands and a document; asked here
+    they are one run and a verdict, which is what somebody standing in front of
+    a live server at eleven at night actually needs.
+
+    ⚠️ It works with no `w4ve.toml`, on purpose. The honest moment to ask "can
+    I move?" is while MCDR is still the thing running, before anything has been
+    written, and a check that demands you convert first is a check that arrives
+    too late to be an answer.
+    """
+    root = Path(args.dir or ".").resolve()
+    server = Server.find(str(root))
+    if server and server.root != root:
+        server = None                    # a w4ve.toml further up is not ours
+    blockers, warnings, notes = [], [], []
+
+    say(Out.bold(f"preflight  {root}"))
+    say()
+
+    # 1. What is here. Under MCDR the shape is unmistakable, and knowing it is
+    # what makes every later answer specific rather than generic.
+    mcdr_config = read_mcdr_config(root)
+    plugins_dir = root / "plugins"
+    permission = root / "permission.yml"
+    if mcdr_config:
+        say(f"{Out.ok('mcdr')}  config.yml found: this server runs MCDR today")
+    elif plugins_dir.is_dir():
+        say(f"{Out.warn('mcdr')}  plugins/ is here but there is no config.yml")
+        notes.append("without MCDR's config.yml the start command has to be "
+                     "written by hand")
+    else:
+        say(f"{Out.dim('mcdr')}  no MCDR here, so there is nothing to move from")
+
+    # 2. Where Minecraft actually runs. Getting this wrong is the quiet kind of
+    # wrong: plugins write to paths relative to it, so a backup lands in an
+    # empty folder and reports success.
+    declared = (mcdr_config or {}).get("working_directory") or "server"
+    game_dir = root / declared
+    if game_dir.is_dir():
+        say(f"{Out.ok('layout')}  Minecraft runs in {declared}/")
+    else:
+        say(f"{Out.bad('layout')}  {declared}/ is not here")
+        blockers.append(f"MCDR says the server lives in {declared}/, which does "
+                        f"not exist")
+    if server:
+        if server.game_dir_name != declared:
+            blockers.append(f"w4ve.toml says game_dir = \"{server.game_dir_name}\" "
+                            f"and MCDR says {declared!r}: plugins write to paths "
+                            f"relative to it, so this is the difference between "
+                            f"a backup and an empty folder")
+        else:
+            notes.append(f"w4ve.toml already agrees: game_dir = {declared!r}")
+
+    # 3. The start command. Copied, never guessed: the flags on it are somebody's
+    # tuning and a rewritten line is a different server.
+    start = (mcdr_config or {}).get("start_command")
+    if start:
+        say(f"{Out.ok('start')}  {Out.dim(start)}")
+        if server and server.config.get("server", {}).get("start"):
+            if server.config["server"]["start"].strip() != start.strip():
+                warnings.append("w4ve.toml has a different start command than "
+                                "MCDR's config.yml")
+        elif server:
+            blockers.append("w4ve.toml has no `start` line yet; copy MCDR's "
+                            "start_command into it")
+    elif mcdr_config:
+        warnings.append("MCDR's config.yml has no start_command in it")
+
+    # 4. The plugins, read rather than run.
+    mcdr = mcdr_module()
+    plugins = []
+    if mcdr is None:
+        blockers.append("this copy of w4ve cannot read MCDR plugins (the mcdr "
+                        "package is missing next to w4ve.py)")
+    elif not plugins_dir.is_dir():
+        say(f"{Out.dim('plugins')}  no plugins/ folder")
+    else:
+        found = mcdr.report(plugins_dir)
+        plugins = found["plugins"]
+        broken = [p for p in plugins if p.problems]
+        say(f"{Out.ok('plugins') if not broken else Out.warn('plugins')}  "
+            f"{len(plugins)} found"
+            + (f", {len(broken)} that do not even parse" if broken else ""))
+        for plugin in broken:
+            blockers.append(f"{plugin.path.name}: {plugin.problems[0]}")
+
+    # 5. What pip is missing. Not installed here, ever: this says the line and
+    # the operator decides. A plugin can also load fine and still be missing
+    # something it only imports when somebody uses it.
+    missing = []
+    if plugins:
+        try:
+            from mcdr import requirements
+        except ImportError:
+            requirements = None
+        if requirements:
+            wanted = {}
+            for plugin in plugins:
+                for name in requirements.missing(plugin):
+                    wanted.setdefault(name, []).append(plugin.id or plugin.path.name)
+            missing = sorted(wanted)
+            if missing:
+                say(f"{Out.warn('python')}  {len(missing)} package"
+                    f"{'s' if len(missing) != 1 else ''} some plugin asked for "
+                    f"and this machine does not have")
+                say(f"          {Out.dim(requirements.install_line(wanted))}")
+                blockers.append("install those packages before the cutover: a "
+                                "plugin missing one either will not load or "
+                                "will die the first time somebody uses it")
+            else:
+                say(f"{Out.ok('python')}  every package the plugins declare is here")
+
+    # 6. The staff list, which is the thing nobody notices is gone until
+    # somebody who should be admin is not.
+    if permission.is_file():
+        try:
+            from mcdr.permission import PermissionFile
+        except ImportError:
+            PermissionFile = None
+        if PermissionFile is None:
+            warnings.append("permission.yml is here but this w4ve cannot read it")
+        else:
+            complaints = []
+            perms = PermissionFile(permission, on_problem=complaints.append)
+            perms.load()
+            counted = {level: len(perms.names_at(level))
+                       for level in ("owner", "admin", "helper")}
+            people = sum(counted.values())
+            say(f"{Out.ok('permissions')}  {people} named "
+                f"({counted['owner']} owner, {counted['admin']} admin, "
+                f"{counted['helper']} helper)")
+            for line in complaints:
+                warnings.append(f"permission.yml: {line}")
+    elif mcdr_config:
+        warnings.append("no permission.yml: everybody would start as the "
+                        "default level")
+
+    # 7. RCON, which is the fallback channel for a server W4VE did not start.
+    enabled, port = rcon_of(game_dir)
+    if enabled is None:
+        warnings.append(f"no server.properties in {declared}/ to check RCON")
+    elif enabled:
+        say(f"{Out.ok('rcon')}  on, port {port}")
+    else:
+        say(f"{Out.warn('rcon')}  off")
+        notes.append("RCON off is workable but it is the fallback channel for "
+                     "a server the guardian did not start")
+
+    # 8. Java, because the version the server needs is not always the one on
+    # PATH, and finding out at boot is a bad time.
+    try:
+        out = subprocess.run(["java", "-version"], capture_output=True,
+                             text=True, timeout=10)
+        found_java = re.search(r'"(\d+)', out.stderr or out.stdout)
+        if found_java:
+            say(f"{Out.ok('java')}  {found_java.group(1)} on PATH")
+            if server and server.java and found_java.group(1) != server.java:
+                warnings.append(f"w4ve.toml says Java {server.java}, PATH has "
+                                f"{found_java.group(1)}")
+    except (OSError, subprocess.SubprocessError):
+        warnings.append("no `java` on PATH here (normal on a container host)")
+
+    # The rehearsal. Off by default because it imports every plugin, which is
+    # somebody else's code running on this machine, and that should be asked
+    # for rather than assumed.
+    if getattr(args, "load", False) and plugins:
+        say()
+        say(Out.dim("loading them for real, against nothing:"))
+        load_plugins(server or _rootlike(root), plugins_dir)
+
+    say()
+    for line in blockers:
+        say(f"{Out.bad('blocker')}  {line}")
+    for line in warnings:
+        say(f"{Out.warn('warning')}  {line}")
+    for line in notes:
+        say(f"{Out.dim('note')}     {line}")
+    say()
+    if blockers:
+        say(f"{Out.bad('not ready')}  {len(blockers)} thing"
+            f"{'s' if len(blockers) != 1 else ''} to fix first")
+        return 1
+    say(f"{Out.ok('ready')}  nothing is in the way of a cutover")
+    note("`w4ve preflight --load` loads the plugins for real, which is the "
+         "rehearsal")
+    note("the steps themselves are in docs/cutover-del-mirror.md")
+    return 0
+
+
+class _rootlike:
+    """Just enough of a server for the rehearsal, when there is no w4ve.toml.
+
+    The whole point of preflight is answering before anything is written, and
+    the rehearsal only needs to know where the folder is.
+    """
+
+    def __init__(self, root):
+        self.root = Path(root)
+        self.config = {}
+        self.mc = None
+
 
 def mcdr_module():
     """The MCDR plugin reader, if this copy of w4ve ships it."""
@@ -2057,12 +3111,45 @@ def need_runtime():
     return module
 
 
+def owner_of(server, section, name):
+    """Which piece put this block in w4ve.toml, from what install wrote down."""
+    key = {"services": "services", "timer": "timers"}.get(section, section)
+    for pid, entry in (server.state.get("pieces") or {}).items():
+        if name in (entry.get(key) or []):
+            return pid
+    return ""
+
+
+def answers_for(server, pid):
+    """(settings, secrets) for a piece, or two empty dicts."""
+    if not pid:
+        return {}, {}
+    return server.plain_settings(pid), server.secrets_of(pid)
+
+
+def with_answers(server, pid, fields):
+    """Expand `${setting:x}` and `${secret:y}`, and hand the rest over as env.
+
+    The environment is why a package almost never needs a config template: a
+    service reads `W4VE_PUBLIC_URL` and that is the end of it. The expansion is
+    for the cases that cannot be an environment variable, like a port inside a
+    command line.
+    """
+    module = settings_module()
+    if module is None or not pid:
+        return fields, {}
+    settings, secrets = answers_for(server, pid)
+    expanded = module.expand(fields, settings, secrets)
+    return expanded, module.environment_for(pid, settings, secrets)
+
+
 def runtime_pieces(server, rt):
-    """Turn w4ve.toml into a guardian: one server, plus declared services."""
+    """Turn w4ve.toml into a guardian: one server, its services, its upkeep."""
     game_dir = server.root / server.game_dir
     command = rt.server_command(server.config, server.root, server.game_dir)
     guardian = rt.Guardian(server.root, server.config)
     section = server.config.get("server", {})
+    module = settings_module()
     if command:
         guardian.add_server(
             command, game_dir,
@@ -2071,15 +3158,41 @@ def runtime_pieces(server, rt):
             restart=section.get("restart_policy") or "never",
             watches=rt.watches_from(server.config))
     for service in rt.services_from(server.config):
+        pid = owner_of(server, "services", service["name"])
+        service, answers = with_answers(server, pid, service)
+        environment = dict(answers)
+        environment.update(service.get("env") or {})
+        if module:
+            still = module.unresolved([service["command"], environment])
+            if still:
+                # Refusing to start beats starting with an empty token: the
+                # first failure says the word `secret`, the second says
+                # nothing anybody can read.
+                problem(f"{service['name']} is not configured: "
+                        f"{', '.join(sorted(set(still)))}")
+                note(f"  run `w4ve configure {pid}`" if pid else "")
+                continue
         guardian.add_service(service["name"], service["command"],
                              server.root / service["cwd"], service["restart"],
                              health=service.get("health"),
                              health_every=service.get("health_every", 30),
-                             env=service.get("env"),
+                             env=environment,
                              mcdr=service.get("mcdr", False),
                              stop_grace=service.get("stop_grace",
                                                     rt.SERVICE_GRACE),
                              after=service.get("after") or ())
+    for timer in rt.timers_from(server.config):
+        pid = owner_of(server, "timer", timer["name"])
+        timer, answers = with_answers(server, pid, timer)
+        environment = dict(answers)
+        environment.update(timer.get("env") or {})
+        guardian.add_timer(timer["name"], timer["command"], timer["every"],
+                           cwd=timer["cwd"], env=environment,
+                           why=timer.get("why", ""))
+    for area in rt.storage_from(server.config):
+        guardian.add_storage(area["name"], area["dir"], quota=area.get("quota"),
+                             keep=area.get("keep"), by=area.get("by", "mtime"),
+                             why=area.get("why", ""))
     return guardian, command
 
 
@@ -2091,10 +3204,17 @@ def cmd_run(args, index):
     server = need_server(args)
     guardian, command = runtime_pieces(server, rt)
     if not command:
-        problem("w4ve.toml does not say how to start this server")
-        note('add `start = "java -Xms4G -Xmx4G -jar fabric-server-launch.jar nogui"` '
-             "under [server]")
-        return 2
+        # A folder with no Minecraft in it is a real case, and it is the one a
+        # shared piece needs: a hub that serves a whole network of servers runs
+        # on a machine of its own, with services and timers and no world.
+        if guardian.watched or guardian.timers:
+            note("no Minecraft server here: running the services and timers "
+                 "on their own")
+        else:
+            problem("w4ve.toml does not say how to start this server")
+            note('add `start = "java -Xms4G -Xmx4G -jar fabric-server-launch.jar nogui"` '
+                 "under [server]")
+            return 2
     guardian.echo = not args.quiet
     say(Out.dim(f"guardian for {server.root.name}, Ctrl-C stops the server"))
 
@@ -2346,6 +3466,26 @@ def build_parser():
     listing_plugins.add_argument("target", nargs="?",
                                  help="which plugin the action is about")
 
+    configure = add("configure", cmd_configure,
+                    "answer what a piece needs told to it")
+    configure.add_argument("id", help="the piece to configure")
+    configure.add_argument("--all", action="store_true",
+                           help="go through every setting, not only the missing ones")
+    configure.add_argument("--show", action="store_true",
+                           help="what is set and what is not (never prints secrets)")
+    configure.add_argument("--set", action="append", metavar="name=value",
+                           help="set one without prompting (repeatable)")
+
+    http_cmd = add("http", cmd_http, "the web server config this server needs")
+    http_cmd.add_argument("flavour", nargs="?", default="nginx",
+                          choices=["nginx", "caddy"],
+                          help="which web server to write it for (default: nginx)")
+    http_cmd.add_argument("--out", help="write it to a file instead of printing")
+
+    storage = add("storage", cmd_storage, "what pieces are storing, and its ceiling")
+    storage.add_argument("--purge", action="store_true",
+                         help="make room now, following what each piece declared")
+
     packing = add("pack", cmd_pack, "build a .w4ve out of a folder")
     packing.add_argument("folder", help="folder with a w4ve.json in it")
     packing.add_argument("--out", help="where to leave the package")
@@ -2389,7 +3529,7 @@ def build_parser():
                       help="the guardian journal instead of the console")
 
     for name in ("run", "start", "stop", "console", "logs", "pack", "repair",
-                 "plugins"):
+                 "plugins", "configure", "http", "storage"):
         subparsers.choices[name].set_defaults(needs_index=False)
 
     for name, sub in subparsers.choices.items():

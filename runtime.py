@@ -51,6 +51,12 @@ DEPENDENCY_WAIT = 30
 CRASH_WINDOW = 600
 CRASH_LIMIT = 3
 
+# A timer that runs longer than this is not a timer any more, and letting it
+# pile up would eventually be a machine full of the same script.
+TIMER_TIMEOUT = 300
+# How often the disk is looked at. Storage fills up over days, not seconds.
+STORAGE_EVERY = 300
+
 CONSOLE_CAP = 8 * 1024 * 1024
 
 
@@ -602,6 +608,87 @@ class Watched:
 SOCK_MAX = 100
 
 
+# --------------------------------------------------------------------- disk
+
+def parse_size(text):
+    """`2G` -> bytes. Duplicated from piecesettings on purpose.
+
+    The runtime has to work on a machine where only `w4ve.py` and `runtime.py`
+    were copied, so it does not get to depend on the settings module for two
+    lines of arithmetic.
+    """
+    raw = str(text).strip().lower().replace("b", "")
+    units = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
+    unit = units.get(raw[-1:]) if raw else None
+    try:
+        return int(float(raw[:-1] if unit else raw) * (unit or 1))
+    except ValueError:
+        return 0
+
+
+def parse_time(text):
+    """`7d` -> seconds."""
+    raw = str(text).strip().lower()
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+    unit = units.get(raw[-1:]) if raw else None
+    try:
+        return int(float(raw[:-1] if unit else raw) * (unit or 1))
+    except ValueError:
+        return 0
+
+
+def folder_usage(folder):
+    """(bytes, files) under a folder, symlinks not followed."""
+    total, count = 0, 0
+    for path in Path(folder).rglob("*"):
+        try:
+            if path.is_file() and not path.is_symlink():
+                total += path.stat().st_size
+                count += 1
+        except OSError:
+            continue
+    return total, count
+
+
+def purge_area(folder, quota=None, keep=None, by="mtime"):
+    """Make room, oldest first, and never touch what is still inside the rules.
+
+    `by="atime"` is what a cache wants: a song played every day stays even if
+    it is the oldest thing there. `by="mtime"` is what a log wants. Getting
+    this backwards is how a cache throws away exactly what people use.
+    """
+    folder = Path(folder)
+    if not folder.is_dir():
+        return 0, 0
+    files = []
+    for path in folder.rglob("*"):
+        try:
+            if not path.is_file() or path.is_symlink():
+                continue
+            info = path.stat()
+            age = info.st_atime if by == "atime" else info.st_mtime
+            files.append((age, info.st_size, path))
+        except OSError:
+            continue
+    files.sort()
+    freed, gone = 0, 0
+    moment = time.time()
+    remaining = sum(size for _, size, _ in files)
+    for age, size, path in files:
+        too_old = keep is not None and (moment - age) > keep
+        too_big = quota is not None and remaining > quota
+        if not (too_old or too_big):
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        freed += size
+        gone += 1
+        remaining -= size
+    return freed, gone
+
+
 def control_socket_for(run_dir):
     """Where this server's control socket lives, short enough to bind.
 
@@ -649,6 +736,8 @@ class Guardian:
         self.lock_path = self.run_dir / "lock"
         self.lock_fd = None
         self.watched = {}
+        self.timers = {}
+        self.storage = {}
         self.listeners = []
         self.listeners_lock = threading.Lock()
         self.echo = False           # print the console here, for `w4ve run`
@@ -762,6 +851,111 @@ class Guardian:
                        stop_grace=stop_grace, after=after)
         self.watched[name] = proc
         return proc
+
+    def add_timer(self, name, command, every, cwd=".", env=None, why=""):
+        """Something to run again every so often, watched instead of cron'd.
+
+        A cron entry is a promise nobody checks: the ShapeBoard scan was dead
+        for three days and the only symptom was a board that stopped changing.
+        A timer here runs in the guardian, its output goes to the journal, and
+        a run that fails says so out loud the first time and then keeps count.
+        """
+        self.timers[name] = {
+            "name": name,
+            "command": list(command),
+            "every": max(5, int(every)),
+            "cwd": str(Path(self.root) / cwd),
+            "env": dict(env or {}),
+            "why": why,
+            "last": 0.0,
+            "runs": 0,
+            "failures": 0,
+            "streak": 0,
+            "last_error": "",
+        }
+        return self.timers[name]
+
+    def add_storage(self, name, folder, quota=None, keep=None, by="mtime",
+                    why=""):
+        """A folder a piece writes to, with a ceiling and a way to make room."""
+        self.storage[name] = {
+            "name": name,
+            "dir": str(Path(self.root) / folder),
+            "quota": quota,
+            "keep": keep,
+            "by": by,
+            "why": why,
+            "last_purge": 0.0,
+        }
+        Path(self.storage[name]["dir"]).mkdir(parents=True, exist_ok=True)
+        return self.storage[name]
+
+    def _housekeeping(self):
+        """The loop that runs the timers and keeps the disk inside its lines.
+
+        One thread for both because they are the same kind of work: something
+        that has to happen on its own, that nobody is watching, and that must
+        never be able to hold up the guardian noticing that the server died.
+        """
+        while not self.stopping.is_set():
+            moment = time.time()
+            for timer in list(self.timers.values()):
+                if moment - timer["last"] < timer["every"]:
+                    continue
+                timer["last"] = moment
+                self._run_timer(timer)
+            for area in list(self.storage.values()):
+                if moment - area["last_purge"] < STORAGE_EVERY:
+                    continue
+                area["last_purge"] = moment
+                self._purge_storage(area)
+            self.stopping.wait(1.0)
+
+    def _run_timer(self, timer):
+        environment = dict(os.environ)
+        environment.update(timer["env"])
+        try:
+            result = subprocess.run(
+                timer["command"], cwd=timer["cwd"], env=environment,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                timeout=TIMER_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            timer["failures"] += 1
+            timer["streak"] += 1
+            timer["last_error"] = "took longer than %ds" % TIMER_TIMEOUT
+            self.log("timer %s %s" % (timer["name"], timer["last_error"]))
+            return
+        except OSError as exc:
+            timer["failures"] += 1
+            timer["streak"] += 1
+            timer["last_error"] = str(exc)
+            self.log("timer %s could not run: %s" % (timer["name"], exc))
+            return
+        timer["runs"] += 1
+        if result.returncode == 0:
+            if timer["streak"]:
+                self.log("timer %s is working again after %d failures"
+                         % (timer["name"], timer["streak"]))
+            timer["streak"] = 0
+            return
+        timer["failures"] += 1
+        timer["streak"] += 1
+        tail = (result.stdout or b"").decode("utf-8", "replace").strip()
+        timer["last_error"] = tail.splitlines()[-1] if tail else "exit %s" % result.returncode
+        # Loud the first time and then quiet: a timer failing every minute
+        # would bury everything else in the journal, which is how people learn
+        # to ignore it.
+        if timer["streak"] == 1 or timer["streak"] % 60 == 0:
+            self.log("timer %s failed (%d in a row): %s"
+                     % (timer["name"], timer["streak"], timer["last_error"]))
+
+    def _purge_storage(self, area):
+        quota = parse_size(area["quota"]) if area["quota"] else None
+        keep = parse_time(area["keep"]) if area["keep"] else None
+        freed, gone = purge_area(Path(area["dir"]), quota, keep, area["by"])
+        if gone:
+            self.log("storage %s: freed %d bytes in %d files"
+                     % (area["name"], freed, gone))
 
     def wait_for_dependencies(self, proc, timeout=DEPENDENCY_WAIT):
         """Hold a service back until what it needs is actually up.
@@ -1025,6 +1219,12 @@ class Guardian:
         recovered = self.recover()
         thread = threading.Thread(target=self.serve, daemon=True)
         thread.start()
+        if self.timers or self.storage:
+            # Its own thread: housekeeping must never be able to delay the
+            # guardian noticing that the server died.
+            threading.Thread(target=self._housekeeping, daemon=True).start()
+            self.log("housekeeping: %d timers, %d storage areas"
+                     % (len(self.timers), len(self.storage)))
 
         if start_now:
             for name, proc in self.watched.items():
@@ -1216,6 +1416,43 @@ def services_from(config):
             # MCDR the answer was to pip install all of MCDR on the machine to
             # get one class out of it.
             "mcdr": bool(entry.get("mcdr")),
+        })
+    return out
+
+
+def timers_from(config):
+    """Read `[timer.<name>]` blocks: something to run again every so often."""
+    out = []
+    for name, entry in (config.get("timer") or {}).items():
+        if not isinstance(entry, dict) or not entry.get("command"):
+            continue
+        command = entry["command"]
+        if isinstance(command, str):
+            command = shlex.split(command)
+        out.append({
+            "name": name,
+            "command": list(command),
+            "every": parse_time(entry.get("every") or "300s") or 300,
+            "cwd": entry.get("cwd") or ".",
+            "env": dict(entry.get("env") or {}),
+            "why": entry.get("why", ""),
+        })
+    return out
+
+
+def storage_from(config):
+    """Read `[storage.<name>]` blocks: a folder with a ceiling."""
+    out = []
+    for name, entry in (config.get("storage") or {}).items():
+        if not isinstance(entry, dict) or not entry.get("dir"):
+            continue
+        out.append({
+            "name": name,
+            "dir": entry["dir"],
+            "quota": entry.get("quota"),
+            "keep": entry.get("keep"),
+            "by": entry.get("by", "mtime"),
+            "why": entry.get("why", ""),
         })
     return out
 

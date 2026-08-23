@@ -24,6 +24,8 @@ import shutil
 import zipfile
 from pathlib import Path
 
+import piecesettings
+
 SCHEMA = 1
 
 # What a component can be. `plugin` is declared by the format and refused by
@@ -35,10 +37,17 @@ KINDS = {
     "datapack": "world/datapacks",
     "resourcepack": "resourcepacks",
     "asset": "w4ve/assets",
+    "client": "w4ve/client",  # a jar for the players, served rather than loaded
     "service": None,          # a process, not a file
     "watch": None,            # a line to look for, and what to do about it
+    "http": None,             # a path on the public side, served or proxied
+    "storage": None,          # a folder this piece writes to, with a ceiling
+    "timer": None,            # something to run again every so often
     "plugin": "plugins",
 }
+
+# Kinds that are declarations rather than files, and so land in w4ve.toml.
+DECLARED = ("service", "watch", "http", "storage", "timer")
 
 NOT_YET = {"plugin": "the native plugin platform does not exist yet"}
 
@@ -93,6 +102,21 @@ class Manifest:
     def conflicts(self):
         return self.data.get("conflicts") or []
 
+    @property
+    def settings(self):
+        """What this piece needs told to it before it can run."""
+        return piecesettings.declarations_of(self.data)
+
+    @property
+    def guide(self):
+        """A short install guide the piece carries, printed after installing.
+
+        Three or four lines, in the manifest and not in a web page, because the
+        moment somebody needs them is the moment the command finishes.
+        """
+        value = self.data.get("guide") or []
+        return [value] if isinstance(value, str) else list(value)
+
     # ------------------------------------------------------------- validation
 
     def problems(self):
@@ -116,6 +140,17 @@ class Manifest:
         if not self.components:
             out.append("no components: the package would install nothing")
 
+        seen = set()
+        for declaration in self.settings:
+            out.extend(declaration.problems())
+            if declaration.name in seen:
+                out.append("setting %s is declared twice" % declaration.name)
+            seen.add(declaration.name)
+        for declaration in self.settings:
+            if declaration.when and declaration.when not in seen:
+                out.append("setting %s waits on %r, which is not a setting here"
+                           % (declaration.name, declaration.when))
+
         for index, component in enumerate(self.components):
             where = "component %d" % (index + 1)
             kind = component.get("kind")
@@ -134,6 +169,15 @@ class Manifest:
             elif kind == "watch":
                 out.extend("%s: %s" % (where, p)
                            for p in watch_problems(component))
+            elif kind == "http":
+                out.extend("%s: %s" % (where, p)
+                           for p in http_problems(component))
+            elif kind == "storage":
+                out.extend("%s: %s" % (where, p)
+                           for p in storage_problems(component))
+            elif kind == "timer":
+                out.extend("%s: %s" % (where, p)
+                           for p in timer_problems(component))
             elif not component.get("file"):
                 out.append("%s: no file" % where)
             elif component["file"].startswith("/") or ".." in component["file"]:
@@ -182,7 +226,7 @@ class Manifest:
             kind = component.get("kind")
             if kind == "mod" and component not in mods:
                 continue
-            if kind in ("service", "watch"):
+            if kind in DECLARED:
                 actions.append({
                     "kind": kind,
                     "name": component["name"],
@@ -230,6 +274,113 @@ def watch_problems(component):
     if component.get("do") not in WATCH_ACTIONS:
         out.append("`do` is %r, not one of %s"
                    % (component.get("do"), ", ".join(WATCH_ACTIONS)))
+    return out
+
+
+CACHE_RULES = ("immutable", "short", "none")
+
+
+def http_problems(component):
+    """A path on the public side: either a folder to serve or a service to ask.
+
+    This is the piece of WaveChat that costs the most by hand today, and the
+    one that has nothing to do with Minecraft: a bind mount, a `location` that
+    has to come before another one, a body size limit, a cache header that has
+    to be repeated or the browser downloads the image instead of showing it.
+    None of that is knowledge a person installing a chat mod should need.
+    """
+    out = []
+    if not component.get("name"):
+        out.append("an http route needs a name")
+    elif not ID_RE.match(component["name"]):
+        out.append("http name %r is not lowercase letters, digits and dashes"
+                   % component["name"])
+    path = component.get("path")
+    if not path:
+        out.append("an http route needs `path`, the URL it answers on")
+    elif not path.startswith("/"):
+        out.append("path %r has to start with /" % path)
+    serve, proxy = component.get("serve"), component.get("proxy")
+    if bool(serve) == bool(proxy):
+        out.append("an http route is either `serve` (a folder) or `proxy` "
+                   "(a service), one of the two")
+    if serve and (str(serve).startswith("/") or ".." in str(serve)):
+        out.append("serve %r escapes the server folder" % serve)
+    if proxy and not re.match(r"^[\w.\-]+:\d+$", str(proxy)):
+        out.append("proxy %r is not host:port" % proxy)
+    cache = component.get("cache", "none")
+    if cache not in CACHE_RULES:
+        out.append("cache is %r, not one of %s" % (cache, ", ".join(CACHE_RULES)))
+    if component.get("max_body"):
+        try:
+            piecesettings.parse_size(component["max_body"], "max_body")
+        except piecesettings.SettingError as exc:
+            out.append(str(exc))
+    return out
+
+
+def storage_problems(component):
+    """A folder this piece writes to, with a ceiling and a way to make room.
+
+    Declared because a piece that writes without a ceiling is how a disk fills
+    up quietly: the music cache of WaveChat is eighty times bigger than
+    everything else it stores, and nothing anywhere said so.
+    """
+    out = []
+    if not component.get("name"):
+        out.append("a storage needs a name")
+    elif not ID_RE.match(component["name"]):
+        out.append("storage name %r is not lowercase letters, digits and dashes"
+                   % component["name"])
+    folder = component.get("dir")
+    if not folder:
+        out.append("a storage needs `dir`")
+    elif str(folder).startswith("/") or ".." in str(folder):
+        out.append("dir %r escapes the server folder" % folder)
+    if component.get("quota"):
+        try:
+            piecesettings.parse_size(component["quota"], "quota")
+        except piecesettings.SettingError as exc:
+            out.append(str(exc))
+    if component.get("keep"):
+        try:
+            piecesettings.parse_time(component["keep"], "keep")
+        except piecesettings.SettingError as exc:
+            out.append(str(exc))
+    if not component.get("quota") and not component.get("keep"):
+        out.append("a storage needs a `quota`, a `keep`, or both: without one "
+                   "of them it is just a folder")
+    if component.get("by", "mtime") not in ("mtime", "atime"):
+        out.append("by is %r, not mtime or atime" % component.get("by"))
+    return out
+
+
+def timer_problems(component):
+    """Something to run again every so often, watched instead of forgotten.
+
+    A cron nobody looks at is the failure mode this exists to remove: the
+    ShapeBoard scan was dead for three days and the only symptom was a board
+    that stopped changing.
+    """
+    out = []
+    if not component.get("name"):
+        out.append("a timer needs a name")
+    elif not ID_RE.match(component["name"]):
+        out.append("timer name %r is not lowercase letters, digits and dashes"
+                   % component["name"])
+    command = component.get("command")
+    if not command or not isinstance(command, list):
+        out.append("a timer needs a command, as a list of arguments")
+    if not component.get("every"):
+        out.append("a timer needs `every`, how often to run it")
+    else:
+        try:
+            seconds = piecesettings.parse_time(component["every"], "every")
+            if seconds < 5:
+                out.append("every %r is faster than five seconds, which is a "
+                           "loop and not a timer" % component["every"])
+        except piecesettings.SettingError as exc:
+            out.append(str(exc))
     return out
 
 
@@ -326,6 +477,7 @@ class Install:
         self.written = []       # (destination, backup or None)
         self.services = []
         self.watches = []
+        self.declared = []      # (section, name), for anything else in the toml
         self.journal_path = (Path(server.root) / "w4ve" / "run" /
                              "install.journal")
 
@@ -357,6 +509,12 @@ class Install:
     def apply(self, actions):
         record = {"version": self.manifest.version, "source": "package",
                   "files": {}, "editable": [], "services": [], "watches": [],
+                  "http": [], "storage": [], "timers": [],
+                  # Kept so `w4ve configure` works months later, with the
+                  # package file long gone: the declarations are what turn a
+                  # value into a question with help text.
+                  "settings": self.manifest.data.get("settings") or [],
+                  "guide": self.manifest.guide,
                   "package": self.package.name}
         pending = False
         self._journal({"op": "begin", "piece": self.manifest.id,
@@ -371,6 +529,15 @@ class Install:
                     if action["kind"] == "watch":
                         self._add_watch(action, record)
                         continue
+                    if action["kind"] == "http":
+                        self._add_http(action, record)
+                        continue
+                    if action["kind"] == "storage":
+                        self._add_storage(action, record)
+                        continue
+                    if action["kind"] == "timer":
+                        self._add_timer(action, record)
+                        continue
                     destination = self.base_for(action["dest"]) / action["dest"]
                     self._write(archive, action, destination, record)
                     if action["reload"] == "restart":
@@ -380,9 +547,43 @@ class Install:
             raise
         if pending:
             record["pending_restart"] = True
+        self._write_client_index(record)
         self.server.state["pieces"][self.manifest.id] = record
         self.server.save_state()
         return record
+
+    def _write_client_index(self, record):
+        """Say which client jar goes with this version of the server half.
+
+        The two halves of a piece are published together or they lie to each
+        other. WaveChat's client asks a JSON which version to run, and today
+        that JSON is uploaded by hand, after the jars, in an order that if
+        reversed points everybody at a 404. Written here it cannot get out of
+        step: it is written from what was just installed.
+        """
+        jars = {k: v for k, v in record["files"].items()
+                if k.startswith("w4ve/client/")}
+        if not jars:
+            return
+        root = Path(self.server.root)
+        index = {"piece": self.manifest.id, "version": self.manifest.version,
+                 "minecraft": {}}
+        for component in self.manifest.components:
+            if component.get("kind") != "client":
+                continue
+            name = Path(component["file"]).name
+            relative = "w4ve/client/" + name
+            if relative not in jars:
+                continue
+            index["minecraft"][str(component.get("mc") or "*")] = {
+                "version": self.manifest.version,
+                "file": name,
+                "sha256": jars[relative],
+            }
+        path = root / "w4ve" / "client" / "latest.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
+        record["files"]["w4ve/client/latest.json"] = sha256_of(path)
 
     def _write(self, archive, action, destination, record):
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -435,10 +636,66 @@ class Install:
         if health.get("http"):
             fields["health_url"] = health["http"]
             fields["health_every"] = int(health.get("every", 30))
+        elif health.get("tcp"):
+            # A daemon speaking its own protocol could never answer a URL, and
+            # without this its readiness stays unknown forever.
+            fields["health_tcp"] = health["tcp"]
+        # Everything the runtime already understood but the packager could not
+        # write down, which meant a package could not express ChatBridge.
+        if component.get("after"):
+            fields["after"] = component["after"]
+        if component.get("env"):
+            fields["env"] = dict(component["env"])
+        if component.get("mcdr"):
+            fields["mcdr"] = True
+        if component.get("stop_grace"):
+            fields["stop_grace"] = int(component["stop_grace"])
         self.server.set_service(component["name"], fields,
                                 owner=self.manifest.id)
         record["services"].append(component["name"])
         self.services.append(component["name"])
+
+    def _add_http(self, action, record):
+        component = action["component"]
+        self._journal({"op": "http", "name": component["name"]})
+        fields = {"path": component["path"]}
+        for key in ("serve", "proxy", "cache", "max_body", "why"):
+            if component.get(key):
+                fields[key] = component[key]
+        if component.get("exact"):
+            fields["exact"] = True
+        self.server.set_http(component["name"], fields, owner=self.manifest.id)
+        record["http"].append(component["name"])
+        self.declared.append(("http", component["name"]))
+
+    def _add_storage(self, action, record):
+        component = action["component"]
+        self._journal({"op": "storage", "name": component["name"]})
+        fields = {"dir": component["dir"]}
+        for key in ("quota", "keep", "by", "why"):
+            if component.get(key):
+                fields[key] = component[key]
+        self.server.set_storage(component["name"], fields, owner=self.manifest.id)
+        # The folder is made now rather than by the service on its first write,
+        # so a permissions problem is found by `install` and not at 3am.
+        folder = Path(self.server.root) / component["dir"]
+        folder.mkdir(parents=True, exist_ok=True)
+        record["storage"].append(component["name"])
+        self.declared.append(("storage", component["name"]))
+
+    def _add_timer(self, action, record):
+        component = action["component"]
+        self._journal({"op": "timer", "name": component["name"]})
+        fields = {"command": list(component["command"]),
+                  "every": component["every"]}
+        for key in ("cwd", "why"):
+            if component.get(key):
+                fields[key] = component[key]
+        if component.get("env"):
+            fields["env"] = dict(component["env"])
+        self.server.set_timer(component["name"], fields, owner=self.manifest.id)
+        record["timers"].append(component["name"])
+        self.declared.append(("timer", component["name"]))
 
     def _add_watch(self, action, record):
         component = action["component"]
@@ -465,7 +722,10 @@ class Install:
             self.server.remove_service(name)
         for name in self.watches:
             self.server.remove_watch(name)
+        for section, name in self.declared:
+            self.server.remove_block(section, name)
         self.written, self.services, self.watches = [], [], []
+        self.declared = []
         try:
             self.journal_path.unlink()
         except OSError:
@@ -539,6 +799,8 @@ def roll_back_interrupted(server):
             server.remove_service(step["name"])
         elif step.get("op") == "watch":
             server.remove_watch(step["name"])
+        elif step.get("op") in ("http", "storage", "timer"):
+            server.remove_block(step["op"], step["name"])
     server.state["pieces"].pop(found["piece"], None)
     server.save_state()
     try:
@@ -549,11 +811,16 @@ def roll_back_interrupted(server):
             "undone": undone, "restored": restored, "kept": kept}
 
 
-def remove(server, piece_id):
+def remove(server, piece_id, keep_settings=False):
     """Take out exactly what a package put in, and say what it did not.
 
     A file that changed since we wrote it is left alone: somebody meant that,
     and a remove command is not a licence to throw away work.
+
+    `keep_settings` is for the update path, which removes the old version
+    before writing the new one. **Updating a piece must never lose what
+    somebody answered**: a token typed once and forgotten is a token nobody
+    can type again.
     """
     entry = server.state["pieces"].get(piece_id)
     if not entry:
@@ -574,12 +841,28 @@ def remove(server, piece_id):
             continue
         path.unlink()
         gone.append(relative)
+    # Read where the data lives before the blocks that say so are taken out.
+    kept_dirs = [(server.config.get("storage") or {}).get(name, {}).get("dir")
+                 for name in entry.get("storage") or []]
     for name in entry.get("services") or []:
         server.remove_service(name)
     for name in entry.get("watches") or []:
         server.remove_watch(name)
+    for section, key in (("http", "http"), ("storage", "storage"),
+                         ("timer", "timers")):
+        for name in entry.get(key) or []:
+            server.remove_block(section, name)
+    # The settings block goes with it: leaving `[settings.<piece>]` behind
+    # after a remove is how a reinstall silently inherits an old answer.
+    if not keep_settings:
+        server.remove_block("settings", piece_id)
+        server.forget_secrets(piece_id)
     del server.state["pieces"][piece_id]
     server.save_state()
     return {"removed": gone, "changed": changed, "missing": missing,
             "services": entry.get("services") or [],
-            "watches": entry.get("watches") or []}
+            "watches": entry.get("watches") or [],
+            "http": entry.get("http") or [],
+            "timers": entry.get("timers") or [],
+            # Data is never deleted by a remove. Say where it is instead.
+            "kept_data": [d for d in kept_dirs if d]}

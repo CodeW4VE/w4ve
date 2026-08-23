@@ -53,6 +53,9 @@ w4ve doctor                     # what is wrong before the server finds out
 | `doctor` | missing dependencies, duplicate jars, wrong Java, files changed by hand |
 | `repair` | undo an install that was killed halfway |
 | `plugins` | what MCDR plugins this server has, and what is wrong with them |
+| `configure <id>` | answer what a piece needs told to it, discovering ids rather than asking for them |
+| `http [nginx\|caddy]` | the web server configuration the installed pieces need |
+| `storage` | what the pieces are keeping on this disk, and `--purge` to make room |
 
 ## Packages
 
@@ -70,6 +73,18 @@ w4ve remove mypiece                 # take out exactly what it put in
   one release; the package carries all of them and the install picks the one
   for this server. Two that match is the package being wrong, and it is said at
   install time rather than found by Fabric at boot.
+- **A piece can ask for what it needs to know.** A `settings` block turns a
+  piece from something only its author can install into something anybody can:
+  a public domain, a token, a channel. Ordinary answers land in your
+  `w4ve.toml` with the piece's own help text as the comment above each line;
+  secrets land in `w4ve/secrets.json`, mode 600, and nowhere else. `w4ve
+  configure <piece>` asks, and **an id is never asked for, it is discovered**:
+  with a Discord token in hand it lists the servers, channels and roles by
+  name and you pick a number. What is answered arrives in the service's
+  environment as `W4VE_PUBLIC_URL` and friends, so most pieces need no config
+  template at all. A service with an unanswered `${secret:...}` in it is not
+  started, because starting it with a hole where the token goes fails later and
+  unreadably.
 - **A piece can bring a service.** A `service` component declares a process:
   command, working folder, restart policy, the Python modules it needs and how
   to ask whether it is up. It lands as a `[services.<name>]` block in your
@@ -80,6 +95,27 @@ w4ve remove mypiece                 # take out exactly what it put in
   speaks its own protocol and could never answer a URL. What a service is asked
   with is a signal, not a console command, and its grace is ten seconds rather
   than the ninety a world needs to save.
+- **A piece can own a path on the public side.** An `http` component says
+  "serve this folder here" or "send this path to my service", and `w4ve http`
+  writes the nginx or Caddy configuration for it. It gets right the four things
+  that cost a night on a real machine: exact routes before prefixes, the body
+  size limit, a cache header of its own (inherit the neighbour's and the
+  browser downloads your images instead of showing them) and the trailing slash
+  on an alias.
+- **A piece can say what it writes to disk, and how much.** A `storage`
+  component carries a quota and a retention rule, and the guardian keeps it
+  inside them. `by = "atime"` is what a cache wants: the song played every day
+  survives even when it is the oldest thing there. Removing a piece never
+  deletes the data; it tells you where it is.
+- **A piece can bring something that repeats.** A `timer` runs in the guardian
+  rather than in cron, which means a run that fails says so once and then keeps
+  count, and says it again when it starts working. The ShapeBoard scan was dead
+  for three days and the only symptom was a board that stopped changing.
+- **A piece can carry the half the players download.** `client` jars are all
+  installed, not just the one for this server's Minecraft version, and w4ve
+  writes a `latest.json` beside them with the version and sha256 of each. Serve
+  that folder and the mod can check its own version without anybody uploading
+  anything by hand, in an order that if reversed points everybody at a 404.
 - **A piece can ask for a restart.** A `watch` component says which console
   line to look for and what to do about it. RegionCast stops the server to copy
   region files and prints one line asking to come back; under MCDR that costs a
@@ -241,16 +277,15 @@ read, and it is the one place where the state of a server is written down.
 
 ## What it does not do yet
 
-- Install `.w4ve` packages. The format is
-  [designed](https://github.com/CodeW4VE/registry) but nothing publishes one yet,
-  so today the CLI installs jars and `.mcdr` files straight from the catalog.
-- Talk to more than one server at a time. One `w4ve.toml`, one server.
-- Reload a plugin in place. It tells you which ones can be reloaded; doing it is
-  still `!!MCDR plugin reload` until the plugin platform exists.
-- Run MCDR plugins itself. The runtime owns the process; the compatibility host
-  for `mcdreforged.api.all` is a later milestone.
+- Talk to more than one server at a time. One `w4ve.toml`, one server, which is
+  what a piece shared by a whole network still needs.
+- A native plugin platform. MCDR plugins run; a `plugin` component in a package
+  is refused on purpose, because accepting one would mean installing code
+  nothing can run.
 - Update the guardian without restarting the server. The server survives the
   guardian today, but it gets its console back on the next start W4VE does.
+- Reload a web server by itself. `w4ve http` writes the configuration and tells
+  you the two commands; running them as root is your call.
 
 ## Configuration
 
