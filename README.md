@@ -377,6 +377,12 @@ read, and it is the one place where the state of a server is written down.
 
 ## Rules it follows
 
+Each of these is a test in `tests/test_promises.py`, because a guarantee
+nobody checks is a comment. They break the same way every time: somebody adds
+a small convenience, it is obviously fine in the case they are looking at, and
+a line of this file quietly stops being true.
+
+
 - **It never restarts your server.** It tells you what is pending and offers to
   run the restart command from your `w4ve.toml`. Restarting a server with people
   on it without asking is not a feature.
@@ -392,6 +398,16 @@ read, and it is the one place where the state of a server is written down.
 - **It reads the manifest inside a jar, not its file name.** File names lie:
   `Carpet Extra.jar`, `ferritecore.jar` and `ServerReplay-1.1.2+mc1.21 (1).jar`
   are all real files on a real server.
+- **A package cannot run anything.** It places files and declares processes.
+  `package.py` cannot reach `subprocess`, `eval` or a shell, so "install this
+  piece" never means "run this stranger's script".
+- **A secret is never in the toml or the journal.** It goes in a file at mode
+  600 and nowhere else, and an RCON password is redacted before it can be
+  logged.
+- **The API is off, and local when it is on.** A Unix socket needs no token
+  because the file mode is the permission; a port always needs one.
+- **It never touches the world, and never accepts a licence for you.** Nothing
+  anywhere writes an `eula.txt`.
 - **A conflict needs versions on both sides.** Carpet TIS 1.82 does not boot
   with Lithium 0.13, but 1.64 with 0.13 is fine. Telling a healthy server it is
   broken is how a tool teaches people to ignore it.

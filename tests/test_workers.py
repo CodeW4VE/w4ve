@@ -405,3 +405,66 @@ class FromAPackageCase(unittest.TestCase):
         self.package.remove(self.server, "greeter")
         left = list((self.root / "w4ve" / "plugins").rglob("*.py"))
         self.assertEqual(left, [], left)
+
+
+class NamedEventsCase(unittest.TestCase):
+    """A console line means more than being a console line.
+
+    Without this a plugin has to write the regex for "somebody joined" itself,
+    which means every plugin writes it, some write it wrong, and none of them
+    get the last case here right.
+    """
+
+    def test_a_join_and_a_leave_are_named(self):
+        joined = worker.named_events(
+            "[12:00:00] [Server thread/INFO]: TVTvirus joined the game")
+        self.assertEqual(joined, [("player_joined", {"player": "TVTvirus"})])
+        left = worker.named_events(
+            "[12:00:00] [Server thread/INFO]: Hugo left the game")
+        self.assertEqual(left, [("player_left", {"player": "Hugo"})])
+
+    def test_somebody_talking_is_named_too(self):
+        said = worker.named_events(
+            "[12:00:00] [Server thread/INFO]: <kades> hola")
+        self.assertEqual(said, [("player_said",
+                                 {"player": "kades", "message": "hola"})])
+
+    def test_a_player_cannot_forge_somebody_else_joining(self):
+        # The one that matters. Typing this in chat must not make a plugin
+        # believe Fulano joined: a chat line arrives with a player attached
+        # and a server line does not.
+        events = worker.named_events(
+            "[12:00:00] [Server thread/INFO]: <malo> Fulano joined the game")
+        self.assertEqual([name for name, _ in events], ["player_said"], events)
+
+    def test_an_ordinary_line_means_nothing_extra(self):
+        self.assertEqual(worker.named_events(
+            '[12:00:00] [Server thread/INFO]: Done (1.0s)! For help, type "help"'),
+            [])
+
+    def test_nonsense_is_not_a_crash(self):
+        for line in ("", "   ", "not a log line at all", "]]][[["):
+            self.assertIsInstance(worker.named_events(line), list)
+
+
+class DeliveredEventsCase(HostCase):
+    """And the plugin really receives them."""
+
+    def test_a_join_reaches_a_plugin_that_listens_for_it(self):
+        one = self.start("greeter")
+        one.start()
+        self.host.console_line(
+            "[12:00:00] [Server thread/INFO]: TVTvirus joined the game")
+        time.sleep(1.0)
+        answer = one.invoke("!!seen", ["TVTvirus"], timeout=5)
+        self.assertIn("1 times", str(answer["value"]),
+                      "the plugin never heard about the join")
+
+    def test_a_forged_join_in_chat_does_not(self):
+        one = self.start("greeter")
+        one.start()
+        self.host.console_line(
+            "[12:00:00] [Server thread/INFO]: <malo> Fulano joined the game")
+        time.sleep(1.0)
+        answer = one.invoke("!!seen", ["Fulano"], timeout=5)
+        self.assertIn("never joined", str(answer["value"]), answer)

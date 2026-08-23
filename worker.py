@@ -478,6 +478,34 @@ class Worker:
         }
 
 
+def named_events(line):
+    """The events a console line means, beyond being a console line.
+
+    Parsing is borrowed from the MCDR compatibility layer rather than written
+    again, and not to save typing: that code already gets right the thing that
+    is easy to get wrong. **A player typing "Hugo joined the game" in chat must
+    not become a join event for Hugo.** It is told apart because a chat line
+    arrives with a player attached and a server line does not.
+    """
+    try:
+        from mcdr.info import parse_server_line, player_event
+    except ImportError:
+        return []
+    try:
+        info = parse_server_line(line)
+    except Exception:                 # noqa: BLE001
+        return []
+    out = []
+    if info.player is not None and info.content:
+        out.append(("player_said", {"player": info.player,
+                                    "message": info.content}))
+    found = player_event(info)
+    if found:
+        what, who = found
+        out.append(("player_%s" % what, {"player": who}))
+    return out
+
+
 class WorkerHost:
     """Every native plugin of one server, and the core they talk to."""
 
@@ -535,13 +563,20 @@ class WorkerHost:
             worker.deliver(event, payload)
 
     def console_line(self, line):
-        """A line from the server's console, as an event.
+        """A line from the server's console, as one or two events.
 
         Called from the guardian's reader thread, which is why `deliver` never
         blocks: this thread is also how the guardian learns that Minecraft
         died.
+
+        Every line goes out as `console`, and the ones that mean something get
+        a named event too. Without that a plugin has to write the regex for
+        "somebody joined" itself, which means every plugin writes it, some of
+        them write it wrong, and none of them get the subtlety below right.
         """
         self.dispatch("console", {"line": line})
+        for event, payload in named_events(line):
+            self.dispatch(event, payload)
 
     def command(self, text, source="console"):
         """Somebody typed something. Returns (claimed, lines)."""

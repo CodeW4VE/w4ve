@@ -1968,6 +1968,14 @@ def cmd_doctor(args, index):
                             f"{'s' if len(routes) != 1 else ''} declared here "
                             f"are not in any web server yet (`w4ve http`)")
 
+    # 11. Running as root, which nothing here refuses and everything here
+    # should mention. Refusing outright would break every container that runs
+    # as root today, which is most of them; saying it is the honest middle,
+    # and a mod installed as root is a file the server user cannot replace.
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        warnings.append("this is running as root: anything it writes will be "
+                        "owned by root, and the server usually is not")
+
     if server.pending:
         warnings.append(f"waiting for a restart: {', '.join(server.pending)}")
 
