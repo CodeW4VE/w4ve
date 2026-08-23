@@ -1,0 +1,19 @@
+# The reference plugin. Everything a real one needs is in here once, so this
+# file is worth copying rather than a "hello world" that teaches nothing.
+
+[plugin]
+id       = "greeter"
+name     = "Greeter"
+version  = "1.0.0"
+protocol = 1
+
+[run]
+# The interpreter is part of the command on purpose: a plugin with its own
+# virtualenv points at that python here, and nothing else has to know.
+command = ["python3", "main.py"]
+
+[config]
+# Whatever is here arrives as `plugin.config`. Edit it and reload the plugin.
+greeting = "welcome back"
+# Who is allowed to be greeted loudly. Empty means everybody.
+vips = []

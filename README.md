@@ -139,6 +139,60 @@ w4ve remove mypiece                 # take out exactly what it put in
   never overwritten and never deleted by `remove`: the new default arrives as a
   `.new` file next to yours.
 
+## Native plugins
+
+A native plugin is a **process**, and what crosses between it and the core is a
+line of JSON. That is [RFC-0003](docs/rfc/RFC-0003-workers-y-protocolo-de-plugins.md),
+and it exists for one reason: a plugin that hangs, crashes or floods must not
+be able to take the guardian with it, and nobody can promise that about code
+running inside their own process.
+
+```sh
+w4ve dev new my-plugin          # scaffold one that already passes conformance
+w4ve dev check my-plugin        # does it really speak the protocol
+w4ve dev run my-plugin          # talk to it with no server and no guardian
+```
+
+Plugins live in `w4ve/plugins/`, one folder each, and `w4ve run` starts them
+alongside the server.
+
+```python
+from w4ve_plugin import Plugin
+
+plugin = Plugin("hello", "1.0.0")
+
+@plugin.command("!!hello", help="say hello")
+def hello(source, args):
+    return "hello, %s" % (args[0] if args else "world")
+
+@plugin.on("player_joined")
+def joined(payload):
+    plugin.say("welcome, %s" % payload["player"])
+
+plugin.run()
+```
+
+What the core promises, and what is tested against plugins written to break it
+(`tests/badplugins/`, five of them, each aimed at a different way this goes
+wrong):
+
+- **A plugin that never answers produces an error, not a hang.** Every request
+  has a deadline, and the test measures that the deadline is really enforced,
+  not only that the message says so.
+- **A plugin that crashes takes down its own process and nothing else.**
+  Anybody waiting on it is told; the rest never notice. One that dies three
+  times in five minutes is left alone, the same rule the server follows.
+- **A plugin that cannot keep up loses events instead of growing memory.** The
+  queue has a ceiling and it says so once, because the thread handing events
+  over is also the one that learns when Minecraft died.
+- **Running is not the same as alive.** A process that starts and never speaks
+  is refused with those words.
+
+**The protocol is the contract, not the language.** Anything that can read a
+line and write one can be a plugin, and `sdk/conformance.py` is what decides
+whether an SDK is official: it starts the plugin, speaks RFC-0003 at it and
+checks what comes back. It knows nothing about Python.
+
 ## MCDR plugins
 
 W4VE is meant to replace MCDReforged without you losing the plugins you
@@ -301,9 +355,9 @@ read, and it is the one place where the state of a server is written down.
 
 - Talk to more than one server at a time. One `w4ve.toml`, one server, which is
   what a piece shared by a whole network still needs.
-- A native plugin platform. MCDR plugins run; a `plugin` component in a package
-  is refused on purpose, because accepting one would mean installing code
-  nothing can run.
+- Install a native plugin from a package. They run (see above) and the
+  `plugin` component of a `.w4ve` still refuses to install: wiring the two
+  together is the next thing, not a thing that quietly half works.
 - Run without Python in the container. The guardian is Python, so an image
   that is only Java (`yolks:java_21` and friends) cannot start it. An MCDR image
   already has both, because MCDR is Python too.

@@ -1982,6 +1982,195 @@ def cmd_doctor(args, index):
     return 1 if problems else 0
 
 
+# ---------------------------------------------------------------------- dev
+
+PLUGIN_TEMPLATE = """# {name}, a W4VE plugin.
+# Everything the core needs to know about it lives here.
+
+[plugin]
+id       = "{pid}"
+name     = "{name}"
+version  = "0.1.0"
+protocol = 1
+
+[run]
+# The interpreter is part of the command on purpose: a plugin with its own
+# virtualenv points at that python here and nothing else has to know.
+command = ["python3", "main.py"]
+
+[config]
+# Whatever is here arrives as `plugin.config`. Edit it, reload the plugin.
+greeting = "hello"
+"""
+
+PLUGIN_MAIN = '''"""{name}: a W4VE plugin.
+
+Run the conformance kit against this folder before shipping it:
+
+    w4ve dev check .
+"""
+import sys
+from pathlib import Path
+
+# Where the SDK is. Written out by `w4ve dev new` so this file runs from
+# anywhere; change it if you move either of them, or install the SDK and
+# delete these two lines.
+sys.path.insert(0, r"{sdk}")
+
+from w4ve_plugin import Plugin
+
+plugin = Plugin("{pid}", "0.1.0", name="{name}")
+
+
+@plugin.on_start
+def started():
+    plugin.log("{pid} is up")
+
+
+@plugin.command("!!{pid}", help="what this plugin is doing")
+def status(source, args):
+    """Whatever this returns is shown to whoever ran the command."""
+    state = plugin.server_status()
+    return [
+        "{name} 0.1.0",
+        "  server: %s" % ("running" if state.get("running") else "stopped"),
+        "  greeting: %r" % plugin.config.get("greeting"),
+    ]
+
+
+@plugin.on("player_joined")
+def joined(payload):
+    plugin.say("%s, %s" % (plugin.config.get("greeting", "hello"),
+                           payload.get("player", "somebody")))
+
+
+if __name__ == "__main__":
+    plugin.run()
+'''
+
+
+def worker_module():
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import worker
+        return worker
+    except ImportError:
+        return None
+
+
+def cmd_dev(args, index):
+    """Everything somebody writing a plugin needs, and nothing else."""
+    # One positional for all three: `new` reads it as a name, the others as a
+    # folder. Three subcommands with three different nouns would be tidier and
+    # would also mean remembering which is which.
+    args.folder = args.name or "."
+    if args.action == "new":
+        return dev_new(args)
+    if args.action == "check":
+        return dev_check(args)
+    if args.action == "run":
+        return dev_run(args)
+    problem("dev takes new, check or run")
+    return 2
+
+
+def dev_new(args):
+    """Scaffold a plugin that already passes the conformance kit.
+
+    Starting from something that works beats starting from something that
+    merely compiles: the first thing a new plugin author should see is a green
+    run, not their own first bug.
+    """
+    name = args.name or ""
+    pid = re.sub(r"[^a-z0-9-]", "-", name.lower()).strip("-")
+    if not pid:
+        problem("give it a name: w4ve dev new my-plugin")
+        return 2
+    folder = Path(args.dir or ".") / pid
+    if folder.exists():
+        problem(f"{folder} already exists")
+        return 1
+    folder.mkdir(parents=True)
+    pretty = name if name != pid else pid.replace("-", " ").title()
+    (folder / "w4ve.plugin.toml").write_text(
+        PLUGIN_TEMPLATE.format(pid=pid, name=pretty), encoding="utf-8")
+    sdk = Path(__file__).resolve().parent / "sdk" / "python"
+    (folder / "main.py").write_text(
+        PLUGIN_MAIN.format(pid=pid, name=pretty, sdk=sdk), encoding="utf-8")
+    say(f"{Out.ok('ok')}  {folder}")
+    say(Out.dim(f"    w4ve dev check {folder}     does it speak the protocol"))
+    say(Out.dim(f"    w4ve dev run {folder}       talk to it by hand"))
+    return 0
+
+
+def dev_check(args):
+    """Run the conformance kit. This is what "official SDK" means."""
+    kit = Path(__file__).resolve().parent / "sdk" / "conformance.py"
+    if not kit.exists():
+        problem("the conformance kit is not next to this w4ve")
+        return 2
+    folder = Path(args.folder or ".").resolve()
+    command = [sys.executable, str(kit), str(folder)]
+    if args.verbose:
+        command.append("--verbose")
+    return subprocess.call(command)
+
+
+def dev_run(args):
+    """Start one plugin and talk to it, with no server and no guardian.
+
+    Being able to try a plugin without a Minecraft server is most of what
+    writing one involves.
+    """
+    module = worker_module()
+    if module is None:
+        problem("this w4ve cannot run native plugins (worker.py is missing)")
+        return 2
+    folder = Path(args.folder or ".").resolve()
+    try:
+        manifest = module.read_manifest(folder)
+    except module.WorkerError as exc:
+        problem(str(exc))
+        return 1
+    root = Path(tempfile.mkdtemp(prefix="w4ve-dev-"))
+    host = module.WorkerHost(root)
+    one = module.Worker(manifest, root, host=host)
+    host.workers[one.id] = one
+    ok, message = one.start()
+    say(("%s  %s" % (Out.ok("ok"), message)) if ok
+        else ("%s  %s" % (Out.bad("error"), message)))
+    if not ok:
+        return 1
+    say(Out.dim("  commands: " + (", ".join(sorted(one.commands)) or "none")))
+    say(Out.dim("  type a command, `!event <name> {json}` to send one, Ctrl-D to leave"))
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("!event "):
+                parts = line.split(None, 2)
+                payload = {}
+                if len(parts) > 2:
+                    try:
+                        payload = json.loads(parts[2])
+                    except ValueError:
+                        payload = {"value": parts[2]}
+                one.deliver(parts[1], payload)
+                say(Out.dim("  sent"))
+                continue
+            claimed, lines = host.command(line)
+            if not claimed:
+                say(Out.warn("  no plugin owns that command"))
+            for answer in lines:
+                say("  " + str(answer))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        one.stop()
+    return 0
+
+
 # ------------------------------------------------------------------ configure
 
 def settings_module():
@@ -3610,6 +3799,14 @@ def build_parser():
     storage.add_argument("--purge", action="store_true",
                          help="make room now, following what each piece declared")
 
+    dev = add("dev", cmd_dev, "write a plugin: scaffold it, check it, try it")
+    dev.add_argument("action", choices=["new", "check", "run"],
+                     help="new: scaffold one. check: conformance. run: try it")
+    dev.add_argument("name", nargs="?",
+                     help="for `new`, what to call it; for the rest, the folder")
+    dev.add_argument("--verbose", action="store_true",
+                     help="for `check`, print every line of the conversation")
+
     packing = add("pack", cmd_pack, "build a .w4ve out of a folder")
     packing.add_argument("folder", help="folder with a w4ve.json in it")
     packing.add_argument("--out", help="where to leave the package")
@@ -3653,7 +3850,7 @@ def build_parser():
                       help="the guardian journal instead of the console")
 
     for name in ("run", "start", "stop", "console", "logs", "pack", "repair",
-                 "plugins", "configure", "http", "storage"):
+                 "plugins", "configure", "http", "storage", "dev"):
         subparsers.choices[name].set_defaults(needs_index=False)
 
     for name, sub in subparsers.choices.items():

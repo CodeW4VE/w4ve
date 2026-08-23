@@ -1,0 +1,6 @@
+[plugin]
+id = "liar"
+version = "1.0.0"
+protocol = 99
+[run]
+command = ["python3", "main.py"]

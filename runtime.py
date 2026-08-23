@@ -746,6 +746,8 @@ class Guardian:
         # w4ve carries the compatibility layer. None means "no plugins", which
         # is a normal server, not a broken one.
         self.plugins = None
+        # Native plugins (RFC-0003), each one a process of its own.
+        self.workers = None
 
     # ------------------------------------------------------------------ setup
 
@@ -1043,7 +1045,38 @@ class Guardian:
             self.plugins = runtime
         return ok, message
 
+    def start_workers(self):
+        """Start the native plugins: the ones that are processes (RFC-0003).
+
+        Separate from `start_plugins` and deliberately so. Those are MCDR's,
+        in-process because that is what they expect; these are W4VE's, each in
+        its own process, and the guarantees are different enough that pretending
+        they are one population would be a lie in the status output.
+        """
+        if self.workers is not None:
+            return False, "native plugins are already loaded"
+        folder = self.root / "w4ve" / "plugins"
+        if not folder.is_dir():
+            return False, "no native plugins here"
+        try:
+            from worker import WorkerHost
+        except ImportError as exc:
+            self.log("native plugins: not available (%s)" % exc)
+            return False, str(exc)
+        host = WorkerHost(self.root, guardian=self)
+        started, problems = host.load(folder)
+        self.workers = host
+        for line in problems:
+            self.log("native plugins: " + line)
+        message = "%d native plugin%s" % (len(started),
+                                          "s" if len(started) != 1 else "")
+        self.log("native plugins: " + message)
+        return True, message
+
     def stop_plugins(self):
+        if self.workers is not None:
+            self.workers.stop_all()
+            self.workers = None
         if self.plugins is None:
             return
         self.plugins.stop()
@@ -1052,13 +1085,26 @@ class Guardian:
     def feed_plugins(self, name, line):
         if self.plugins is not None:
             self.plugins.feed(name, line)
+        if self.workers is not None and name == "server":
+            # Never blocks: `console_line` drops rather than waits, because
+            # this is the thread that also learns when Minecraft dies.
+            self.workers.console_line(line)
 
     def plugins_state(self, name, state, ready, exit_code=None):
         if self.plugins is not None:
             self.plugins.state_changed(name, state, ready, exit_code)
 
     def plugins_console(self, text):
-        """Offer a typed line to the plugins. `(claimed, what it answered)`."""
+        """Offer a typed line to the plugins. `(claimed, what it answered)`.
+
+        Native plugins are asked first. They are the ones whose failure is
+        contained, so preferring them costs nothing, and a name registered on
+        both sides is a conflict the operator can see in `status` either way.
+        """
+        if self.workers is not None:
+            claimed, lines = self.workers.command(text)
+            if claimed:
+                return True, lines
         if self.plugins is None:
             return False, []
         return self.plugins.console(text)
@@ -1161,6 +1207,8 @@ class Guardian:
                       "processes": [p.status() for p in self.watched.values()]}
             if self.plugins is not None:
                 answer["plugins"] = self.plugins.status()
+            if self.workers is not None:
+                answer["workers"] = self.workers.status()
             return answer
         if proc is None:
             return {"ok": False, "error": "no process called %r" % name}
@@ -1242,6 +1290,7 @@ class Guardian:
         # allowed to ask whether the server is running, and the honest answer
         # is easier to give once it is.
         self.start_plugins()
+        self.start_workers()
 
         while not self.stopping.is_set():
             time.sleep(0.3)
