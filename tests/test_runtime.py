@@ -230,6 +230,37 @@ class GuardianCase(unittest.TestCase):
         self.assertIsNone(status[0]["ready"],
                           "with no health check, readiness is unknown")
 
+    def test_stopping_a_service_does_not_wait_for_a_console(self):
+        """⚠️ A service has no console, so it is asked with a signal.
+
+        The stop path was written for Minecraft, which obeys the word `stop`
+        typed into its stdin. A service does not read stdin at all: the word
+        went nowhere, and the guardian then sat through the full ninety second
+        grace waiting for an answer, so `w4ve stop <service>` looked hung.
+
+        The fixture ignores stdin on purpose, the way ChatBridge's daemon does
+        when it is not attached to a terminal.
+        """
+        script = self.root / "deaf.py"
+        script.write_text(
+            "import time\n"
+            "print('service up', flush=True)\n"
+            "time.sleep(300)\n")
+        _, client = self.guardian(
+            "--boot", "0.3",
+            services=[("deaf", [sys.executable, str(script)])])
+        wait_for(lambda: [p for p in client.call({"cmd": "status"})["processes"]
+                          if p["name"] == "deaf" and p["pid"]])
+        started = time.time()
+        reply = client.call({"cmd": "stop", "process": "deaf"})
+        took = time.time() - started
+        self.assertTrue(reply["ok"], reply)
+        self.assertLess(took, 5,
+                        "stopping a service must not wait out the world's grace")
+        status = [p for p in client.call({"cmd": "status"})["processes"]
+                  if p["name"] == "deaf"][0]
+        self.assertFalse(runtime.alive(status["pid"]), "the service is still up")
+
 
 class WatchCase(unittest.TestCase):
     """A piece can ask for a restart, and stop needing a plugin to get one."""

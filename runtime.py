@@ -38,6 +38,10 @@ SCHEMA = 1
 # server mid-save is how chunks get lost.
 STOP_GRACE = 90
 TERM_GRACE = 10
+# A service is not a world. The long grace exists so Minecraft can save what
+# people built; an image server or a bridge daemon has nothing to lose by
+# being asked to leave now.
+SERVICE_GRACE = 10
 
 # Three deaths this close together and we stop trying. Retrying forever against
 # a corrupt world is how an incident becomes data loss.
@@ -366,8 +370,15 @@ class Watched:
         self.asked_to_stop = True
         self._become("stopping", "stop requested")
 
-        if self.owned:
-            self.send(self.handler.stop_command() if self.handler else "stop")
+        if self.owned and self.handler is not None:
+            self.send(self.handler.stop_command())
+        elif self.owned:
+            # ⚠️ A service has no console to type `stop` into. Writing the word
+            # into its stdin does nothing at all, and then the guardian sat
+            # through the full ninety second grace waiting for an answer that
+            # was never coming: `w4ve stop <service>` looked like it had hung.
+            # A signal is how you ask a service to leave.
+            self._signal(signal.SIGTERM, "a service is asked with a signal")
         else:
             # An adopted server still knows how to save itself: ask it over
             # RCON, and only reach for signals when there is no answer.
@@ -691,7 +702,8 @@ class Guardian:
         return proc
 
     def add_service(self, name, command, cwd, restart="on-failure",
-                    health=None, health_every=30, env=None, mcdr=False):
+                    health=None, health_every=30, env=None, mcdr=False,
+                    stop_grace=SERVICE_GRACE):
         env = dict(env or {})
         if mcdr:
             # The service said it imports `mcdreforged`. ChatBridge's daemon
@@ -707,7 +719,8 @@ class Guardian:
                 env["PYTHONPATH"] = (str(compat) + os.pathsep + existing
                                      if existing else str(compat))
         proc = Watched(name, command, cwd, self, handler=None, restart=restart,
-                       health=health, health_every=health_every, env=env)
+                       health=health, health_every=health_every, env=env,
+                       stop_grace=stop_grace)
         self.watched[name] = proc
         return proc
 
@@ -1115,6 +1128,7 @@ def services_from(config):
             "health": entry.get("health_url") or None,
             "health_every": int(entry.get("health_every") or 30),
             "env": env,
+            "stop_grace": int(entry.get("stop_grace") or SERVICE_GRACE),
             # `mcdr = true` means: this process imports `mcdreforged` even
             # though it is not a plugin. ChatBridge's daemon does, and under
             # MCDR the answer was to pip install all of MCDR on the machine to

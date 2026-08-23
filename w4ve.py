@@ -2076,7 +2076,9 @@ def runtime_pieces(server, rt):
                              health=service.get("health"),
                              health_every=service.get("health_every", 30),
                              env=service.get("env"),
-                             mcdr=service.get("mcdr", False))
+                             mcdr=service.get("mcdr", False),
+                             stop_grace=service.get("stop_grace",
+                                                    rt.SERVICE_GRACE))
     return guardian, command
 
 
