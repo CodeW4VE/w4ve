@@ -3,7 +3,9 @@
 **Estado:** aceptado e implementado (`runtime.py`), verificado el 19 de agosto de 2026
 **Fecha:** 19 de agosto de 2026
 **Autoridad:** `W4VE-MANIFIESTO.md` v1.3, tareas 20.5, 20.11 y 20.12
-**Evidencia:** `docs/minewave-inventory.md` (8 de agosto de 2026)
+**Evidencia:** un inventario de solo lectura de cinco servidores MCDR en
+producción (8 de agosto de 2026). No se publica: es el mapa operativo de una
+red concreta. Lo que este RFC necesita de él está citado aquí.
 **Reemplaza:** nada
 **Depende de:** nada
 

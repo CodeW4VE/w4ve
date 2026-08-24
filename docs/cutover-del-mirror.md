@@ -119,8 +119,8 @@ mira ninguno de los dos.
 ## El contenedor
 
 Probado el mismo día, en un contenedor con Java 21 y Python 3, que es lo que la
-imagen del mirror ya tiene (`registry.h4l.ch/luxius/mcdr-pterodactyl:1.0.0`
-lleva Python 3.12 y Java 21, porque MCDR es Python).
+imagen del mirror ya tiene: cualquier imagen preparada para MCDR trae Python,
+porque MCDR es Python.
 
 - **El guardián arranca como PID 1** y el servidor queda listo. Eso es
   exactamente lo que wings quiere: un proceso en primer plano, no un wrapper
