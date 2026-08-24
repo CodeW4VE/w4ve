@@ -192,10 +192,14 @@ wrong):
 - **Running is not the same as alive.** A process that starts and never speaks
   is refused with those words.
 
-**The protocol is the contract, not the language.** Anything that can read a
-line and write one can be a plugin, and `sdk/conformance.py` is what decides
-whether an SDK is official: it starts the plugin, speaks RFC-0003 at it and
-checks what comes back. It knows nothing about Python.
+**The protocol is the contract, not the language**, and that is checked rather
+than asserted: `sdk/shell/example` is a POSIX shell script with no SDK and no
+JSON library, and it passes the same conformance kit the Python SDK does. Both
+run under one guardian and both answer their commands.
+
+`sdk/conformance.py` is what decides whether an SDK is official: it starts the
+plugin, speaks RFC-0003 at it and checks what comes back. It knows nothing
+about Python.
 
 ## MCDR plugins
 

@@ -1,0 +1,14 @@
+# A plugin in shell. It exists to prove the claim RFC-0003 makes about itself:
+# the protocol is the contract, not the language.
+
+[plugin]
+id       = "shellcheck"
+name     = "Shell Example"
+version  = "1.0.0"
+protocol = 1
+
+[run]
+command = ["sh", "main.sh"]
+
+[config]
+greeting = "hello from a shell script"

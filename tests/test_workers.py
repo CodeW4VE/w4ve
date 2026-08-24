@@ -468,3 +468,46 @@ class DeliveredEventsCase(HostCase):
         time.sleep(1.0)
         answer = one.invoke("!!seen", ["Fulano"], timeout=5)
         self.assertIn("never joined", str(answer["value"]), answer)
+
+
+class PolyglotCase(HostCase):
+    """The claim RFC-0003 makes about itself, checked instead of asserted.
+
+    "The protocol is the contract, not the language" is the sentence the whole
+    design rests on, and until something that is not Python speaks it, it is a
+    wish. `sdk/shell/example` is a POSIX shell script with no SDK and no JSON
+    library, and it passes the same conformance kit the Python SDK does.
+    """
+
+    SHELL = ROOT / "sdk" / "shell" / "example"
+
+    def start_shell(self):
+        manifest = worker.read_manifest(self.SHELL)
+        one = worker.Worker(manifest, self.tmp, host=self.host)
+        self.host.workers[one.id] = one
+        return one
+
+    def test_a_shell_script_is_a_plugin(self):
+        one = self.start_shell()
+        ok, message = one.start()
+        self.assertTrue(ok, message)
+        self.assertIn("!!shell", one.commands)
+        answer = one.invoke("!!shell", [], timeout=5)
+        self.assertTrue(answer["ok"], answer)
+        self.assertIn("shell script", str(answer["value"]))
+
+    def test_two_languages_under_one_guardian(self):
+        shell = self.start_shell()
+        shell.start()
+        python = self.start("greeter")
+        python.start()
+        claimed, lines = self.host.command("!!shell")
+        self.assertTrue(claimed and lines)
+        claimed, lines = self.host.command("!!seen")
+        self.assertTrue(claimed and lines)
+
+    def test_it_passes_the_same_conformance_kit(self):
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "sdk" / "conformance.py"), str(self.SHELL)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

@@ -53,8 +53,10 @@ Se consideraron un socket Unix, gRPC y un puerto TCP.
 las mismas por las que este proyecto elige casi todo:
 
 - **Cualquier lenguaje puede hablarlo hoy**, sin librería, sin generar código y
-  sin instalar nada. Un plugin en shell es concebible, y eso es la prueba de
-  que el listón está donde debe.
+  sin instalar nada. ⭐ **Comprobado, no supuesto**: `sdk/shell/example` es un
+  script de shell POSIX, sin SDK y sin parser de JSON, y **pasa el mismo
+  conformance kit** que el SDK de Python. Corre bajo el guardián al lado de un
+  plugin de Python, y los dos contestan sus comandos.
 - **Se depura leyendo.** Un log del protocolo es texto que una persona entiende
   a las tres de la mañana, que es cuando hace falta.
 - **El guardián ya sabe supervisar procesos con stdin y stdout**: es
