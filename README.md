@@ -155,7 +155,21 @@ running inside their own process.
 w4ve dev new my-plugin          # scaffold one that already passes conformance
 w4ve dev check my-plugin        # does it really speak the protocol
 w4ve dev run my-plugin          # talk to it with no server and no guardian
+w4ve dev env my-plugin          # build it a virtualenv of its own
+w4ve dev lock my-plugin         # freeze that environment for a second machine
 ```
+
+**A plugin's dependencies are its own.** W4VE never installs anything into its
+own environment, so two plugins wanting different versions of the same library
+is not a conflict to resolve: it is two environments. A `.venv` beside a plugin
+is used automatically, whatever its manifest says, because the manifest is
+written by whoever made the plugin and the environment by whoever installed it.
+
+`w4ve dev env` is the one thing here that installs, and it is a person typing a
+command about a plugin they chose, being shown what will be fetched and saying
+yes. With a `requirements.txt` carrying hashes it installs with
+`--require-hashes`, which refuses anything not pinned, transitive dependencies
+included.
 
 Plugins live in `w4ve/plugins/`, one folder each, and `w4ve run` starts them
 alongside the server.

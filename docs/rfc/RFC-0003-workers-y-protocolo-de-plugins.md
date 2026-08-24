@@ -167,9 +167,12 @@ contesta, con respuestas obviamente falsas que lo dicen.
 
 ## 8. Lo que este RFC no hace
 
-- **No aísla dependencias todavía.** Un worker de Python usa el intérprete que
-  su `command` diga, y apuntar a un virtualenv es cosa de quien lo instala. El
-  aislamiento con wheels bloqueadas y hashes de la sección 8.2 es posterior.
+- **El aislamiento de dependencias llega hasta el entorno, no hasta el
+  sandbox.** Un `.venv` al lado del plugin se usa solo, así que dos plugins que
+  quieren versiones distintas de la misma librería no chocan: son dos entornos.
+  `w4ve dev env` lo construye, y con un `requirements.txt` con hashes instala
+  con `--require-hashes`. Lo que **no** hay es aislamiento del sistema de
+  archivos ni de la red: un plugin puede leer lo que su usuario pueda leer.
 - **Limita recursos sólo si el plugin lo pide.** Un bloque `[limits]` pone
   techo a memoria, CPU y descriptores, aplicado **dentro del hijo** (ponerlo en
   el guardián se lo pondría al guardián, que es justo el proceso que no puede

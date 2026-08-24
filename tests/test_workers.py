@@ -554,3 +554,50 @@ class LimitsCase(HostCase):
         good.start()
         self.assertTrue(good.invoke("!!seen", [], timeout=5)["ok"],
                         "one plugin hitting its ceiling took another with it")
+
+
+class OwnEnvironmentCase(HostCase):
+    """A plugin's dependencies are its own, and W4VE's are W4VE's.
+
+    The manifesto is blunt: W4VE does not install a plugin's dependencies into
+    its own environment. Two plugins wanting different versions of the same
+    library is not a conflict to resolve, it is two environments; and a plugin
+    that can add packages to the process watching Minecraft can break it from
+    a requirements file.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.folder = self.tmp / "solo"
+        self.folder.mkdir(parents=True)
+        (self.folder / "w4ve.plugin.toml").write_text(
+            '[plugin]\nid = "solo"\nversion = "1.0.0"\n'
+            '[run]\ncommand = ["python3", "main.py"]\n')
+        (self.folder / "main.py").write_text("print('never runs')\n")
+
+    def test_an_environment_beside_the_plugin_wins_over_the_manifest(self):
+        # The manifest is written by whoever made the plugin; the environment
+        # is built by whoever installed it. Somebody who ran `w4ve dev env`
+        # and then watched it start against the system Python would have no
+        # idea why.
+        env = self.folder / ".venv" / "bin"
+        env.mkdir(parents=True)
+        (env / "python").write_text("#!/bin/sh\n")
+        (env / "python").chmod(0o755)
+        manifest = worker.read_manifest(self.folder)
+        self.assertEqual(manifest["command"][0], str(env / "python"))
+
+    def test_and_without_one_the_manifest_is_obeyed(self):
+        self.assertEqual(worker.read_manifest(self.folder)["command"][0],
+                         "python3")
+
+    def test_a_non_python_command_is_never_rewritten(self):
+        # The shell example must keep starting with `sh`, whatever is sitting
+        # in a .venv beside it.
+        (self.folder / "w4ve.plugin.toml").write_text(
+            '[plugin]\nid = "solo"\nversion = "1.0.0"\n'
+            '[run]\ncommand = ["sh", "main.sh"]\n')
+        env = self.folder / ".venv" / "bin"
+        env.mkdir(parents=True)
+        (env / "python").write_text("#!/bin/sh\n")
+        self.assertEqual(worker.read_manifest(self.folder)["command"][0], "sh")

@@ -2152,6 +2152,153 @@ def worker_module():
         return None
 
 
+def plugin_env_path(folder):
+    """Where a plugin's own virtualenv lives, whether or not it exists."""
+    return Path(folder) / ".venv"
+
+
+def plugin_interpreter(folder):
+    """The Python of a plugin's own environment, if it has one."""
+    candidate = plugin_env_path(folder) / "bin" / "python"
+    return candidate if candidate.exists() else None
+
+
+def dev_env(args):
+    """Build a plugin its own environment, because W4VE will not share hers.
+
+    The manifesto is blunt about this: W4VE does not install a plugin's
+    dependencies into its own environment. Two plugins wanting different
+    versions of the same library is not a conflict to resolve, it is two
+    environments; and a plugin that can add packages to the process watching
+    Minecraft is a plugin that can break it from a requirements file.
+
+    ⚠️ **This installs, and it is the only thing here that does.** That is not
+    a hole in the rule, it is the shape of it: nothing installs *by itself* or
+    as a side effect of starting a server. This is a person typing a command
+    about a plugin they chose, being told exactly what will be fetched, and
+    saying yes.
+    """
+    module = worker_module()
+    if module is None:
+        problem("this w4ve cannot read native plugins (worker.py is missing)")
+        return 2
+    folder = Path(args.folder or ".").resolve()
+    try:
+        manifest = module.read_manifest(folder)
+    except module.WorkerError as exc:
+        problem(str(exc))
+        return 1
+
+    wanted = list(manifest.get("requires") or [])
+    lock = folder / "requirements.txt"
+    if lock.exists():
+        # A lockfile wins over the manifest list: it is the one that can carry
+        # exact versions and hashes, which is the difference between "install
+        # something called requests" and "install this exact file".
+        say(Out.dim(f"  using {lock.name}"))
+    elif not wanted:
+        say(f"{manifest['id']} declares no Python packages, so there is "
+            f"nothing to build an environment for")
+        return 0
+
+    home = plugin_env_path(folder)
+    if home.exists() and not args.force:
+        problem(f"{home} already exists (use --force to build it again)")
+        return 1
+
+    say(Out.bold(f"{manifest['id']} {manifest['version']}"))
+    say(f"  environment: {home}")
+    if lock.exists():
+        hashed = "--hash=" in lock.read_text(encoding="utf-8")
+        say(f"  from: {lock}" + ("  (with hashes)" if hashed
+                                 else "  " + Out.warn("(no hashes: a name is "
+                                                      "not an identity)")))
+    else:
+        say(f"  packages: {', '.join(wanted)}")
+        say(Out.warn("  no requirements.txt, so these are names and not "
+                     "versions: what arrives today may not be what arrives "
+                     "tomorrow"))
+    say()
+    say(Out.dim("  This downloads and runs somebody else's code. A hash "
+                "proves identity, never good intentions."))
+    if args.dry_run:
+        say(Out.dim("dry run, nothing was fetched"))
+        return 0
+    if not (args.yes or ask("build it?", default=False)):
+        say("nothing done")
+        return 0
+
+    if home.exists():
+        shutil.rmtree(home)
+    result = subprocess.run([sys.executable, "-m", "venv", str(home)])
+    if result.returncode != 0:
+        problem("could not create the environment")
+        return 1
+    pip = home / "bin" / "pip"
+    command = [str(pip), "install"]
+    if lock.exists():
+        command += ["-r", str(lock)]
+        if "--hash=" in lock.read_text(encoding="utf-8"):
+            # Refuses anything whose hash is not pinned, including transitive
+            # dependencies. Half a locked file is not a locked file.
+            command.append("--require-hashes")
+    else:
+        command += wanted
+    result = subprocess.run(command)
+    if result.returncode != 0:
+        problem("the packages did not install; the environment is left in "
+                "place so you can see why")
+        return 1
+
+    absent = module.missing_requirements(dict(manifest,
+                                              command=[str(home / "bin" / "python")]))
+    if absent:
+        problem("built it, and it still does not have: " + ", ".join(absent))
+        return 1
+    say(f"{Out.ok('ok')}  {home}")
+    say(Out.dim(f"    w4ve dev run {folder}   uses it from now on"))
+    return 0
+
+
+def dev_lock(args):
+    """Freeze a plugin's environment into a requirements.txt with hashes.
+
+    What makes an install reproducible is not a list of names, it is a list of
+    files. `pip freeze` gives versions; `--hash` is what makes a second machine
+    get the same bytes.
+    """
+    folder = Path(args.folder or ".").resolve()
+    interpreter = plugin_interpreter(folder)
+    if interpreter is None:
+        problem(f"{folder} has no environment yet (w4ve dev env {folder})")
+        return 1
+    pip = folder / ".venv" / "bin" / "pip"
+    result = subprocess.run([str(pip), "freeze"], capture_output=True, text=True)
+    if result.returncode != 0:
+        problem("could not read the environment")
+        return 1
+    frozen = [line for line in result.stdout.splitlines() if line.strip()
+              and not line.startswith("-e ")]
+    if not frozen:
+        say("that environment has nothing in it")
+        return 0
+    lock = folder / "requirements.txt"
+    if args.dry_run:
+        say(Out.dim(f"would write {len(frozen)} lines to {lock}"))
+        return 0
+    lock.write_text(
+        "# Written by `w4ve dev lock`. Exact versions, so a second machine\n"
+        "# gets what this one has.\n"
+        "#\n"
+        "# ⚠️ Without hashes this pins versions and not files. To pin files:\n"
+        "#     pip hash <wheel>   and add --hash= to each line, then\n"
+        "#     w4ve dev env . --force   installs with --require-hashes.\n"
+        + "\n".join(frozen) + "\n", encoding="utf-8")
+    say(f"{Out.ok('ok')}  {lock}  ({len(frozen)} package"
+        f"{'s' if len(frozen) != 1 else ''})")
+    return 0
+
+
 def cmd_dev(args, index):
     """Everything somebody writing a plugin needs, and nothing else."""
     # One positional for all three: `new` reads it as a name, the others as a
@@ -2164,7 +2311,11 @@ def cmd_dev(args, index):
         return dev_check(args)
     if args.action == "run":
         return dev_run(args)
-    problem("dev takes new, check or run")
+    if args.action == "env":
+        return dev_env(args)
+    if args.action == "lock":
+        return dev_lock(args)
+    problem("dev takes new, check, run, env or lock")
     return 2
 
 
@@ -3903,8 +4054,13 @@ def build_parser():
                          help="what the token may do (default: read)")
 
     dev = add("dev", cmd_dev, "write a plugin: scaffold it, check it, try it")
-    dev.add_argument("action", choices=["new", "check", "run"],
-                     help="new: scaffold one. check: conformance. run: try it")
+    dev.add_argument("action",
+                     choices=["new", "check", "run", "env", "lock"],
+                     help="new: scaffold one. check: conformance. run: try it. "
+                          "env: build its own virtualenv. lock: freeze that "
+                          "environment into a requirements.txt")
+    dev.add_argument("--force", action="store_true",
+                     help="for `env`, build it again over the existing one")
     dev.add_argument("name", nargs="?",
                      help="for `new`, what to call it; for the rest, the folder")
     dev.add_argument("--verbose", action="store_true",

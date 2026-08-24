@@ -152,12 +152,21 @@ def read_manifest(folder):
     requires = python.get("requires") or []
     if isinstance(requires, str):
         requires = [requires]
+    command = list(command)
+    # ⚠️ A plugin's own environment wins over whatever `command` says, and it
+    # has to: the manifest is written by whoever made the plugin, and the
+    # environment is built by whoever installed it. Somebody who ran
+    # `w4ve dev env` and then watched their plugin start against the system
+    # Python would have no idea why.
+    own = folder / ".venv" / "bin" / "python"
+    if own.exists() and command and "python" in Path(command[0]).name:
+        command[0] = str(own)
     return {
         "id": plugin["id"],
         "name": plugin.get("name") or plugin["id"],
         "version": str(plugin["version"]),
         "protocol": wanted,
-        "command": list(command),
+        "command": command,
         "config": dict(data.get("config") or {}),
         # Declared and checked, never installed. Same rule as a service, and
         # for the same reason: fetching code from the internet and running it
