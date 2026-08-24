@@ -19,6 +19,16 @@ command = ["python3", "main.py"]
 [python]
 requires = []
 
+# A ceiling on what this plugin may take. Off unless you ask for it, because a
+# default limit is one somebody hits at the worst moment without having chosen
+# it. It is a ceiling and NOT a sandbox: it stops a plugin eating the machine
+# by accident, and does nothing about one that means harm.
+#
+# [limits]
+# memory = "256M"
+# cpu    = 300      # seconds of CPU time
+# files  = 128      # open file descriptors
+
 [config]
 # Whatever is here arrives as `plugin.config`. Edit it and reload the plugin.
 greeting = "welcome back"

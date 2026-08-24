@@ -170,8 +170,14 @@ contesta, con respuestas obviamente falsas que lo dicen.
 - **No aísla dependencias todavía.** Un worker de Python usa el intérprete que
   su `command` diga, y apuntar a un virtualenv es cosa de quien lo instala. El
   aislamiento con wheels bloqueadas y hashes de la sección 8.2 es posterior.
-- **No limita recursos.** Un worker puede comerse la memoria de la máquina. Lo
-  que sí garantiza es que se lleva por delante sólo lo suyo.
+- **Limita recursos sólo si el plugin lo pide.** Un bloque `[limits]` pone
+  techo a memoria, CPU y descriptores, aplicado **dentro del hijo** (ponerlo en
+  el guardián se lo pondría al guardián, que es justo el proceso que no puede
+  quedarse sin nada). Viene apagado porque un límite por defecto es un límite
+  que alguien se come en el peor momento sin haberlo elegido.
+  ⚠️ **Es un techo, no un sandbox.** Frena a un plugin que se come la máquina
+  por accidente y no hace nada contra uno que quiere hacer daño. Llamarlo
+  sandbox sería de las mentiras que el manifiesto lista como peligrosas.
 - **No define el companion mod.** Los eventos tipados desde Fabric son otro
   contrato, y va en su propio RFC.
 - **No sustituye a los plugins de MCDR.** Conviven; son dos poblaciones con

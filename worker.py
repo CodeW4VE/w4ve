@@ -61,6 +61,53 @@ class WorkerError(Exception):
     """Something the operator has to know about a worker."""
 
 
+def _limiter(limits):
+    """Apply a plugin's declared limits, inside the child, before it runs.
+
+    ⚠️ In the child on purpose. Setting a limit in the guardian would apply it
+    to the guardian, which is the one process that must not run out of
+    anything.
+
+    A limit is a ceiling and not a sandbox, and the difference matters enough
+    to say: this stops a plugin eating the machine's memory by accident. It
+    does not stop one that means harm, and calling it a sandbox would be the
+    kind of lie the manifesto lists as dangerous.
+    """
+    def apply():
+        import resource
+
+        memory = limits.get("memory")
+        if memory:
+            try:
+                resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
+            except (ValueError, OSError):
+                pass
+        seconds = limits.get("cpu")
+        if seconds:
+            try:
+                resource.setrlimit(resource.RLIMIT_CPU, (seconds, seconds))
+            except (ValueError, OSError):
+                pass
+        files = limits.get("files")
+        if files:
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (files, files))
+            except (ValueError, OSError):
+                pass
+    return apply
+
+
+def parse_size(text):
+    """`256M` -> bytes, for a limit somebody wrote by hand."""
+    raw = str(text).strip().lower().replace("b", "")
+    units = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}
+    unit = units.get(raw[-1:]) if raw else None
+    try:
+        return int(float(raw[:-1] if unit else raw) * (unit or 1))
+    except ValueError:
+        return 0
+
+
 def sdk_path():
     """Where the Python SDK lives, or None if this w4ve does not carry it."""
     folder = Path(__file__).resolve().parent / "sdk" / "python"
@@ -116,8 +163,28 @@ def read_manifest(folder):
         # for the same reason: fetching code from the internet and running it
         # is the operator's decision, not a side effect of starting a server.
         "requires": [str(name) for name in requires],
+        # A ceiling, not a sandbox. Off unless the plugin asks for it: a
+        # default limit is a limit somebody hits at the worst moment without
+        # having chosen it.
+        "limits": _limits_from(data.get("limits") or {}),
         "folder": folder,
     }
+
+
+def _limits_from(declared):
+    out = {}
+    if declared.get("memory"):
+        size = parse_size(declared["memory"])
+        if size:
+            out["memory"] = size
+    for name in ("cpu", "files"):
+        try:
+            value = int(declared.get(name) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            out[name] = value
+    return out
 
 
 def missing_requirements(manifest):
@@ -221,6 +288,7 @@ class Worker:
         environment = dict(os.environ)
         environment["W4VE_PLUGIN"] = self.id
         environment["W4VE_DATA_DIR"] = str(self.data_dir)
+        limits = self.manifest.get("limits") or {}
         # The SDK is W4VE's, so W4VE puts it on the path rather than making
         # every plugin work out where it lives. A plugin that ships its own
         # copy still wins: theirs is found first because sys.path is searched
@@ -239,7 +307,8 @@ class Worker:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                bufsize=1)
+                bufsize=1,
+                preexec_fn=_limiter(limits) if limits else None)
         except OSError as exc:
             self.state = "failed"
             self.error = str(exc)

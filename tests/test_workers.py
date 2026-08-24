@@ -511,3 +511,46 @@ class PolyglotCase(HostCase):
             [sys.executable, str(ROOT / "sdk" / "conformance.py"), str(self.SHELL)],
             capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class LimitsCase(HostCase):
+    """A ceiling on what a plugin can take, which is not a sandbox.
+
+    The difference is worth being exact about: this stops a plugin eating the
+    machine's memory by accident, and it does nothing at all about one that
+    means harm. Calling it a sandbox would be the kind of lie the manifesto
+    lists among the dangerous ones.
+    """
+
+    def greedy(self):
+        manifest = worker.read_manifest(BAD / "greedy")
+        one = worker.Worker(manifest, self.tmp, host=self.host)
+        self.host.workers[one.id] = one
+        return one
+
+    def test_a_limit_is_read_from_the_manifest(self):
+        manifest = worker.read_manifest(BAD / "greedy")
+        self.assertEqual(manifest["limits"]["memory"], 64 * 1024 * 1024)
+
+    def test_a_plugin_with_no_limits_declares_none(self):
+        # Off unless asked for: a default ceiling is one somebody hits at the
+        # worst possible moment without having chosen it.
+        self.assertEqual(worker.read_manifest(EXAMPLE)["limits"], {})
+
+    def test_asking_for_a_gigabyte_against_sixty_four_megabytes(self):
+        one = self.greedy()
+        ok, message = one.start()
+        self.assertTrue(ok, message)
+        answer = one.invoke("!!eat", [], timeout=10)
+        # Either it is refused the memory and says so, or it dies trying.
+        # What must not happen is that it gets it.
+        self.assertFalse(answer.get("ok") and answer.get("value"), answer)
+
+    def test_and_the_guardian_is_still_there(self):
+        one = self.greedy()
+        one.start()
+        one.invoke("!!eat", [], timeout=10)
+        good = self.start("greeter")
+        good.start()
+        self.assertTrue(good.invoke("!!seen", [], timeout=5)["ok"],
+                        "one plugin hitting its ceiling took another with it")

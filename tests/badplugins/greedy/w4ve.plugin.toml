@@ -1,0 +1,7 @@
+[plugin]
+id = "greedy"
+version = "1.0.0"
+[run]
+command = ["python3", "main.py"]
+[limits]
+memory = "64M"
