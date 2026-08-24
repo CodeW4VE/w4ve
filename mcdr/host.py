@@ -952,6 +952,22 @@ class Host:
     # ------------------------------------------------------------- bookkeeping
 
     def register_help(self, plugin_id, prefix, message, permission=0):
+        """A line in `!!help`, and a warning when two plugins claim one prefix.
+
+        This is the check that catches what a command clash usually looks like
+        in the wild, because the two plugins rarely collide through the same
+        door. On the smp, WhereIs 2.2.2 registers `!!here` as a command while
+        the Here plugin answers `!!here` by reading the chat: no two command
+        trees to compare, one prefix answered twice, and `!!help` listing it
+        twice with different text. What they do share is this: both announce
+        the same prefix, so this is where it can be seen.
+        """
+        for other in self._help:
+            if other["prefix"] == prefix and other["plugin"] != plugin_id:
+                self.logger_for(plugin_id).warning(
+                    "%s is already offered by %s; players will see it twice"
+                    % (prefix, other["plugin"]))
+                break
         item = {"plugin": plugin_id, "prefix": prefix,
                 "message": message, "permission": permission}
         self._help.append(item)
@@ -974,10 +990,28 @@ class Host:
         return [item for item in self._help
                 if level >= (item.get("permission") or 0)]
 
-    def register_command(self, plugin_id, root_node):
+    def register_command(self, plugin_id, root_node, allow_duplicates=False):
+        """Take a plugin's command tree, and say so when two claim one word.
+
+        Nothing is refused: every tree that matches gets its turn in
+        `run_command`, which is what MCDR does and what some setups rely on.
+        What was missing was the sentence, and `allow_duplicates` was being
+        accepted and dropped, so a plugin that said "I know, let me" and one
+        that did not were treated the same.
+        """
         entry = self.loaded.get(plugin_id)
         if entry is None:
             return
+        if not allow_duplicates:
+            mine = set(getattr(root_node, "literals", ()) or ())
+            for other_id, other in self.commands:
+                if other_id == plugin_id:
+                    continue
+                shared = mine & set(getattr(other, "literals", ()) or ())
+                if shared:
+                    self.logger_for(plugin_id).warning(
+                        "%s is also registered by %s; both will answer it"
+                        % (", ".join(sorted(shared)), other_id))
         entry.commands.append(root_node)
         self.commands.append((plugin_id, root_node))
 

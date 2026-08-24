@@ -28,11 +28,27 @@ class FakeRcon(threading.Thread):
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(4)
+        # So `run` can notice `running` went false instead of sitting in
+        # accept() forever. See `stop`, which is where this matters.
+        self.sock.settimeout(0.1)
         self.port = self.sock.getsockname()[1]
         self.running = True
 
     def stop(self):
+        """Stop accepting, and only then close the socket.
+
+        The order is the whole point. Closing the socket while `run` is parked
+        in accept() does not wake it up: the thread stays blocked on a file
+        descriptor NUMBER, and the kernel is now free to hand that number to
+        the next socket anybody opens -- which, in a test file, is the next
+        test's server. The zombie thread then accepts a connection meant for a
+        server it is not, sees its own `running` is false, and drops it. What
+        the client gets is a connection reset in the middle of logging in, one
+        test too late to be believed, roughly one run in four.
+        """
         self.running = False
+        if self.is_alive():
+            self.join(timeout=2)
         try:
             self.sock.close()
         except OSError:
@@ -42,6 +58,8 @@ class FakeRcon(threading.Thread):
         while self.running:
             try:
                 conn, _ = self.sock.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 return
             threading.Thread(target=self._serve, args=(conn,), daemon=True).start()

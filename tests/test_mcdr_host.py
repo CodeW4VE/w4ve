@@ -274,6 +274,63 @@ class HostCase(unittest.TestCase):
         host.feed_line("[14:32:10] [Server thread/INFO]: <TVTvirus> !!fine")
         self.assertEqual(host.plugin_instance("fine").ran, ["yes"])
 
+    def test_two_plugins_offering_one_prefix_is_said_out_loud(self):
+        """The smp runs this exact pair, and nothing ever mentioned it.
+
+        WhereIs 2.2.2 registers `!!here` as a command; the Here plugin answers
+        `!!here` by reading the chat. Two different doors, so comparing command
+        trees finds nothing, and the player just sees one command answered
+        twice. Both announce the prefix, so that is where it is caught.
+        """
+        (self.tmp / "plugins" / "mine.py").write_text(
+            "from mcdreforged.api.all import *\n"
+            "PLUGIN_METADATA = {'id': 'mine', 'version': '1.0.0'}\n"
+            "def on_load(server, old):\n"
+            "    server.register_help_message('!!here', 'mine')\n")
+        (self.tmp / "plugins" / "theirs.py").write_text(
+            "from mcdreforged.api.all import *\n"
+            "PLUGIN_METADATA = {'id': 'theirs', 'version': '1.0.0'}\n"
+            "def on_load(server, old):\n"
+            "    server.register_help_message('!!here', 'theirs')\n")
+        self.host()
+        warned = [l for l in self.lines if "!!here is already offered" in l]
+        self.assertTrue(warned, self.lines)
+        # Both lines stay in the help: this is a warning, not a veto. Removing
+        # one would be deciding for the admin which plugin they meant.
+        prefixes = [i["prefix"] for i in self.host().help_messages]
+        self.assertEqual(prefixes.count("!!here"), 2)
+
+    def test_one_plugin_saying_it_knows_is_not_warned_at(self):
+        (self.tmp / "plugins" / "a.py").write_text(
+            "from mcdreforged.api.all import *\n"
+            "PLUGIN_METADATA = {'id': 'a', 'version': '1.0.0'}\n"
+            "def on_load(server, old):\n"
+            "    server.register_command(Literal('!!both').runs(lambda s: None))\n")
+        (self.tmp / "plugins" / "b.py").write_text(
+            "from mcdreforged.api.all import *\n"
+            "PLUGIN_METADATA = {'id': 'b', 'version': '1.0.0'}\n"
+            "def on_load(server, old):\n"
+            "    server.register_command(Literal('!!both').runs(lambda s: None),\n"
+            "                            allow_duplicates=True)\n")
+        self.host()
+        self.assertFalse([l for l in self.lines if "also registered" in l],
+                         self.lines)
+
+    def test_two_plugins_claiming_one_command_word_is_warned_about(self):
+        (self.tmp / "plugins" / "a.py").write_text(
+            "from mcdreforged.api.all import *\n"
+            "PLUGIN_METADATA = {'id': 'a', 'version': '1.0.0'}\n"
+            "def on_load(server, old):\n"
+            "    server.register_command(Literal('!!both').runs(lambda s: None))\n")
+        (self.tmp / "plugins" / "b.py").write_text(
+            "from mcdreforged.api.all import *\n"
+            "PLUGIN_METADATA = {'id': 'b', 'version': '1.0.0'}\n"
+            "def on_load(server, old):\n"
+            "    server.register_command(Literal('!!both').runs(lambda s: None))\n")
+        self.host()
+        self.assertTrue([l for l in self.lines if "also registered" in l],
+                        self.lines)
+
     def test_a_missing_pip_module_is_not_called_a_compatibility_hole(self):
         """MinecraftDataAPI needs hjson. That is its problem, not ours."""
         (self.tmp / "plugins" / "needy.py").write_text(

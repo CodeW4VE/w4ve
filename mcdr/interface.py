@@ -300,7 +300,8 @@ class PluginServerInterface(ServerInterface):
         self._host.register_help(self._plugin.id, prefix, message, permission)
 
     def register_command(self, root_node, allow_duplicates=False):
-        self._host.register_command(self._plugin.id, root_node)
+        self._host.register_command(self._plugin.id, root_node,
+                                    allow_duplicates=allow_duplicates)
 
     def register_event_listener(self, event, callback, priority=None):
         self._host.register_listener(self._plugin.id, event, callback, priority)
