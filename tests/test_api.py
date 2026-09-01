@@ -163,7 +163,7 @@ class ServedCase(unittest.TestCase):
         self.assertTrue(self.client.hello()["ok"])
 
     def test_a_bug_in_a_route_is_a_500_and_the_api_survives(self):
-        def explode(route, body):
+        def explode(route, body, job_id=None):
             raise RuntimeError("this is a bug")
         saved, self.api.run = self.api.run, explode
         try:

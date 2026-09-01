@@ -1381,15 +1381,31 @@ class Client:
         finally:
             conn.close()
 
-    def tail(self, on_line, timeout=None):
+    def tail(self, on_line, timeout=None, stop=None, ready=None):
+        """Follow the console until the caller says to stop.
+
+        `stop` is a callable asked between reads, so a follower can be told to
+        let go without waiting for the next line: a quiet server would keep a
+        cancelled job hanging for as long as nobody talks. `ready` is set once
+        the guardian has confirmed the subscription, which is what lets a
+        caller send a command *after* it is listening and not lose the first
+        line of the answer.
+        """
         conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        conn.settimeout(timeout)
+        # With `stop` we wake up regularly to ask it, and the caller's timeout
+        # stops being the socket's problem.
+        conn.settimeout(0.5 if stop is not None else timeout)
         conn.connect(str(self.sock_path))
         conn.sendall(b'{"cmd": "tail"}\n')
         buf = b""
         try:
             while True:
-                chunk = conn.recv(4096)
+                if stop is not None and stop():
+                    return
+                try:
+                    chunk = conn.recv(4096)
+                except socket.timeout:
+                    continue
                 if not chunk:
                     return
                 buf += chunk
@@ -1399,6 +1415,8 @@ class Client:
                         message = json.loads(raw.decode())
                     except ValueError:
                         continue
+                    if message.get("tailing") and ready is not None:
+                        ready.set()
                     if message.get("event") == "console":
                         on_line(message["process"], message["line"])
         finally:

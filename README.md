@@ -366,6 +366,38 @@ w4ve.command("say hello")
   against it: that a read token really cannot stop a server, that a wrong token
   and an absent W4VE are told apart, and that nothing is being read off disk.
 
+### Work that takes minutes
+
+A backup is the operation people want to run from outside, and `!!pb make`
+comes back four minutes later. So the request that asks for it gets an id
+instead of an answer, and the client polls.
+
+```python
+job = w4ve.start_job("!!pb make nightly",
+                     until=r"Backup .* created",   # the line that ends it
+                     timeout=900)
+print(w4ve.wait_for_job(job["id"])["lines"])
+```
+
+```sh
+curl --unix-socket <server>/w4ve/run/api.sock -X POST \
+     -d '{"command": "!!pb make", "until": "created"}' \
+     http://localhost/v1/jobs                     # 202, with an id
+curl --unix-socket <server>/w4ve/run/api.sock \
+     http://localhost/v1/jobs/<id>                # running, done or failed
+```
+
+- **It subscribes before it sends.** The other order loses the first line of
+  the answer, which for a short command is the whole answer.
+- **`until` is what ends it, `timeout` is the backstop.** With no `until`, the
+  deadline *was* the plan and what it collected is the answer; with one,
+  reaching the deadline is a failure and says what it was waiting for.
+- **Cancelling stops us listening and nothing else.** A backup cannot be
+  un-asked, and the message says so rather than implying the work was undone.
+- **Jobs live in memory and the last 50 are kept.** Surviving a restart would
+  mean a second place where the truth about a server is written down, and
+  there is already one.
+
 ## The two files
 
 ```
@@ -434,8 +466,6 @@ a line of this file quietly stops being true.
 
 - Talk to more than one server at a time. One `w4ve.toml`, one server, which is
   what a piece shared by a whole network still needs.
-- Long-running jobs over the API. Everything it does answers now or fails now;
-  a backup that takes four minutes needs a job to poll, and that is not here.
 - Run without Python in the container. The guardian is Python, so an image
   that is only Java (`yolks:java_21` and friends) cannot start it. An MCDR image
   already has both, because MCDR is Python too.

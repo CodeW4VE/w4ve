@@ -33,6 +33,7 @@ Standard library only, Python 3.9, same rules as the rest.
 
 import json
 import os
+import re
 import secrets
 import socket
 import socketserver
@@ -62,7 +63,229 @@ ROUTES = {
     ("POST", "/v1/server/start"): "write",
     ("POST", "/v1/server/stop"): "write",
     ("POST", "/v1/plugins/reload"): "admin",
+    # Jobs: for the work that answers in minutes instead of milliseconds.
+    ("GET", "/v1/jobs"): "read",
+    ("POST", "/v1/jobs"): "write",
+    ("GET", "/v1/jobs/{id}"): "read",
+    ("POST", "/v1/jobs/{id}/cancel"): "write",
 }
+
+# The two routes above with an `{id}` in them, as (method, prefix, suffix).
+# Kept as a separate list so ROUTES stays the whole list of what exists: a
+# path that matches nothing here is a 404 before any token is even read.
+WITH_ID = [
+    ("GET", "/v1/jobs/", ""),
+    ("POST", "/v1/jobs/", "/cancel"),
+]
+
+
+def resolve(method, path):
+    """Turn a request path into a key of ROUTES, plus the id it carried.
+
+    Returns (route, job_id), and (None, None) when nothing matches.
+    """
+    if (method, path) in ROUTES:
+        return (method, path), None
+    for verb, prefix, suffix in WITH_ID:
+        if verb != method or not path.startswith(prefix):
+            continue
+        rest = path[len(prefix):]
+        if suffix:
+            if not rest.endswith(suffix):
+                continue
+            rest = rest[:-len(suffix)]
+        if not rest or "/" in rest:
+            continue
+        return (method, prefix + "{id}" + suffix), rest
+    return None, None
+
+
+# A job that nobody ever polls still has to stop being remembered.
+JOBS_KEPT = 50
+# Nothing may be asked to wait longer than this, whatever the body says.
+JOB_MAX_SECONDS = 3600
+JOB_DEFAULT_SECONDS = 600
+# Lines kept per job. A chatty server must not turn a job into a memory leak.
+JOB_LINES_KEPT = 500
+
+
+class Job:
+    """Work whose answer cannot be the reply to the request that asked for it.
+
+    A backup is the case this exists for: `!!pb make` comes back in four
+    minutes, and by then the HTTP request is long gone. So the request gets an
+    id, a thread follows the console, and the client polls.
+
+    What this deliberately does NOT do is pretend it can cancel the work.
+    Cancelling a job stops us listening; the backup carries on, because there
+    is no way to un-ask a server for one. Saying so is the honest version.
+    """
+
+    def __init__(self, api, command, process="server", until=None,
+                 timeout=JOB_DEFAULT_SECONDS):
+        self.api = api
+        self.id = secrets.token_hex(8)
+        self.command = command
+        self.process = process
+        self.until = re.compile(until) if until else None
+        self.until_source = until or ""
+        self.timeout = timeout
+        self.state = "running"
+        self.error = ""
+        self.matched = ""
+        self.started = time.time()
+        self.finished = None
+        self.lines = []
+        self.dropped = 0
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._cancelled = threading.Event()
+        self._thread = None
+
+    # -------------------------------------------------------------- running
+
+    def begin(self):
+        self._thread = threading.Thread(target=self._work, daemon=True)
+        self._thread.start()
+
+    def _work(self):
+        import runtime
+        client = runtime.Client(self.api.root)
+        listening = threading.Event()
+
+        def follow():
+            try:
+                client.tail(self._line, stop=self._should_stop, ready=listening)
+            except OSError as exc:
+                self._end("failed", "lost the console: %s" % exc)
+            finally:
+                listening.set()      # never leave the starter waiting
+
+        follower = threading.Thread(target=follow, daemon=True)
+        follower.start()
+        # Subscribe first, send second. The other order loses the first line of
+        # the answer, which for a short command is the whole answer.
+        if not listening.wait(5):
+            self._end("failed", "could not follow the console")
+            return
+        if self._done.is_set():
+            return
+
+        answer = self.api.guardian_says({"cmd": "send", "text": self.command,
+                                         "process": self.process})
+        if not answer.get("ok"):
+            self._end("failed", answer.get("error") or answer.get("message")
+                      or "the command was refused")
+            return
+        for line in answer.get("lines") or []:
+            self._line(self.process, line)
+
+        if self._done.wait(self.timeout):
+            return
+        # Out of time. With something to wait for, that is a failure; without
+        # one, the deadline WAS the plan and what we collected is the answer.
+        if self.until is None:
+            self._end("done", "")
+        else:
+            self._end("failed", "waited %ds for %s and it never came"
+                      % (self.timeout, self.until_source))
+
+    def _line(self, process, line):
+        if process != self.process or self._done.is_set():
+            return
+        with self._lock:
+            if len(self.lines) >= JOB_LINES_KEPT:
+                self.lines.pop(0)
+                self.dropped += 1
+            self.lines.append(line)
+        if self.until is not None and self.until.search(line):
+            self.matched = line
+            self._end("done", "")
+
+    def _should_stop(self):
+        return self._done.is_set() or self._cancelled.is_set()
+
+    def _end(self, state, error):
+        with self._lock:
+            if self.finished is not None:
+                return
+            self.state = state
+            self.error = error
+            self.finished = time.time()
+        self._done.set()
+
+    def cancel(self):
+        if self.finished is not None:
+            return False, "this job already finished (%s)" % self.state
+        self._cancelled.set()
+        self._end("cancelled", "")
+        return True, ("stopped listening; whatever the server was doing "
+                      "carries on, because it cannot be un-asked")
+
+    # -------------------------------------------------------------- reading
+
+    def brief(self):
+        with self._lock:
+            return {"id": self.id, "state": self.state, "command": self.command,
+                    "process": self.process, "started": self.started,
+                    "finished": self.finished, "lines": len(self.lines),
+                    "error": self.error}
+
+    def full(self):
+        with self._lock:
+            out = {"id": self.id, "state": self.state, "command": self.command,
+                   "process": self.process, "until": self.until_source,
+                   "timeout": self.timeout, "started": self.started,
+                   "finished": self.finished, "matched": self.matched,
+                   "error": self.error, "lines": list(self.lines)}
+        if self.dropped:
+            out["dropped"] = self.dropped
+        return out
+
+
+class Jobs:
+    """Every job this API started, newest last, and a lid on how many."""
+
+    def __init__(self, api):
+        self.api = api
+        self._jobs = {}
+        self._order = []
+        self._lock = threading.Lock()
+
+    def start(self, command, process, until, timeout):
+        job = Job(self.api, command, process=process, until=until,
+                  timeout=timeout)
+        with self._lock:
+            self._jobs[job.id] = job
+            self._order.append(job.id)
+            self._forget_old()
+        job.begin()
+        return job
+
+    def _forget_old(self):
+        """Drop finished jobs past the limit. A running one is never dropped."""
+        while len(self._order) > JOBS_KEPT:
+            for i, jid in enumerate(self._order):
+                if self._jobs[jid].finished is not None:
+                    self._order.pop(i)
+                    self._jobs.pop(jid, None)
+                    break
+            else:
+                return              # all of them are still running
+
+    def get(self, job_id):
+        with self._lock:
+            return self._jobs.get(job_id)
+
+    def listing(self):
+        with self._lock:
+            return [self._jobs[j].brief() for j in self._order]
+
+    def stop_all(self):
+        for job in list(self._jobs.values()):
+            if job.finished is None:
+                job.cancel()
+
 
 # A body bigger than this is not a command, it is a mistake or an attack.
 MAX_BODY = 64 * 1024
@@ -214,8 +437,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle(self, method):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
-        route = (method, path)
-        if route not in ROUTES:
+        route, job_id = resolve(method, path)
+        if route is None:
             self._fail(404, "no such thing: %s %s" % (method, path))
             return
         needed = ROUTES[route]
@@ -238,7 +461,7 @@ class Handler(BaseHTTPRequestHandler):
             self._fail(400, str(exc))
             return
         try:
-            code, payload = self.server.api.run(route, body)
+            code, payload = self.server.api.run(route, body, job_id)
         except Exception as exc:            # noqa: BLE001
             # A bug in here must never be a bug in the guardian. It becomes a
             # 500 with the reason, and the server keeps running.
@@ -277,6 +500,10 @@ class Api:
         self.httpd = None
         self.thread = None
         self.socket_path = self.root / "w4ve" / "run" / "api.sock"
+        # Long work lives here and nowhere else: jobs are in memory on
+        # purpose. Surviving a restart would mean a second place where the
+        # truth about a server is written down, and there is already one.
+        self.jobs = Jobs(self)
 
     # ------------------------------------------------------------- lifetime
 
@@ -306,6 +533,9 @@ class Api:
                                       else " (no token needed: local socket)")
 
     def stop(self):
+        # Jobs first: a follower thread holding a socket to a guardian that is
+        # going away is how a shutdown hangs.
+        self.jobs.stop_all()
         if self.httpd is not None:
             self.httpd.shutdown()
             self.httpd.server_close()
@@ -318,7 +548,7 @@ class Api:
 
     # ------------------------------------------------------------ answering
 
-    def run(self, route, body):
+    def run(self, route, body, job_id=None):
         method, path = route
         if path == "/v1/hello":
             return 200, {"ok": True, "software": "w4ve", "api": VERSION,
@@ -346,9 +576,63 @@ class Api:
             return self._process(body, "stop")
         if path == "/v1/plugins/reload":
             return self._reload(body)
+        if path == "/v1/jobs":
+            if method == "GET":
+                return 200, {"ok": True, "jobs": self.jobs.listing()}
+            return self._start_job(body)
+        if path == "/v1/jobs/{id}":
+            job = self.jobs.get(job_id)
+            if job is None:
+                return 404, {"ok": False, "error": "no job called %r" % job_id}
+            return 200, {"ok": True, **job.full()}
+        if path == "/v1/jobs/{id}/cancel":
+            job = self.jobs.get(job_id)
+            if job is None:
+                return 404, {"ok": False, "error": "no job called %r" % job_id}
+            ok, message = job.cancel()
+            # The reason goes in `error` when it is one: a client reads that
+            # field to find out what happened, and a 409 with nothing in it is
+            # a "no" with no explanation.
+            return (200 if ok else 409), {"ok": ok, "message": message,
+                                          "error": "" if ok else message,
+                                          "state": job.state}
         return 404, {"ok": False, "error": "no such thing"}
 
+    def _start_job(self, body):
+        """Ask for something long. The id comes back now, the answer later."""
+        command = str(body.get("command", "")).strip()
+        if not command:
+            return 400, {"ok": False, "error": "no command"}
+        until = body.get("until") or ""
+        if until:
+            try:
+                re.compile(until)
+            except re.error as exc:
+                return 400, {"ok": False,
+                             "error": "`until` is not a regular expression: %s" % exc}
+        try:
+            timeout = float(body.get("timeout") or JOB_DEFAULT_SECONDS)
+        except (TypeError, ValueError):
+            return 400, {"ok": False, "error": "`timeout` is not a number"}
+        if timeout <= 0:
+            return 400, {"ok": False, "error": "`timeout` must be more than zero"}
+        # Capped rather than refused: a client asking for a day is not wrong,
+        # it just cannot have one.
+        timeout = min(timeout, JOB_MAX_SECONDS)
+        job = self.jobs.start(command, str(body.get("process", "server")),
+                              until, timeout)
+        # 202: taken, not done. The whole point of the route is that the
+        # answer is not ready and pretending otherwise with a 200 would be a
+        # lie a client cannot see through.
+        return 202, {"ok": True, "id": job.id, "state": job.state,
+                     "timeout": timeout,
+                     "poll": "/v1/jobs/%s" % job.id}
+
     # ---------------------------------------------------------------- doing
+
+    def guardian_says(self, request):
+        """Public name of `_guardian_says`, for the jobs that live out here."""
+        return self._guardian_says(request)
 
     def _guardian_says(self, request):
         """Ask the guardian, exactly as the CLI does.

@@ -23,6 +23,7 @@ reports success while nothing happened.
 import http.client
 import json
 import socket
+import time
 from pathlib import Path
 
 __all__ = ["W4VE", "W4VEError", "Denied", "NotRunning"]
@@ -142,6 +143,49 @@ class W4VE:
 
     def reload_plugin(self, plugin):
         return self.call("POST", "/v1/plugins/reload", {"plugin": plugin})
+
+    # ----------------------------------------------------------------- jobs
+
+    def start_job(self, command, process="server", until=None, timeout=None):
+        """Ask for something that takes minutes. Comes back with an id, now.
+
+        `until` is a regular expression: the first console line that matches
+        it ends the job. Without one, the job collects lines until `timeout`
+        and that is the answer.
+        """
+        body = {"command": command, "process": process}
+        if until:
+            body["until"] = until
+        if timeout:
+            body["timeout"] = timeout
+        return self.call("POST", "/v1/jobs", body)
+
+    def job(self, job_id):
+        """How that job is going, and every line it has collected."""
+        return self.call("GET", "/v1/jobs/" + str(job_id))
+
+    def jobs(self):
+        return self.call("GET", "/v1/jobs")["jobs"]
+
+    def cancel_job(self, job_id):
+        """Stop listening. The server carries on: it cannot be un-asked."""
+        return self.call("POST", "/v1/jobs/%s/cancel" % job_id)
+
+    def wait_for_job(self, job_id, every=1.0, timeout=None):
+        """Poll until it finishes, and hand back the finished job.
+
+        A convenience for scripts. Anything with a screen to draw should poll
+        on its own clock instead of blocking in here.
+        """
+        started = time.time()
+        while True:
+            answer = self.job(job_id)
+            if answer.get("state") != "running":
+                return answer
+            if timeout is not None and time.time() - started > timeout:
+                raise W4VEError("job %s is still running after %ds"
+                                % (job_id, timeout))
+            time.sleep(every)
 
     # ------------------------------------------------------------ shortcuts
 

@@ -41,7 +41,13 @@ def main():
     out(stamp('Done (%.3fs)! For help, type "help"' % args.boot))
 
     started = time.time()
+    # Work that answers minutes later, which is the shape of a backup: the
+    # command comes back at once and the result arrives whenever it arrives.
+    slow_done_at = None
     while True:
+        if slow_done_at is not None and time.time() > slow_done_at:
+            slow_done_at = None
+            out(stamp("[Backup] done, 1 file"))
         if args.crash_after and time.time() - started > args.crash_after:
             out(stamp("something went very wrong"))
             sys.exit(1)
@@ -59,6 +65,12 @@ def main():
             time.sleep(0.1)
             continue
         command = line.strip()
+        if command.startswith("slowjob"):
+            bits = command.split()
+            wait = float(bits[1]) if len(bits) > 1 else 1.0
+            slow_done_at = time.time() + wait
+            out(stamp("[Backup] starting"))
+            continue
         if command == "stop" and not args.ignore_stop:
             out(stamp("Stopping server"))
             out(stamp("Saving worlds"))
