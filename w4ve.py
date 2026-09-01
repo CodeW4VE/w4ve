@@ -3781,7 +3781,8 @@ def cmd_run(args, index):
                 proc.send(line)
 
     threading.Thread(target=console, daemon=True).start()
-    code, message = guardian.run(start_now=not args.no_start)
+    code, message = guardian.run(start_now=not args.no_start,
+                                 take_over=args.take_over)
     say(message)
     return code
 
@@ -4081,6 +4082,9 @@ def build_parser():
                      help="hold the server: start the guardian only")
     run.add_argument("--quiet", action="store_true",
                      help="do not echo the server console here")
+    run.add_argument("--take-over", action="store_true",
+                     help="take the running server, console and all, from the "
+                          "guardian that has it, without restarting it")
 
     start = add("start", cmd_start, "start the server with the guardian already up")
     start.add_argument("process", nargs="?", default="server",

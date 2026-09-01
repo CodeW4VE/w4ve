@@ -291,9 +291,29 @@ Pendiente para cerrar el RFC contra producción:
 - Ensayarlo en el **mirror de MineWave**, que es el layout real (MCDR, Java
   dentro de un contenedor, `mods/` colgando de `server/`). Eso implica parar
   MCDR en ese servidor y es una decisión del operador, no del runtime.
-- El **traspaso de descriptores** (`SCM_RIGHTS`) para actualizar el guardián
-  sin reiniciar el servidor. Hoy el servidor sobrevive al guardián, pero
-  recupera la consola solo en el siguiente arranque hecho por W4VE.
+- ~~El **traspaso de descriptores** (`SCM_RIGHTS`) para actualizar el guardián
+  sin reiniciar el servidor~~ ✅ **hecho el 1 de septiembre**, en
+  `Guardian.hand_over` / `Guardian.take_over` y `w4ve run --take-over`: los dos
+  extremos de la consola viajan por el socket de control, el guardián viejo se
+  aparta sin tocar lo que vigilaba y **el pid no cambia**, que es la afirmación
+  sobre la que está construida la prueba (`tests/test_handover.py`, 4 pruebas
+  con dos guardianes y un servidor de verdad).
+
+  Tres cosas salieron de implementarlo, y ninguna se veía desde el diseño:
+
+  1. **Cerrar el fichero cuelga; hay que cerrar el descriptor.** El hilo que
+     lee la consola está dentro de un `read` sobre ese mismo objeto y tiene su
+     cerrojo; `.close()` espera a ese cerrojo, que solo se suelta cuando llega
+     una línea. Con un servidor callado, el traspaso se congelaba hasta que
+     alguien hablara.
+  2. **Mandar la respuesta dos veces se llevaba por delante el apagado.** La
+     contestación ya viaja con los descriptores; volver a enviarla sobre una
+     conexión que el otro ya cerró lanzaba una excepción que se comía el
+     `shutdown` de después, y el guardián viejo se quedaba arriba para siempre.
+  3. **Dos guardianes escribían el mismo `state.json.tmp`.** Durante el
+     traspaso hay dos vivos sobre un directorio, y uno le renombraba el fichero
+     al otro por debajo. El temporal lleva el pid desde entonces, y el que ya
+     entregó no vuelve a escribir estado: dejó de ser la verdad.
 - ~~RCON como canal de respaldo real~~ ✅ **hecho el 19 de agosto**, en
   `rcon.py`: un servidor adoptado se para pidiéndoselo por RCON y solo se
   recurre a las señales si no contesta, se le pueden mandar comandos con la

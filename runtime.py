@@ -217,7 +217,16 @@ class Watched:
         self.after = [str(name) for name in (after or [])]
         self.asked_to_come_back = False
 
+        # The console, kept apart from the Popen object on purpose. A guardian
+        # that inherited this server from another one has the two ends of its
+        # console and no child process to wait on, and everything that talks to
+        # the console has to work the same in both cases.
         self.proc = None
+        self.stdin = None
+        self.stdout = None
+        # Console objects whose descriptor we already handed over and closed.
+        # Held on purpose: see `let_go_of_console`.
+        self._handed_over = []
         self.pid = None
         self.starttime = None
         self.owned = False
@@ -298,6 +307,8 @@ class Watched:
                 universal_newlines=True,
                 start_new_session=True,   # its own process group, on purpose
             )
+            self.stdin = self.proc.stdin
+            self.stdout = self.proc.stdout
             self.pid = self.proc.pid
             self.starttime = starttime_of(self.pid)
             self.owned = True
@@ -331,17 +342,83 @@ class Watched:
         self._become("running", "adopted a process we did not start")
         threading.Thread(target=self._watch_foreign, daemon=True).start()
 
+    def inherit(self, entry, stdin_fd, stdout_fd):
+        """Take a running process AND its console from another guardian.
+
+        The difference with `adopt` is the whole point of the handover: an
+        adopted process can be watched and killed but not talked to, and this
+        one can, because the two ends of its console came over the socket.
+
+        It is still not our child, so there is no `proc` and nothing to wait
+        on. `_reap` knows that and watches /proc instead.
+        """
+        self.pid = entry.get("pid")
+        self.starttime = entry.get("starttime")
+        self.started_at = entry.get("started_at")
+        self.owned = True
+        self.proc = None
+        self.stdin = os.fdopen(stdin_fd, "w", buffering=1)
+        self.stdout = os.fdopen(stdout_fd, "r", buffering=1)
+        self.ready = entry.get("ready")
+        self.exit_code = None
+        self._become(entry.get("state") or "running",
+                     "inherited from the previous guardian, console and all")
+        threading.Thread(target=self._read_console, daemon=True).start()
+        threading.Thread(target=self._reap, daemon=True).start()
+
+    def console_fds(self):
+        """The two ends of the console, or None if we do not hold them."""
+        if not self.owned or not self.stdin or not self.stdout:
+            return None
+        try:
+            return [self.stdin.fileno(), self.stdout.fileno()]
+        except ValueError:          # already closed
+            return None
+
+    def let_go_of_console(self):
+        """Drop our copies after they have been sent somewhere else.
+
+        Sending a descriptor duplicates it in the receiver, so letting go here
+        does not close it there. Doing it at once is what stops two guardians
+        reading one console and each getting half the lines.
+
+        ⚠️ The descriptor is closed, NOT the file object, and the difference is
+        a hang. `_read_console` is sitting inside a read on that same object
+        and holding its buffer lock; calling `.close()` waits for that lock,
+        the lock is only released when a line arrives, and a quiet server
+        therefore freezes the handover until somebody says something. Closing
+        the descriptor underneath needs no lock.
+
+        The objects are then kept, unclosed, so that garbage collection cannot
+        close a descriptor number that something else has since been given.
+        """
+        fds = []
+        for handle in (self.stdin, self.stdout):
+            try:
+                fds.append(handle.fileno())
+            except (ValueError, AttributeError):
+                pass
+            if handle is not None:
+                self._handed_over.append(handle)
+        self.stdin = None
+        self.stdout = None
+        for fd in fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
     def send(self, text):
         if not alive(self.pid, self.starttime):
             return False, "%s is not running" % self.name
-        if not self.owned or not self.proc or not self.proc.stdin:
+        if not self.owned or not self.stdin:
             # No stdin of ours, which is the normal state for a server we only
             # adopted. RFC-0001 says the fallback is RCON, so use it instead of
             # telling the caller to go and do it themselves.
             return self.send_over_rcon(text)
         try:
-            self.proc.stdin.write(text.rstrip("\n") + "\n")
-            self.proc.stdin.flush()
+            self.stdin.write(text.rstrip("\n") + "\n")
+            self.stdin.flush()
         except (BrokenPipeError, ValueError) as exc:
             return False, "console is gone: %s" % exc
         return True, "sent"
@@ -441,7 +518,7 @@ class Watched:
     def _read_console(self):
         console = open(str(self.console_path), "a", buffering=1)
         try:
-            for line in self.proc.stdout:
+            for line in self.stdout:
                 line = line.rstrip("\n")
                 if console.tell() > CONSOLE_CAP:
                     console.close()
@@ -555,20 +632,31 @@ class Watched:
             time.sleep(self.health_every if self.ready else 2)
 
     def _reap(self):
-        code = self.proc.wait()
+        if self.proc is not None:
+            code = self.proc.wait()
+        else:
+            # Inherited from another guardian: this process is not our child,
+            # so there is nothing to wait on and no exit code to read. We watch
+            # /proc instead and say we do not know how it ended, which is true.
+            while alive(self.pid, self.starttime):
+                time.sleep(0.5)
+            code = None
         self.exit_code = code
         self.ready = False
+        # "exit 0" and "exit, we could not see the code" are different things,
+        # and the journal is the place where that difference gets read later.
+        how = "exit %d" % code if code is not None else "exit, code unknown"
         if self.asked_to_come_back:
             self.asked_to_come_back = False
-            self._become("stopped", "exit %d, a piece asked it to come back" % code)
+            self._become("stopped", "%s, a piece asked it to come back" % how)
             time.sleep(1)
             ok, message = self.start()
             self.guardian.log(message)
         elif self.asked_to_stop or self.state in ("stopping", "killed"):
-            self._become("stopped", "exit %d" % code)
+            self._become("stopped", how)
         else:
             self._note_death()
-            self._become("crashed", "exit %d, nobody asked for that" % code)
+            self._become("crashed", "%s, nobody asked for that" % how)
             self._maybe_restart()
 
     def _watch_foreign(self):
@@ -742,6 +830,9 @@ class Guardian:
         self.listeners_lock = threading.Lock()
         self.echo = False           # print the console here, for `w4ve run`
         self.stopping = threading.Event()
+        # Set once this guardian has given its server to another one. From
+        # then on it writes nothing down: it is no longer the truth.
+        self.handed_over = False
         # The MCDR compatible plugin host, if this server has plugins and this
         # w4ve carries the compatibility layer. None means "no plugins", which
         # is a normal server, not a broken one.
@@ -791,9 +882,15 @@ class Guardian:
     def snapshot(self):
         """Write down what we believe, so the next guardian can check it.
 
+        After a handover this does nothing: what we believe is out of date the
+        moment the console leaves, and writing it would overwrite the note of
+        the guardian that now actually owns the server.
+
         This file is a cache, never the truth. The truth is /proc, and every
         read of this file verifies (pid, starttime) before believing a word.
         """
+        if self.handed_over:
+            return
         data = {
             "schema": SCHEMA,
             "written": now(),
@@ -812,7 +909,11 @@ class Guardian:
                 "cwd": str(proc.cwd),
                 "flavor": proc.handler.name if proc.handler else None,
             }
-        tmp = self.state_path.with_suffix(".json.tmp")
+        # The temporary name carries our pid. During a handover there are two
+        # guardians alive over one directory for a moment, and with a shared
+        # `state.json.tmp` one of them renames the other's file out from under
+        # it and the loser dies with FileNotFoundError.
+        tmp = self.state_path.with_suffix(".json.%d.tmp" % os.getpid())
         tmp.write_text(json.dumps(data, indent=2) + "\n")
         tmp.replace(self.state_path)
 
@@ -1009,6 +1110,10 @@ class Guardian:
             if not pid or not alive(pid, starttime):
                 continue
             proc = self.watched.get(name)
+            if proc is not None and proc.owned and proc.stdin:
+                # Already ours, console and all: this one came over in a
+                # handover. Adopting it again would throw the console away.
+                continue
             if proc is None:
                 proc = self.add_service(name, entry.get("command") or [],
                                         entry.get("cwd") or str(self.root),
@@ -1018,6 +1123,120 @@ class Guardian:
         if found:
             self.log("recovered: %s" % ", ".join(found))
         return found
+
+    # -------------------------------------------------------------- handover
+
+    def hand_over(self, conn):
+        """Give a new guardian this server's console, and stand down.
+
+        This is what closes the last hole in RFC-0001. The server already
+        survived a guardian dying, but it only got its console back on the
+        next start W4VE did, so updating the runtime meant a restart of the
+        world. Now the descriptors move across the control socket and nothing
+        stops.
+
+        The order is the whole trick:
+
+        1. send the descriptors (sending duplicates them in the receiver);
+        2. close ours at once, or two guardians read one console and each
+           gets half the lines;
+        3. release the lock, so the new one can take it;
+        4. leave without stopping anything.
+        """
+        moving = [(name, proc) for name, proc in self.watched.items()
+                  if proc.console_fds()]
+        if not moving:
+            return {"ok": False,
+                    "error": "nothing here holds a console to hand over"}
+        if len(moving) > 1:
+            # One socket message carries one array of descriptors, and pairing
+            # them back up with the right process is guesswork this refuses to
+            # do. Multi-process handover is a bigger change than it looks.
+            return {"ok": False,
+                    "error": "%d processes have consoles, and handover moves one"
+                             % len(moving)}
+
+        name, proc = moving[0]
+        entry = {"name": name, "pid": proc.pid, "starttime": proc.starttime,
+                 "started_at": proc.started_at, "state": proc.state,
+                 "ready": proc.ready, "command": list(proc.command),
+                 "cwd": str(proc.cwd)}
+        payload = json.dumps({"ok": True, "handover": 1, "process": entry,
+                              "guardian_pid": os.getpid()}) + "\n"
+        try:
+            socket.send_fds(conn, [payload.encode()], proc.console_fds())
+        except OSError as exc:
+            return {"ok": False, "error": "could not send the console: %s" % exc}
+        proc.let_go_of_console()
+        self.handed_over = True
+        self.log("handed %s over to another guardian, console and all" % name)
+        self.release()
+        # The reply already went out with the descriptors, and saying it twice
+        # would leave a stray line in the new guardian's buffer.
+        return {"ok": True, "sent": True, "process": name}
+
+    def take_over(self, timeout=15):
+        """Take a running server, console included, from the guardian that has it.
+
+        Returns (ok, message). Failing here is not fatal for the caller: the
+        normal thing to do is carry on and start the server the usual way.
+        """
+        client = Client(self.root)
+        if not client.connected():
+            return False, "no guardian is running here to take over from"
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(timeout)
+        try:
+            conn.connect(str(self.sock_path))
+            conn.sendall(b'{"cmd": "handover"}\n')
+            data, fds, _flags, _addr = socket.recv_fds(conn, 65536, 2)
+        except OSError as exc:
+            for fd in locals().get("fds") or []:
+                os.close(fd)
+            return False, "the handover did not happen: %s" % exc
+        finally:
+            conn.close()
+
+        try:
+            answer = json.loads(data.decode().split("\n", 1)[0])
+        except (ValueError, UnicodeDecodeError):
+            for fd in fds:
+                os.close(fd)
+            return False, "the other guardian said something that is not JSON"
+        if not answer.get("ok"):
+            for fd in fds:
+                os.close(fd)
+            return False, answer.get("error", "the other guardian said no")
+        if len(fds) != 2:
+            for fd in fds:
+                os.close(fd)
+            return False, "expected two descriptors, got %d" % len(fds)
+
+        entry = answer.get("process") or {}
+        name = entry.get("name") or "server"
+        proc = self.watched.get(name)
+        if proc is None:
+            proc = self.add_service(name, entry.get("command") or [],
+                                    entry.get("cwd") or str(self.root),
+                                    restart="never")
+        # The old guardian releases its lock as it hands over, but it does it
+        # after we have the descriptors, so the file can be a moment behind.
+        limit = time.time() + timeout
+        while time.time() < limit:
+            got_it, holder = self.claim()
+            if got_it:
+                break
+            time.sleep(0.1)
+        else:
+            for fd in fds:
+                os.close(fd)
+            return False, "took the console but never got the lock (%s has it)" % holder
+
+        proc.inherit(entry, fds[0], fds[1])
+        self.log("took %s over from guardian %s, without restarting it"
+                 % (name, answer.get("guardian_pid")))
+        self.snapshot()
+        return True, "took over %s (pid %s), console and all" % (name, proc.pid)
 
     # ----------------------------------------------------------- control sock
 
@@ -1206,6 +1425,23 @@ class Guardian:
                     except ValueError:
                         conn.sendall(b'{"ok": false, "error": "not json"}\n')
                         continue
+                    if request.get("cmd") == "handover":
+                        # Has to be answered here and not in `handle()`: the
+                        # descriptors travel over this connection, and
+                        # `handle()` only ever sees the parsed request.
+                        reply = self.hand_over(conn)
+                        if reply.get("ok"):
+                            # The answer already went out WITH the descriptors.
+                            # Sending it again would raise on a connection the
+                            # other side has closed, and that exception used to
+                            # eat the shutdown below: the old guardian handed
+                            # over its console and then stayed up forever.
+                            threading.Thread(target=self.shutdown,
+                                             kwargs={"stop_processes": False},
+                                             daemon=True).start()
+                        else:
+                            conn.sendall((json.dumps(reply) + "\n").encode())
+                        continue
                     if request.get("cmd") == "tail":
                         tailing = True
                         with self.listeners_lock:
@@ -1282,11 +1518,28 @@ class Guardian:
         self.snapshot()
         self.stopping.set()
 
-    def run(self, start_now=True):
-        """Foreground on purpose: inside a container the runtime IS the process."""
-        got_it, holder = self.claim()
-        if not got_it:
-            return 1, "another guardian holds this server (pid %s)" % (holder or "?")
+    def run(self, start_now=True, take_over=False):
+        """Foreground on purpose: inside a container the runtime IS the process.
+
+        With `take_over`, the guardian already running here is asked for its
+        server first: the world keeps playing while the runtime under it is
+        replaced. If there is nobody to take over from, or the handover fails,
+        this says so and starts normally, because an upgrade that refuses to
+        boot is worse than one that restarts.
+        """
+        inherited = []
+        if take_over:
+            ok, message = self.take_over()
+            self.log("handover: " + message)
+            if ok:
+                inherited = [name for name, proc in self.watched.items()
+                             if proc.owned and proc.stdin]
+            else:
+                print(message, flush=True)
+        if not inherited:
+            got_it, holder = self.claim()
+            if not got_it:
+                return 1, "another guardian holds this server (pid %s)" % (holder or "?")
 
         def bye(signum, _frame):
             self.log("got %s" % signal.Signals(signum).name)
@@ -1296,7 +1549,11 @@ class Guardian:
         signal.signal(signal.SIGTERM, bye)
 
         self.log("guardian up, pid %d, root %s" % (os.getpid(), self.root))
-        recovered = self.recover()
+        # Anything inherited is already running AND already ours, console
+        # included. Recovering it again would downgrade it to "adopted, no
+        # console", which is exactly what the handover was for.
+        recovered = list(inherited) + [n for n in self.recover()
+                                       if n not in inherited]
         thread = threading.Thread(target=self.serve, daemon=True)
         thread.start()
         if self.timers or self.storage:

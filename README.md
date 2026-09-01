@@ -325,6 +325,30 @@ them.
 Every command takes `-n` to say what it would do and change nothing, and `-y` to
 answer yes to everything (for scripts and cron).
 
+### Replacing the guardian without stopping the world
+
+The server already survived its guardian dying. What it did not survive was an
+*upgrade*: the next guardian could only adopt what it found, and an adopted
+server has no console, so updating the runtime cost a restart.
+
+```sh
+w4ve run --take-over        # take the running server from the guardian that has it
+```
+
+The two ends of the console move across the control socket with `SCM_RIGHTS`,
+which duplicates them in the receiver, and the old guardian then stands down
+without touching anything it was watching. **The pid never changes**, and that
+is the assertion the test is built around.
+
+- **It moves one console.** One socket message carries one array of
+  descriptors, and pairing several back up with the right process is guesswork
+  this refuses to do.
+- **Finding nobody is not a failure.** It says so and starts normally, because
+  an upgrade that refuses to boot is worse than one that restarts.
+- **The inherited process is not our child**, so there is no exit code to read
+  when it dies. The journal says `exit, code unknown` rather than inventing a
+  zero.
+
 ## The local API
 
 Something that is not the CLI can ask W4VE to do things. It listens on a **Unix
@@ -469,8 +493,6 @@ a line of this file quietly stops being true.
 - Run without Python in the container. The guardian is Python, so an image
   that is only Java (`yolks:java_21` and friends) cannot start it. An MCDR image
   already has both, because MCDR is Python too.
-- Update the guardian without restarting the server. The server survives the
-  guardian today, but it gets its console back on the next start W4VE does.
 - Reload a web server by itself. `w4ve http` writes the configuration and tells
   you the two commands; running them as root is your call.
 

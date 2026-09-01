@@ -1,6 +1,6 @@
 """Smallest possible guardian host, used by the tests and as an example.
 
-    python3 tests/guard.py <root> [--service NAME CMD...] -- <server command...>
+    python3 tests/guard.py <root> [--take-over] [--service NAME CMD...] -- <server command...>
 """
 
 import sys
@@ -14,6 +14,10 @@ import runtime  # noqa: E402
 def main(argv):
     root = argv[0]
     rest = argv[1:]
+    take_over = False
+    if rest and rest[0] == "--take-over":
+        take_over = True
+        rest = rest[1:]
     services = []
     while rest and rest[0] == "--service":
         rest = rest[1:]
@@ -33,7 +37,7 @@ def main(argv):
                             restart="never")
     for name, command in services:
         guardian.add_service(name, command, root, restart="on-failure")
-    code, message = guardian.run(start_now=bool(rest))
+    code, message = guardian.run(start_now=bool(rest), take_over=take_over)
     print(message)
     return code
 
