@@ -1,8 +1,8 @@
 # Cuánto MCDR hay que reimplementar, medido
 
-**Fecha:** 19 de agosto de 2026
+**Fecha:** 19 de agosto de 2026, **completado el 1 de septiembre**
 **Método:** `tools/mcdr_api_survey.py`, lectura estática con `ast`, sin ejecutar nada
-**Alcance:** seis de los ocho plugins de aceptación del manifiesto
+**Alcance:** los ocho plugins de aceptación del manifiesto, ya sin huecos
 **Para:** M4, compatibilidad MCDR
 
 El manifiesto acepta reemplazar MCDReforged con una condición: que los plugins
@@ -13,11 +13,16 @@ opinión. Esto lo cuenta.
 
 Para correr los plugins medidos, la capa de compatibilidad tiene que ofrecer:
 
-| Qué | Cuánto |
-| --- | ---: |
-| Nombres importables desde `mcdreforged` | 41 |
-| Métodos del `ServerInterface` | 23 |
-| Eventos de MCDR | 9 |
+| Qué | Con seis plugins | **Con los ocho** |
+| --- | ---: | ---: |
+| Nombres importables desde `mcdreforged` | 41 | **58** |
+| Métodos del `ServerInterface` | 23 | **28** |
+| Eventos de MCDR | 9 | **9** |
+
+La columna de la derecha es de la segunda medición, con los tres que faltaban.
+**Los eventos no se movieron**, y eso es el hallazgo: la superficie de eventos
+ya estaba entera con seis plugins, así que los tres que faltaban no podían
+traer un evento nuevo por mucho que se retrasaran.
 
 De los 23 métodos, **12 los pide más de un plugin** y son el núcleo:
 
@@ -51,11 +56,34 @@ on_server_start (1)  on_user_info (1)
 | DigAll | `CodeW4VE/DigAll` | repo propio |
 | Here | `TISUnion/Here` | uno de los `.py` de un archivo del smp |
 | MinecraftDataAPI | `Fallen-Breath/MinecraftDataAPI` | dependencia real de WhereIs |
+| WhereIs | `plugins/` del smp | traducido, y por eso el que más métodos suma |
+| Online | `plugins/` del smp | pequeño: cuatro métodos, dos eventos |
+| MultiRconAPI | `plugins/` del smp | el segundo que usa `mcdreforged.api.rcon` |
 
-Faltan tres de los ocho de aceptación: **WhereIs**, **Online** y el
-**MultiRconAPI**, que no aparecen en GitHub con una búsqueda directa. Están
-instalados en los servidores, así que se pueden medir desde ahí cuando toque:
-el script lee `.mcdr` y `.pyz` desde dentro sin instalarlos.
+**Los tres que faltaban, medidos el 1 de septiembre.** WhereIs, Online y
+MultiRconAPI no aparecen en GitHub con una búsqueda directa, así que se leyeron
+de donde sí están: el `plugins/` del smp, copiados tal cual y abiertos desde
+dentro sin instalarlos (`WhereIs-v2.2.2.mcdr`, `Online-v1.4.0.mcdr`,
+`MultiRconAPI-V2.0.1.pyz`).
+
+Suman **cinco métodos nuevos** y ni un evento:
+
+```
+get_mcdr_language        WhereIs
+get_plugin_metadata      WhereIs
+register_event_listener  WhereIs
+register_translation     WhereIs
+tr                       Online, WhereIs
+```
+
+**Los cinco ya estaban implementados** en la capa de compatibilidad, o sea que
+completar la medición no añadió trabajo: confirmó que no había ninguno
+escondido. Los tres son plugins pequeños y bien educados; el que marca el
+tamaño del trabajo sigue siendo PrimeBackup.
+
+Que WhereIs pida cuatro de los cinco tiene sentido y no es casualidad: es el
+único de los ocho que está traducido, y cuatro de esos métodos son el
+andamiaje de las traducciones.
 
 ## Tres cosas que salieron de medir en vez de suponer
 
