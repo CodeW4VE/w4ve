@@ -16,15 +16,38 @@ ok  primebackup  1.13.1-w4ve.1  (reload it in place)
 run `docker restart -t 60 smp` now? [y/N]
 ```
 
-Standard library only, one file, Python 3.8 or newer. Copy it to a server and it
-works. No pip, no virtualenv, nothing to install first.
+Standard library only. The complete runtime includes the catalog command,
+guardian, package manager, API, compatibility layer and plugin SDK. Installing
+only `w4ve.py` does not provide that runtime.
 
 ## Install
 
+The complete distribution is currently built from this checkout; a public
+runtime release is still pending. On Linux, with Python available:
+
 ```sh
-curl -O https://raw.githubusercontent.com/CodeW4VE/w4ve/main/w4ve.py
-chmod +x w4ve.py && sudo mv w4ve.py /usr/local/bin/w4ve
+python3 tools/build_distribution.py --out build/distribution
+python3 install.py --archive build/distribution/w4ve-0.3.0.tar.gz
+~/.local/bin/w4ve --help
 ```
+
+The archive contains all runtime modules and a SHA256 manifest. The installer
+validates it before activation, keeps versioned releases under
+`~/.local/share/w4ve/releases/` and atomically switches `~/.local/bin/w4ve`.
+Use `--prefix` and `--bin-dir` to choose other locations. It does not restart
+servers or install piece dependencies. Add the bin directory to your PATH.
+
+To reactivate a previously installed version:
+
+```sh
+python3 install.py --rollback 0.3.0
+```
+
+Rollback rechecks the installed files. It switches the runtime command; it does
+not roll back worlds, databases, piece configuration or a running guardian.
+The manifest verifies content integrity; verify the archive's provenance before
+installing it. Runtime operation, update recovery and installed-piece tests
+remain release gates; a successful `--help` is not that certification.
 
 ## Use
 
