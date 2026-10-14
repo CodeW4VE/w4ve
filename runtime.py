@@ -97,6 +97,15 @@ def alive(pid, starttime=None):
             return False
         if exc.errno != errno.EPERM:
             return False
+    # kill(pid, 0) also succeeds for an exited process awaiting reaping. This
+    # matters after handover: the new guardian is not the process's parent.
+    try:
+        process_stat = Path("/proc/%d/stat" % pid).read_text()
+        fields = process_stat[process_stat.rfind(")") + 1:].split()
+        if fields and fields[0] in ("Z", "X"):
+            return False
+    except (OSError, ValueError):
+        pass
     if starttime is None:
         return True
     seen = starttime_of(pid)
@@ -841,6 +850,7 @@ class Guardian:
         self.workers = None
         # The local API (M8), if this w4ve carries it and the server wants it.
         self.api = None
+        self.identity_services = set()
 
     # ------------------------------------------------------------------ setup
 
@@ -936,8 +946,23 @@ class Guardian:
 
     def add_service(self, name, command, cwd, restart="on-failure",
                     health=None, health_every=30, env=None, mcdr=False,
-                    stop_grace=SERVICE_GRACE, after=()):
+                    stop_grace=SERVICE_GRACE, after=(), w4ve_api=None):
         env = dict(env or {})
+        if w4ve_api is not None:
+            if w4ve_api != "identity":
+                raise ValueError("services may request only the identity API scope")
+            if (self.config.get("api") or {}).get("enabled") is False:
+                raise ValueError("identity service requires the local API, which is explicitly disabled")
+            sdk = Path(__file__).resolve().parent / "sdk" / "client"
+            if not (sdk / "w4ve_client.py").is_file():
+                raise ValueError("W4VE client SDK is missing from this runtime")
+            from api import Tokens
+            env["W4VE_IDENTITY_TOKEN"] = Tokens(self.root).service_identity(name)
+            env["W4VE_SERVER_ROOT"] = str(self.root)
+            env["W4VE_IDENTITY_ADDRESS"] = str((self.config.get("api") or {}).get("listen") or "")
+            existing = env.get("PYTHONPATH") or os.environ.get("PYTHONPATH")
+            env["PYTHONPATH"] = str(sdk) + (os.pathsep + existing if existing else "")
+            self.identity_services.add(name)
         if mcdr:
             # The service said it imports `mcdreforged`. ChatBridge's daemon
             # does, and it is not a plugin: it is a separate process started
@@ -1302,7 +1327,7 @@ class Guardian:
         kind of optional extra that has to prove it knows that.
         """
         section = self.config.get("api") or {}
-        if not section.get("enabled", False):
+        if not section.get("enabled", bool(self.identity_services)):
             return False, "the api is off for this server"
         try:
             from api import Api
@@ -1311,7 +1336,7 @@ class Guardian:
             return False, str(exc)
         instance = Api(self.root, guardian=self,
                        address=section.get("listen") or None,
-                       tokens_required=section.get("tokens"))
+                       tokens_required=True if self.identity_services else section.get("tokens"))
         ok, message = instance.start()
         self.log("api: " + message)
         if ok:
@@ -1391,6 +1416,8 @@ class Guardian:
             self.shutdown(stop_processes=False)
             raise
         os.chmod(str(self.sock_path), 0o660)
+        socket_info = self.sock_path.stat()
+        socket_identity = (socket_info.st_dev, socket_info.st_ino)
         server.listen(8)
         server.settimeout(0.5)
         self.log("control socket at %s" % self.sock_path)
@@ -1404,7 +1431,12 @@ class Guardian:
             threading.Thread(target=self._client, args=(conn,), daemon=True).start()
         server.close()
         if self.sock_path.exists():
-            self.sock_path.unlink()
+            try:
+                info = self.sock_path.stat()
+                if (info.st_dev, info.st_ino) == socket_identity:
+                    self.sock_path.unlink()
+            except FileNotFoundError:
+                pass
 
     def _client(self, conn):
         tailing = False
@@ -1563,6 +1595,8 @@ class Guardian:
             self.log("housekeeping: %d timers, %d storage areas"
                      % (len(self.timers), len(self.storage)))
 
+        # API-dependent services must find their authority before readiness checks.
+        self.start_api()
         if start_now:
             for name, proc in self.watched.items():
                 if name in recovered:
@@ -1580,7 +1614,6 @@ class Guardian:
         # is easier to give once it is.
         self.start_plugins()
         self.start_workers()
-        self.start_api()
 
         while not self.stopping.is_set():
             time.sleep(0.3)
@@ -1773,6 +1806,7 @@ def services_from(config):
             # MCDR the answer was to pip install all of MCDR on the machine to
             # get one class out of it.
             "mcdr": bool(entry.get("mcdr")),
+            "w4ve_api": entry.get("w4ve_api"),
         })
     return out
 

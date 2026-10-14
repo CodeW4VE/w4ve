@@ -38,10 +38,10 @@ def check(archive, tests_dir=None):
         if tests_dir is not None:
             environment = dict(os.environ)
             environment["PYTHONPATH"] = os.pathsep.join([str(release), str(release / "sdk/client"), str(tests_dir)])
-            for pattern in ("test_identity*.py", "test_api.py"):
+            for pattern in ("test_identity*.py", "test_api.py", "test_package.py"):
                 result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", str(tests_dir),
                                          "-p", pattern, "-v"], cwd=root, env=environment,
-                                        capture_output=True, text=True, timeout=60)
+                                        capture_output=True, text=True, timeout=90)
                 print(result.stdout, end="")
                 print(result.stderr, end="", file=sys.stderr)
                 if result.returncode:

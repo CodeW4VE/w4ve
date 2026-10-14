@@ -40,6 +40,7 @@ import socketserver
 import stat
 import threading
 import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -304,11 +305,44 @@ class Tokens:
     def __init__(self, root):
         self.path = Path(root) / "w4ve" / "api-tokens.json"
 
-    def _read(self):
+    def _read(self, strict=False):
         try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or any(not isinstance(entry, dict) for entry in data.values()):
+                raise ValueError("invalid token registry")
+            return data
+        except FileNotFoundError:
             return {}
+        except (OSError, ValueError):
+            if strict:
+                raise ValueError("cannot safely update token registry") from None
+            return {}
+
+    @contextmanager
+    def _locked(self):
+        """Serialize writers across CLI/guardian processes, including Windows."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self.path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"0")
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     def _write(self, data):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -327,21 +361,39 @@ class Tokens:
         if scope not in SCOPES:
             raise ValueError("scope is %r, not one of %s"
                              % (scope, ", ".join(SCOPES)))
+        with self._locked():
+            return self._issue(self._read(strict=True), name, scope)
+
+    def _issue(self, data, name, scope):
         token = secrets.token_urlsafe(32)
-        data = self._read()
         data[token] = {"name": name, "scope": scope,
                        "issued": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                                time.gmtime())}
         self._write(data)
         return token
 
+    def service_identity(self, name):
+        """Reuse one least-privilege token per declared service, without escalation."""
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", name):
+            raise ValueError("invalid service name")
+        owner = "service:" + name
+        with self._locked():
+            data = self._read(strict=True)
+            found = [(token, entry) for token, entry in data.items() if entry.get("name") == owner]
+            if found:
+                if len(found) != 1 or found[0][1].get("scope") != "identity":
+                    raise ValueError("service token registry conflicts; revoke the service token first")
+                return found[0][0]
+            return self._issue(data, owner, "identity")
+
     def revoke(self, name):
-        data = self._read()
-        gone = [t for t, entry in data.items() if entry.get("name") == name]
-        for token in gone:
-            data.pop(token)
-        if gone:
-            self._write(data)
+        with self._locked():
+            data = self._read(strict=True)
+            gone = [t for t, entry in data.items() if entry.get("name") == name]
+            for token in gone:
+                data.pop(token)
+            if gone:
+                self._write(data)
         return len(gone)
 
     def listing(self):
@@ -514,6 +566,7 @@ class Api:
         self.httpd = None
         self.thread = None
         self.socket_path = self.root / "w4ve" / "run" / "api.sock"
+        self.socket_identity = None
         # Long work lives here and nowhere else: jobs are in memory on
         # purpose. Surviving a restart would mean a second place where the
         # truth about a server is written down, and there is already one.
@@ -538,6 +591,8 @@ class Api:
                 # story for a Unix socket, so it is set explicitly rather than
                 # left to whatever umask happens to be in force.
                 os.chmod(self.socket_path, 0o600)
+                info = self.socket_path.stat()
+                self.socket_identity = (info.st_dev, info.st_ino)
         except OSError as exc:
             return False, "the API could not listen: %s" % exc
         self.httpd.api = self
@@ -558,7 +613,9 @@ class Api:
             self.httpd = None
         if not self.address and self.socket_path.exists():
             try:
-                self.socket_path.unlink()
+                info = self.socket_path.stat()
+                if (info.st_dev, info.st_ino) == self.socket_identity:
+                    self.socket_path.unlink()
             except OSError:
                 pass
 

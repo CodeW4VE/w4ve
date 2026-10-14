@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 
 import package  # noqa: E402
 import w4ve  # noqa: E402
+ROOT = Path(w4ve.__file__).resolve().parent
 
 
 def manifest(**overrides):
@@ -158,6 +159,7 @@ class InstallCase(unittest.TestCase):
             {"kind": "service", "name": "thing",
              "command": ["python3", "app.py"], "cwd": "w4ve/services/thing",
              "restart": "on-failure", "reload": "hot",
+             "w4ve_api": "identity",
              "python": {"requires": ["json"]},
              "health": {"http": "http://127.0.0.1:9/health", "every": 15}},
         ])
@@ -179,6 +181,7 @@ class InstallCase(unittest.TestCase):
         self.assertEqual(service["command"], ["python3", "app.py"])
         self.assertEqual(service["health_url"], "http://127.0.0.1:9/health")
         self.assertEqual(service["python_requires"], ["json"])
+        self.assertEqual(service["w4ve_api"], "identity")
 
     def test_removing_takes_out_what_it_put_in_and_leaves_the_rest(self):
         data = manifest(id="withservice", components=[
@@ -441,8 +444,10 @@ class EndToEndCase(unittest.TestCase):
         pkg, _ = package.pack(folder, self.tmp)
 
         cli = str(ROOT / "w4ve.py")
+        index = self.tmp / "index.json"
+        index.write_text(json.dumps({"pieces": {}}))
         install = subprocess.run(
-            [sys.executable, cli, "--dir", str(self.tmp), "install", str(pkg), "-y"],
+            [sys.executable, cli, "--dir", str(self.tmp), "--index", str(index), "install", str(pkg), "-y"],
             capture_output=True, text=True)
         self.assertEqual(install.returncode, 0, install.stdout + install.stderr)
         self.assertTrue((self.tmp / "server/mods/served-1.0.0+1.21.jar").exists())
@@ -471,7 +476,7 @@ class EndToEndCase(unittest.TestCase):
             self.assertEqual(response.status, 200)
 
         remove = subprocess.run(
-            [sys.executable, cli, "--dir", str(self.tmp), "remove", "served", "-y"],
+            [sys.executable, cli, "--dir", str(self.tmp), "--index", str(index), "remove", "served", "-y"],
             capture_output=True, text=True)
         self.assertEqual(remove.returncode, 0, remove.stdout + remove.stderr)
         self.assertFalse((self.tmp / "server/mods/served-1.0.0+1.21.jar").exists())

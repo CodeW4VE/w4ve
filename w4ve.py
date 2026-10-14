@@ -677,6 +677,8 @@ class Server:
         self.config = read_toml(self.config_path)
 
     def remove_service(self, name):
+        from api import Tokens
+        Tokens(self.root).revoke("service:" + name)
         self._remove_block("services", name)
 
     def remove_watch(self, name):
@@ -3726,15 +3728,18 @@ def runtime_pieces(server, rt):
                         f"{', '.join(sorted(set(still)))}")
                 note(f"  run `w4ve configure {pid}`" if pid else "")
                 continue
-        guardian.add_service(service["name"], service["command"],
-                             server.root / service["cwd"], service["restart"],
-                             health=service.get("health"),
-                             health_every=service.get("health_every", 30),
-                             env=environment,
-                             mcdr=service.get("mcdr", False),
-                             stop_grace=service.get("stop_grace",
-                                                    rt.SERVICE_GRACE),
-                             after=service.get("after") or ())
+        try:
+            guardian.add_service(service["name"], service["command"],
+                                 server.root / service["cwd"], service["restart"],
+                                 health=service.get("health"),
+                                 health_every=service.get("health_every", 30),
+                                 env=environment,
+                                 mcdr=service.get("mcdr", False),
+                                 w4ve_api=service.get("w4ve_api"),
+                                 stop_grace=service.get("stop_grace", rt.SERVICE_GRACE),
+                                 after=service.get("after") or ())
+        except (ValueError, OSError) as exc:
+            problem(f"{service['name']} could not be configured: {exc}")
     for timer in rt.timers_from(server.config):
         pid = owner_of(server, "timer", timer["name"])
         timer, answers = with_answers(server, pid, timer)

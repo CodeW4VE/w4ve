@@ -63,14 +63,33 @@ The public client SDK provides identity_session, identity_inspect and
 identity_authorize. WaveChat uses that SDK over local API, rather than reading
 private authority files. Services must fail closed if W4VE is unavailable.
 
-Validated 14 October 2026: 19 authority/API/CLI tests on Windows loopback TCP
+Validated 14 October 2026: 20 authority/API/CLI tests on Windows loopback TCP
 and from an installed distribution on isolated Linux; 24 existing API tests
 including real Unix sockets pass on Linux. No real player pairing or Discord
 linking tested. Windows Unix server support is unavailable in socketserver;
 the API reports that limitation and can be tested over token-protected loopback.
+
 # Sonda de servicio
 
 `POST /v1/identity/health` (SDK `identity_health()`) exige scope `identity` o
 `admin`, incluso cuando el API local tiene tokens desactivados. Devuelve
 `ok`, `service: identity`, `schema: 1`, sin credenciales ni datos de jugadores.
 Confirma acceso al servicio; no certifica emisores, grants, guardian o Minecraft.
+
+## Managed service credential
+
+A service component may declare `w4ve_api: identity`. The installed guardian
+supplies its SDK through PYTHONPATH, an absolute W4VE_SERVER_ROOT, the configured
+API address and W4VE_IDENTITY_TOKEN. The credential stays out of TOML and process
+commands. Other operator scopes cannot be requested through this declaration.
+The API starts before services and requires tokens on all protected routes when
+identity services are present, including Unix sockets. Existing anonymous local
+API consumers then need their own credentials. An explicitly disabled API is
+respected; only the dependent service is rejected during CLI setup.
+
+Tokens.service_identity reuses one identity token named service:<service>, with
+cross-process writer locking. Ambiguous names, a different scope or corrupt
+registry fail without overwriting existing data. Removing a service revokes its
+token. Manual revocation denies the running process; a later restart creates a
+new credential if that service is still declared. This is API capability control,
+not an operating-system sandbox for services sharing the guardian's user.
