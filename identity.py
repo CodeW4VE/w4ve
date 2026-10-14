@@ -69,6 +69,9 @@ class Authority:
                     PRIMARY KEY(community,audience,resource,subject,operation));
                 CREATE TABLE IF NOT EXISTS identity_blocked (
                     community TEXT NOT NULL,subject TEXT NOT NULL,PRIMARY KEY(community,subject));
+                CREATE TABLE IF NOT EXISTS identity_bindings (
+                    owner TEXT PRIMARY KEY,audience TEXT NOT NULL,community TEXT NOT NULL,
+                    instance TEXT NOT NULL,resources TEXT NOT NULL);
             """)
             db.execute("BEGIN IMMEDIATE")
             meta = dict(db.execute("SELECT key,value FROM identity_meta"))
@@ -108,6 +111,57 @@ class Authority:
             db.execute("DELETE FROM identity_sessions WHERE community=? AND instance=?", (community, instance))
             self._changed(db, community)
         return {"community": community, "instance": instance, "secret": secret, "enabled": enabled}
+
+    @staticmethod
+    def normalized_resources(resources):
+        if not isinstance(resources, list) or not 1 <= len(resources) <= 64:
+            raise ValueError("a bounded resource policy is required")
+        normalized = []
+        for resource in resources:
+            if not isinstance(resource, dict) or set(resource) != {"id", "name", "operations"}:
+                raise ValueError("invalid resource declaration")
+            rid = key(resource["id"])
+            name, operations = resource["name"], resource["operations"]
+            if not isinstance(name, str) or not 1 <= len(name) <= 128:
+                raise ValueError("invalid resource name")
+            if not isinstance(operations, list) or not 1 <= len(operations) <= 64:
+                raise ValueError("invalid resource operations")
+            normalized.append({"id": rid, "name": name,
+                               "operations": sorted(set(key(op) for op in operations))})
+        if len({item["id"] for item in normalized}) != len(normalized):
+            raise ValueError("duplicate resource")
+        if len(json.dumps(normalized).encode("utf-8")) > 12288:
+            raise ValueError("resource policy is too large")
+        return normalized
+
+    def provision_binding(self, owner, audience, resources):
+        """Local operator setup. Existing policy/issuer revocations are never reset."""
+        key(owner)
+        key(audience)
+        normalized = self.normalized_resources(resources)
+        encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            binding = db.execute("SELECT * FROM identity_bindings WHERE owner=?", (owner,)).fetchone()
+            if binding is not None:
+                if binding["audience"] != audience or binding["resources"] != encoded:
+                    raise ValueError("binding policy changed; explicit migration required")
+                issuer = db.execute("SELECT * FROM identity_instances WHERE community=? AND instance=?",
+                                    (binding["community"], binding["instance"])).fetchone()
+                if issuer is None or not issuer["enabled"]:
+                    raise ValueError("paired instance is disabled or missing")
+                return {"community": issuer["community"], "instance": issuer["instance"],
+                        "secret": issuer["secret"], "resources": normalized}
+            community, instance, secret = "c_" + uuid.uuid4().hex, "i_" + uuid.uuid4().hex, secrets.token_hex(32)
+            db.execute("INSERT INTO identity_instances VALUES (?,?,?,1)", (community, instance, secret))
+            db.execute("INSERT INTO identity_bindings VALUES (?,?,?,?,?)",
+                       (owner, audience, community, instance, encoded))
+            for resource in normalized:
+                db.executemany("INSERT INTO identity_grants VALUES (?,?,?,?,?)",
+                               [(community, audience, resource["id"], "*", op)
+                                for op in resource["operations"]])
+            self._changed(db, community)
+            return {"community": community, "instance": instance, "secret": secret, "resources": normalized}
 
     def set_grants(self, community, audience, resource, subject, operations):
         for value in (community, audience, resource):

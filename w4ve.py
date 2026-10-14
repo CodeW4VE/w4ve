@@ -2589,8 +2589,15 @@ def cmd_configure(args, index):
     if args.show:
         return _show_settings(server, pid, declarations, values)
 
+    if args.dry_run and not args.set:
+        say(f"would configure {pid}; no settings, grants or pairing files changed")
+        return 0
+
     if args.set:
-        return _set_settings(server, pid, declarations, values, args)
+        result = _set_settings(server, pid, declarations, values, args)
+        if result == 0 and not args.dry_run and not missing_settings(server, pid):
+            return _configure_pairing(server, pid, entry)
+        return result
 
     # An application id in the manifest means the piece can print its own
     # invite link, which is the step people get wrong when they do it by hand.
@@ -2633,8 +2640,28 @@ def cmd_configure(args, index):
     say(Out.dim(f"  values in w4ve.toml under [settings.{pid}]"))
     if any(d.secret for d in declarations):
         say(Out.dim("  secrets in w4ve/secrets.json (mode 600)"))
+    paired = _configure_pairing(server, pid, entry)
+    if paired:
+        return paired
     for line in (entry.get("guide") or []):
         say(f"  {line}")
+    return 0
+
+
+def _configure_pairing(server, pid, entry):
+    if entry.get("pairing") is None:
+        return 0
+    from pairing import configure
+    try:
+        result = configure(server, pid, entry["pairing"], server.settings_of(pid))
+    except (ValueError, OSError) as exc:
+        problem(f"{pid} pairing is not ready: {exc}")
+        return 1
+    if result["enabled"]:
+        say(f"{Out.ok('paired')}  this Minecraft instance and the local service")
+        for resource in result["resources"]:
+            say(f"  {resource['name']}: shared by the admitted players")
+        say(Out.dim("  restart the companion to load its pairing; signing secrets are never printed"))
     return 0
 
 
@@ -3718,6 +3745,15 @@ def runtime_pieces(server, rt):
         service, answers = with_answers(server, pid, service)
         environment = dict(answers)
         environment.update(service.get("env") or {})
+        binding = (server.state["pieces"].get(pid) or {}).get("pairing") if pid else None
+        if binding and service.get("w4ve_api") == "identity":
+            from pairing import contained, declaration
+            try:
+                spec = declaration(binding)
+                environment["W4VE_PAIRING_CONFIG"] = str(contained(server.root, spec["consumer_config"]))
+            except ValueError as exc:
+                problem(f"{service['name']} pairing is invalid: {exc}")
+                continue
         if module:
             still = module.unresolved([service["command"], environment])
             if still:

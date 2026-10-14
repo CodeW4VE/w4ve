@@ -145,6 +145,16 @@ class Manifest:
             out.append("no components: the package would install nothing")
 
         seen = set()
+        if self.data.get("pairing") is not None:
+            try:
+                from pairing import declaration
+                spec = declaration(self.data["pairing"])
+                declared_settings = {item.name: item.type for item in self.settings}
+                if (declared_settings.get(spec["enabled_setting"]) != "bool"
+                        or declared_settings.get(spec["url_setting"]) != "url"):
+                    out.append("pairing requires declared bool enable and url settings")
+            except (ValueError, TypeError, KeyError):
+                out.append("invalid pairing declaration")
         for declaration in self.settings:
             out.extend(declaration.problems())
             if declaration.name in seen:
@@ -556,6 +566,8 @@ class Install:
                   "settings": self.manifest.data.get("settings") or [],
                   "guide": self.manifest.guide,
                   "package": self.package.name}
+        if self.manifest.data.get("pairing") is not None:
+            record["pairing"] = self.manifest.data["pairing"]
         pending = False
         self._journal({"op": "begin", "piece": self.manifest.id,
                        "version": self.manifest.version,

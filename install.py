@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath
 
 REQUIRED = {"w4ve.py", "runtime.py", "package.py", "worker.py", "api.py",
             "piecesettings.py", "discover.py", "rcon.py", "pluginhost.py", "identity.py",
-            "sdk/conformance.py", "sdk/python/w4ve_plugin/__init__.py",
+            "pairing.py", "sdk/conformance.py", "sdk/python/w4ve_plugin/__init__.py",
             "mcdr/__init__.py"}
 VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?")
 
