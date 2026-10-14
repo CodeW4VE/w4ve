@@ -68,6 +68,12 @@ ROUTES = {
     ("POST", "/v1/jobs"): "write",
     ("GET", "/v1/jobs/{id}"): "read",
     ("POST", "/v1/jobs/{id}/cancel"): "write",
+    ("POST", "/v1/identity/instances"): "admin",
+    ("POST", "/v1/identity/grants"): "admin",
+    ("POST", "/v1/identity/block"): "admin",
+    ("POST", "/v1/identity/session"): "write",
+    ("POST", "/v1/identity/inspect"): "read",
+    ("POST", "/v1/identity/authorize"): "read",
 }
 
 # The two routes above with an `{id}` in them, as (method, prefix, suffix).
@@ -504,6 +510,8 @@ class Api:
         # purpose. Surviving a restart would mean a second place where the
         # truth about a server is written down, and there is already one.
         self.jobs = Jobs(self)
+        self._authority = None
+        self._authority_lock = threading.Lock()
 
     # ------------------------------------------------------------- lifetime
 
@@ -548,8 +556,43 @@ class Api:
 
     # ------------------------------------------------------------ answering
 
+    def _identity(self, path, body):
+        from identity import Authority, IdentityDenied
+        if not isinstance(body, dict):
+            return 400, {"ok": False, "error": "identity request must be an object"}
+        with self._authority_lock:
+            if self._authority is None:
+                self._authority = Authority(self.root / "w4ve" / "identity" / "authority.sqlite3")
+        authority = self._authority
+        try:
+            if path == "/v1/identity/instances":
+                result = authority.register_instance(body["community"], body["instance"],
+                                                     body.get("secret"), body.get("enabled", True))
+            elif path == "/v1/identity/grants":
+                authority.set_grants(body["community"], body["audience"], body["resource"],
+                                     body["subject"], body["operations"])
+                result = {}
+            elif path == "/v1/identity/block":
+                authority.set_blocked(body["community"], body["subject"], body["blocked"])
+                result = {}
+            elif path == "/v1/identity/session":
+                result = authority.create_session(body["proof"], body["audience"])
+            elif path == "/v1/identity/inspect":
+                result = authority.inspect(body["session"], body["audience"])
+            elif path == "/v1/identity/authorize":
+                result = authority.authorize(body["session"], body["audience"], body["resource"], body["operation"])
+            else:
+                return 404, {"ok": False, "error": "unknown identity operation"}
+            return 200, {"ok": True, **result}
+        except IdentityDenied:
+            return 401, {"ok": False, "error": "identity unavailable"}
+        except (ValueError, KeyError, TypeError):
+            return 400, {"ok": False, "error": "invalid identity request"}
+
     def run(self, route, body, job_id=None):
         method, path = route
+        if path.startswith("/v1/identity/"):
+            return self._identity(path, body)
         if path == "/v1/hello":
             return 200, {"ok": True, "software": "w4ve", "api": VERSION,
                          "root": str(self.root),
