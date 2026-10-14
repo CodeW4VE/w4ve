@@ -109,6 +109,10 @@ class W4VE:
 
     # --------------------------------------------------------------- asking
 
+    def identity_health(self):
+        """Probe the identity service using its scoped service credential."""
+        return self.call("POST", "/v1/identity/health", {})
+
     def hello(self):
         """What this is and what it can do. The only route with no token."""
         return self.call("GET", "/v1/hello")

@@ -68,3 +68,9 @@ and from an installed distribution on isolated Linux; 24 existing API tests
 including real Unix sockets pass on Linux. No real player pairing or Discord
 linking tested. Windows Unix server support is unavailable in socketserver;
 the API reports that limitation and can be tested over token-protected loopback.
+# Sonda de servicio
+
+`POST /v1/identity/health` (SDK `identity_health()`) exige scope `identity` o
+`admin`, incluso cuando el API local tiene tokens desactivados. Devuelve
+`ok`, `service: identity`, `schema: 1`, sin credenciales ni datos de jugadores.
+Confirma acceso al servicio; no certifica emisores, grants, guardian o Minecraft.

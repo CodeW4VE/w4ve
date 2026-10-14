@@ -74,6 +74,7 @@ ROUTES = {
     ("POST", "/v1/identity/session"): "identity",
     ("POST", "/v1/identity/inspect"): "identity",
     ("POST", "/v1/identity/authorize"): "identity",
+    ("POST", "/v1/identity/health"): "identity",
 }
 
 # The two routes above with an `{id}` in them, as (method, prefix, suffix).
@@ -572,7 +573,9 @@ class Api:
                 self._authority = Authority(self.root / "w4ve" / "identity" / "authority.sqlite3")
         authority = self._authority
         try:
-            if path == "/v1/identity/instances":
+            if path == "/v1/identity/health":
+                result = {"service": "identity", "schema": 1}
+            elif path == "/v1/identity/instances":
                 result = authority.register_instance(body["community"], body["instance"],
                                                      body.get("secret"), body.get("enabled", True))
             elif path == "/v1/identity/grants":

@@ -56,6 +56,17 @@ class IdentityApiTests(unittest.TestCase):
         with self.assertRaises(Denied):
             self.clients["identity"].status()
 
+    def test_identity_health_requires_scoped_credential(self):
+        for client in (self.anonymous, self.clients["read"], self.clients["write"]):
+            with self.assertRaises(Denied):
+                client.identity_health()
+        for scope in ("identity", "admin"):
+            self.assertEqual(self.clients[scope].identity_health(),
+                             {"ok": True, "service": "identity", "schema": 1})
+        self.api.tokens_required = False
+        with self.assertRaises(Denied):
+            self.anonymous.identity_health()
+
     def test_complete_sdk_session_grant_revoke_path(self):
         token = self.mint()
         service = self.clients["identity"]
