@@ -165,7 +165,7 @@ class Authority:
                     or expires - issued > self.PROOF_LIFETIME):
                 raise ValueError("expired or unbounded proof")
             mac = unpack(signature)
-        except (ValueError, KeyError, TypeError, AttributeError):
+        except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
             raise IdentityDenied("proof refused") from None
         subject = "minecraft:" + player
         token = secrets.token_urlsafe(32)

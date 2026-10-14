@@ -392,6 +392,12 @@ w4ve api get status                      # ask a route from the command line
 curl --unix-socket <server>/w4ve/run/api.sock http://localhost/v1/status
 ```
 
+Player identity integrations use `w4ve api token wavechat --scope identity`.
+That service scope can exchange paired-instance proofs and inspect/authorize
+player sessions, but cannot read logs or stop servers. Pairing instances,
+changing grants and blocking accounts require an `admin` token. Identity routes
+require a token even when the Unix API's other local routes do not.
+
 ```python
 from w4ve_client import W4VE
 

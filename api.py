@@ -45,10 +45,10 @@ from pathlib import Path
 
 VERSION = 1
 
-# What a token may do. Cumulative on purpose: `write` implies `read`, because
+# Operator scopes are cumulative: `write` implies `read`, because
 # a client allowed to stop a server and not to look at it is a client that has
-# to guess.
-SCOPES = ("read", "write", "admin")
+# to guess. `identity` is a separate service scope, never server control.
+SCOPES = ("read", "write", "admin", "identity")
 
 # Every operation, and the least scope it needs. A method that is not in here
 # does not exist, which is the only way to be sure the list is the whole list.
@@ -71,9 +71,9 @@ ROUTES = {
     ("POST", "/v1/identity/instances"): "admin",
     ("POST", "/v1/identity/grants"): "admin",
     ("POST", "/v1/identity/block"): "admin",
-    ("POST", "/v1/identity/session"): "write",
-    ("POST", "/v1/identity/inspect"): "read",
-    ("POST", "/v1/identity/authorize"): "read",
+    ("POST", "/v1/identity/session"): "identity",
+    ("POST", "/v1/identity/inspect"): "identity",
+    ("POST", "/v1/identity/authorize"): "identity",
 }
 
 # The two routes above with an `{id}` in them, as (method, prefix, suffix).
@@ -373,7 +373,12 @@ def allowed(scope, needed):
         return True
     if scope not in SCOPES or needed not in SCOPES:
         return False
-    return SCOPES.index(scope) >= SCOPES.index(needed)
+    if scope == "admin":
+        return True
+    if scope == "identity" or needed == "identity":
+        return scope == needed
+    hierarchy = ("read", "write", "admin")
+    return hierarchy.index(scope) >= hierarchy.index(needed)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -449,7 +454,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         needed = ROUTES[route]
         scope = "admin"
-        if needed is not None and self.server.api.tokens_required:
+        if needed is not None and (self.server.api.tokens_required or path.startswith("/v1/identity/")):
             entry = self.server.api.tokens.check(self._token())
             if entry is None:
                 # 401 and not 403: the difference is "who are you" versus "you
@@ -476,16 +481,18 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, payload)
 
 
-class _UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-    daemon_threads = True
-    allow_reuse_address = True
+if hasattr(socketserver, "UnixStreamServer"):
+    class _UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+        allow_reuse_address = True
 
-    def get_request(self):
-        request, _client = super().get_request()
-        # BaseHTTPRequestHandler wants an address; a Unix socket has none.
-        return request, ("local", 0)
-
-
+        def get_request(self):
+            request, _client = super().get_request()
+            return request, ("local", 0)
+else:
+    class _UnixServer:
+        def __init__(self, *args, **kwargs):
+            raise OSError("Unix API sockets are unavailable here; use loopback TCP with scoped tokens")
 class _TcpServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True

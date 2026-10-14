@@ -4051,7 +4051,7 @@ def build_parser():
                               "revoke: take one away. get: ask a route")
     api_cmd.add_argument("name", nargs="?",
                          help="the token's name, or the route for `get`")
-    api_cmd.add_argument("--scope", default="read", choices=["read", "write", "admin"],
+    api_cmd.add_argument("--scope", default="read", choices=["read", "write", "admin", "identity"],
                          help="what the token may do (default: read)")
 
     dev = add("dev", cmd_dev, "write a plugin: scaffold it, check it, try it")

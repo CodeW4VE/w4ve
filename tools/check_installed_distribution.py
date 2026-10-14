@@ -2,6 +2,7 @@
 """Smoke-test a complete archive in a temporary prefix, without server access."""
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -11,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import install
 
 
-def check(archive):
+def check(archive, tests_dir=None):
     version, _, _ = install.read_archive(archive)
     with tempfile.TemporaryDirectory(prefix="w4ve-dist-check-") as scratch:
         root = Path(scratch)
@@ -25,7 +26,7 @@ def check(archive):
         imports = (
             "import sys; sys.path[:0] = " + repr([str(release), str(release / "sdk/python")])
             + "; import runtime, package, worker, api, piecesettings, discover, rcon, pluginhost;"
-            + " import mcdr, w4ve_plugin; print('installed modules imported')"
+            + " import identity, mcdr, w4ve_plugin; print('installed modules imported')"
         )
         result = subprocess.run([sys.executable, "-I", "-c", imports], cwd=root,
                                 capture_output=True, text=True, timeout=20)
@@ -34,6 +35,17 @@ def check(archive):
         install.install(archive, prefix, bin_dir)
         install.verified_release(release, version)
         install.activate(release, bin_dir)
+        if tests_dir is not None:
+            environment = dict(os.environ)
+            environment["PYTHONPATH"] = os.pathsep.join([str(release), str(release / "sdk/client"), str(tests_dir)])
+            for pattern in ("test_identity*.py", "test_api.py"):
+                result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", str(tests_dir),
+                                         "-p", pattern, "-v"], cwd=root, env=environment,
+                                        capture_output=True, text=True, timeout=60)
+                print(result.stdout, end="")
+                print(result.stderr, end="", file=sys.stderr)
+                if result.returncode:
+                    raise AssertionError("installed API/identity tests failed")
         old = launcher.read_bytes()
         original = release / "runtime.py"
         copy = root / "runtime-copy.py"
@@ -50,11 +62,13 @@ def check(archive):
             raise AssertionError("refused activation changed launcher")
     return {"version": version, "launcher": "passed", "installed_imports": "passed",
             "idempotent_install": "passed", "reactivation": "passed",
-            "symlink_refusal": "passed", "server_operations": "not tested"}
+            "symlink_refusal": "passed", "identity_api_tests": "passed" if tests_dir is not None else "not tested",
+            "server_operations": "not tested"}
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
+    parser.add_argument("--tests-dir", type=Path, help="trusted tests to run against installed runtime")
     args = parser.parse_args()
-    print(json.dumps(check(args.archive), sort_keys=True))
+    print(json.dumps(check(args.archive, args.tests_dir), sort_keys=True))

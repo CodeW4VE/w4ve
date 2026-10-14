@@ -187,6 +187,18 @@ class W4VE:
                                 % (job_id, timeout))
             time.sleep(every)
 
+    # ---------------------------------------------------------- player identity
+
+    def identity_session(self, proof, audience):
+        return self.call("POST", "/v1/identity/session", {"proof": proof, "audience": audience})
+
+    def identity_inspect(self, session, audience):
+        return self.call("POST", "/v1/identity/inspect", {"session": session, "audience": audience})
+
+    def identity_authorize(self, session, audience, resource, operation):
+        return self.call("POST", "/v1/identity/authorize",
+                         {"session": session, "audience": audience, "resource": resource, "operation": operation})
+
     # ------------------------------------------------------------ shortcuts
 
     def running(self):
