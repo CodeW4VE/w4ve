@@ -97,6 +97,13 @@ not an operating-system sandbox for services sharing the guardian's user.
 
 ## Paired instance transport role (14 October 2026)
 
+Player proofs may include a canonical lowercase UUID-hex `connection` context.
+The paired issuer signs it alongside the account; it persists in the player
+session and inspection response. Legacy sessions/proofs use an empty context.
+The additive database upgrade preserves them. It is a connection correlation
+claim from the trusted issuer, not an independent online-presence check, a new
+account or an extra permission. Never accept a context from unsigned player JSON.
+
 `w4ve-instance1.<base64url JSON>.<HMAC-SHA256>` uses the paired issuer secret,
 but has exactly community/instance/audience/issued/expires/nonce claims and no
 player UUID or display name. It cannot be exchanged as `w4ve1` player proof.

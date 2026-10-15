@@ -62,7 +62,8 @@ class Authority:
                     expires INTEGER NOT NULL,PRIMARY KEY(community,instance,nonce));
                 CREATE TABLE IF NOT EXISTS identity_sessions (
                     digest TEXT PRIMARY KEY,community TEXT NOT NULL,instance TEXT NOT NULL,
-                    subject TEXT NOT NULL,name TEXT NOT NULL,audience TEXT NOT NULL,expires INTEGER NOT NULL);
+                    subject TEXT NOT NULL,name TEXT NOT NULL,audience TEXT NOT NULL,expires INTEGER NOT NULL,
+                    connection TEXT NOT NULL DEFAULT '');
                 CREATE TABLE IF NOT EXISTS identity_grants (
                     community TEXT NOT NULL,audience TEXT NOT NULL,resource TEXT NOT NULL,
                     subject TEXT NOT NULL,operation TEXT NOT NULL,
@@ -80,6 +81,8 @@ class Authority:
                     PRIMARY KEY(community,instance,audience,resource));
             """)
             db.execute("BEGIN IMMEDIATE")
+            if "connection" not in {row[1] for row in db.execute("PRAGMA table_info(identity_sessions)")}:
+                db.execute("ALTER TABLE identity_sessions ADD COLUMN connection TEXT NOT NULL DEFAULT ''")
             binding_columns = {row[1] for row in db.execute("PRAGMA table_info(identity_bindings)")}
             if "transport_initialized" not in binding_columns:
                 db.execute("ALTER TABLE identity_bindings ADD COLUMN transport_initialized INTEGER NOT NULL DEFAULT 0")
@@ -327,6 +330,9 @@ class Authority:
             if payload["audience"] != audience:
                 raise ValueError("wrong audience")
             player = uuid.UUID(payload["uuid"]).hex
+            connection = payload.get("connection", "")
+            if not isinstance(connection, str) or (connection and not re.fullmatch(r"[0-9a-f]{32}", connection)):
+                raise ValueError("invalid connection context")
             name, nonce = payload["name"], key(payload["nonce"])
             if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,16}", name):
                 raise ValueError("invalid player name")
@@ -360,8 +366,8 @@ class Authority:
             except sqlite3.IntegrityError:
                 raise IdentityDenied("proof refused") from None
             until = now + self.SESSION_LIFETIME
-            db.execute("INSERT INTO identity_sessions VALUES (?,?,?,?,?,?,?)",
-                       (hashlib.sha256(token.encode()).hexdigest(), community, instance, subject, name, audience, until))
+            db.execute("INSERT INTO identity_sessions(digest,community,instance,subject,name,audience,expires,connection) VALUES (?,?,?,?,?,?,?,?)",
+                       (hashlib.sha256(token.encode()).hexdigest(), community, instance, subject, name, audience, until, connection))
         return {"token": token, "expires": until}
 
     def _session(self, db, token, audience):
@@ -385,6 +391,7 @@ class Authority:
         with self._db() as db:
             row = self._session(db, token, audience)
             return {"community": row["community"], "subject": row["subject"], "name": row["name"],
+                    "connection": row["connection"],
                     "origin": row["instance"], "audience": row["audience"], "expires": row["expires"],
                     "policy_revision": self._revision(db, row["community"])}
 
