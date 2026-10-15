@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULES = ("w4ve.py", "runtime.py", "package.py", "piecesettings.py",
-           "discover.py", "worker.py", "api.py", "rcon.py", "pluginhost.py", "identity.py", "pairing.py")
+           "discover.py", "worker.py", "api.py", "rcon.py", "pluginhost.py", "identity.py", "pairing.py", "gameevents.py")
 TREES = ("mcdr", "compat", "sdk", "docs")
 
 

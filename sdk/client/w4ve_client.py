@@ -109,6 +109,18 @@ class W4VE:
 
     # --------------------------------------------------------------- asking
 
+    def game_source_status(self):
+        """Producer capability only; cannot use an operator/player token."""
+        return self.call("POST", "/v1/game/source/status", {})
+
+    def game_source_append(self, event):
+        return self.call("POST", "/v1/game/source/append", event)
+
+    def game_events(self, cursor=0, *, epoch="", limit=100, chat=False):
+        """Administrative journal inspection; service grants are separate work."""
+        return self.call("POST", "/v1/game/events/poll", {
+            "cursor": cursor, "epoch": epoch, "limit": limit, "chat": chat})
+
     def identity_health(self):
         """Probe the identity service using its scoped service credential."""
         return self.call("POST", "/v1/identity/health", {})

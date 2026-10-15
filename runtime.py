@@ -298,6 +298,8 @@ class Watched:
             self.exit_code = None
             self.ready = None
             self._become("starting", "start requested")
+            prepare_source = getattr(self.guardian, "prepare_game_source", None)
+            source = prepare_source(self) if self.name == "server" and prepare_source else None
             # No shell in the middle. A `/bin/sh -c` steals the signals meant
             # for the server and lies about the process tree, which is exactly
             # the shape MCDR has today.
@@ -320,6 +322,11 @@ class Watched:
             self.stdout = self.proc.stdout
             self.pid = self.proc.pid
             self.starttime = starttime_of(self.pid)
+            if source is not None:
+                try:
+                    self.guardian.game_bridge.bind(source, self.pid, self.starttime)
+                except Exception:
+                    self.guardian.log("game source: process binding failed; events are not a presence guarantee")
             self.owned = True
             self.started_at = time.time()
             threading.Thread(target=self._read_console, daemon=True).start()
@@ -851,8 +858,24 @@ class Guardian:
         # The local API (M8), if this w4ve carries it and the server wants it.
         self.api = None
         self.identity_services = set()
+        self.game_bridge = None
+        self._source_check_at = 0
 
     # ------------------------------------------------------------------ setup
+
+    def prepare_game_source(self, proc):
+        proc.env["W4VE_GAME_SOURCE_CONFIG"] = ""
+        if self.game_bridge is None or self.api is None:
+            return None
+        try:
+            source = self.game_bridge.prepare(self.api)
+            proc.env["W4VE_GAME_SOURCE_CONFIG"] = str(self.game_bridge.path)
+            return source
+        except Exception:
+            # A corrupt descriptor must be preserved; do not expose its data
+            # through a parser exception or stop the Minecraft process itself.
+            self.log("game source: setup failed; private descriptor preserved and bridge disabled for this boot")
+            return None
 
     def claim(self):
         """Take the instance lock, or say who has it.
@@ -1330,20 +1353,34 @@ class Guardian:
         kind of optional extra that has to prove it knows that.
         """
         section = self.config.get("api") or {}
-        if not section.get("enabled", bool(self.identity_services)):
+        bridge = self.config.get("bridge") or {}
+        if not section.get("enabled", bool(self.identity_services) or bridge.get("enabled") is True):
             return False, "the api is off for this server"
         try:
             from api import Api
         except ImportError as exc:
             self.log("api: not available (%s)" % exc)
             return False, str(exc)
+        if bridge.get("enabled") is True:
+            try:
+                from gameevents import SourceRuntime
+                self.game_bridge = SourceRuntime(self.root, bridge, alive)
+            except Exception:
+                self.log("game source: invalid bridge configuration; source remains disabled")
+                self.game_bridge = None
         instance = Api(self.root, guardian=self,
                        address=section.get("listen") or None,
-                       tokens_required=True if self.identity_services else section.get("tokens"))
+                       tokens_required=True if self.identity_services or self.game_bridge else section.get("tokens"),
+                       game_events=self.game_bridge.journal if self.game_bridge else None)
         ok, message = instance.start()
         self.log("api: " + message)
         if ok:
             self.api = instance
+            if self.game_bridge:
+                try:
+                    self.game_bridge.reattach(self.watched.get("server"), instance)
+                except Exception:
+                    self.log("game source: existing boot could not be reattached; no presence inferred")
         return ok, message
 
     def stop_api(self):
@@ -1544,12 +1581,17 @@ class Guardian:
         self.log("guardian shutting down")
         # Plugins first: `on_unload` is where a plugin saves what it was
         # keeping, and it is worth having a server to talk to while it does.
-        self.stop_api()
         self.stop_plugins()
         if stop_processes:
             for proc in list(self.watched.values()):
                 if alive(proc.pid, proc.starttime):
                     proc.stop()
+        if self.game_bridge:
+            try:
+                self.game_bridge.reconcile()
+            except Exception:
+                self.log("game source: final lifecycle reconciliation unavailable")
+        self.stop_api()
         self.snapshot()
         self.stopping.set()
 
@@ -1619,6 +1661,12 @@ class Guardian:
         self.start_workers()
 
         while not self.stopping.is_set():
+            if self.game_bridge and time.monotonic() >= self._source_check_at:
+                try:
+                    self.game_bridge.reconcile()
+                except Exception:
+                    self.log("game source: lifecycle reconciliation unavailable")
+                self._source_check_at = time.monotonic() + 2
             time.sleep(0.3)
         self.snapshot()
         self.release()

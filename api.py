@@ -80,6 +80,9 @@ ROUTES = {
     ("POST", "/v1/identity/instance-session"): "identity",
     ("POST", "/v1/identity/instance-inspect"): "identity",
     ("POST", "/v1/identity/instance-recipients"): "identity",
+    ("POST", "/v1/game/source/status"): "game-source",
+    ("POST", "/v1/game/source/append"): "game-source",
+    ("POST", "/v1/game/events/poll"): "admin",
 }
 
 # The two routes above with an `{id}` in them, as (method, prefix, suffix).
@@ -475,15 +478,15 @@ class Handler(BaseHTTPRequestHandler):
         answer.update(extra)
         self._send(code, answer)
 
-    def _body(self):
+    def _body(self, limit=MAX_BODY):
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             return {}
         if length <= 0:
             return {}
-        if length > MAX_BODY:
-            raise ValueError("body is bigger than %d bytes" % MAX_BODY)
+        if length > limit:
+            raise ValueError("body is bigger than %d bytes" % limit)
         try:
             return json.loads(self.rfile.read(length).decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
@@ -510,8 +513,11 @@ class Handler(BaseHTTPRequestHandler):
             self._fail(404, "no such thing: %s %s" % (method, path))
             return
         needed = ROUTES[route]
+        if needed == "game-source":
+            self._game_source(route)
+            return
         scope = "admin"
-        if needed is not None and (self.server.api.tokens_required or path.startswith("/v1/identity/")):
+        if needed is not None and (self.server.api.tokens_required or path.startswith(("/v1/identity/", "/v1/game/"))):
             entry = self.server.api.tokens.check(self._token())
             if entry is None:
                 # 401 and not 403: the difference is "who are you" versus "you
@@ -537,6 +543,46 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(code, payload)
 
+    def _game_source(self, route):
+        # Source credentials are not operator/API tokens. Even admin cannot
+        # fabricate a boot by presenting its token to this ingress.
+        from gameevents import SourceDenied
+        self.close_connection = True
+        journal = self.server.api.game_events
+        if journal is None:
+            self._fail(503, "game event source is disabled")
+            return
+        if self.client_address[0] not in ("local", "127.0.0.1", "::1"):
+            self._fail(403, "game source requires a local connection")
+            return
+        try:
+            source = journal.authenticate(self._token())
+        except SourceDenied:
+            self._fail(401, "game source unavailable")
+            return
+        if not self.server.api._game_slots.acquire(blocking=False):
+            self._fail(429, "game ingress is busy; retry the same event")
+            return
+        try:
+            self.connection.settimeout(3)
+            if self.headers.get("Transfer-Encoding"):
+                self._fail(400, "game ingress requires a bounded Content-Length")
+                return
+            try:
+                body = self._body(limit=16384)
+            except (ValueError, RecursionError):
+                self._fail(400, "invalid game ingress body")
+                return
+            code, payload = self.server.api.run_game_source(route, body, source)
+            self._send(code, payload)
+        except (OSError, TimeoutError):
+            self.close_connection = True
+        except Exception:
+            # Never include producer content or credentials in diagnostics.
+            self._fail(500, "game ingress unavailable")
+        finally:
+            self.server.api._game_slots.release()
+
 
 if hasattr(socketserver, "UnixStreamServer"):
     class _UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -558,7 +604,7 @@ class _TcpServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 class Api:
     """The API of one server. Started by the guardian, or by nothing at all."""
 
-    def __init__(self, root, guardian=None, address=None, tokens_required=None):
+    def __init__(self, root, guardian=None, address=None, tokens_required=None, game_events=None):
         self.root = Path(root)
         self.guardian = guardian
         self.tokens = Tokens(self.root)
@@ -577,6 +623,8 @@ class Api:
         self.jobs = Jobs(self)
         self._authority = None
         self._authority_lock = threading.Lock()
+        self.game_events = game_events
+        self._game_slots = threading.BoundedSemaphore(4)
 
     # ------------------------------------------------------------- lifetime
 
@@ -624,6 +672,42 @@ class Api:
                 pass
 
     # ------------------------------------------------------------ answering
+
+    def run_game_source(self, route, body, source):
+        from gameevents import SourceDenied, ChatDisabled, EventConflict, Backpressure
+        try:
+            if self.guardian and getattr(self.guardian, "game_bridge", None):
+                self.guardian.game_bridge.reconcile()
+            if route[1] == "/v1/game/source/status":
+                if body != {}:
+                    raise ValueError("invalid source query")
+                return 200, {"ok": True, **self.game_events.source_state(source)}
+            return 200, {"ok": True, **self.game_events.append(source, body)}
+        except ChatDisabled:
+            return 403, {"ok": False, "error": "game chat journal is disabled"}
+        except SourceDenied:
+            return 401, {"ok": False, "error": "game source unavailable"}
+        except EventConflict:
+            return 409, {"ok": False, "error": "game event requires reconciliation"}
+        except Backpressure:
+            return 429, {"ok": False, "error": "game journal is full; retry the same event"}
+        except (ValueError, TypeError, KeyError, RecursionError):
+            return 400, {"ok": False, "error": "invalid game event"}
+
+    def _game_poll(self, body):
+        if self.game_events is None:
+            return 503, {"ok": False, "error": "game event source is disabled"}
+        if not isinstance(body, dict) or not body.keys() <= {"cursor", "epoch", "limit", "chat"}:
+            return 400, {"ok": False, "error": "invalid game event query"}
+        from gameevents import SourceDenied
+        try:
+            if self.guardian and getattr(self.guardian, "game_bridge", None):
+                self.guardian.game_bridge.reconcile()
+            return 200, {"ok": True, **self.game_events.poll(**body)}
+        except SourceDenied:
+            return 403, {"ok": False, "error": "game chat journal is disabled"}
+        except (ValueError, TypeError):
+            return 400, {"ok": False, "error": "invalid game event query"}
 
     def _identity(self, path, body):
         from identity import Authority, IdentityDenied
@@ -676,6 +760,8 @@ class Api:
 
     def run(self, route, body, job_id=None):
         method, path = route
+        if path == "/v1/game/events/poll":
+            return self._game_poll(body)
         if path.startswith("/v1/identity/"):
             return self._identity(path, body)
         if path == "/v1/hello":
