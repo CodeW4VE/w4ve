@@ -174,6 +174,10 @@ class Manifest:
             if kind in NOT_YET:
                 out.append("%s: %s" % (where, NOT_YET[kind]))
             reload_rule = component.get("reload", "restart")
+            if kind == "mod" and "required" in component and type(component["required"]) is not bool:
+                out.append("%s: required must be a boolean" % where)
+            if kind == "mod" and component.get("required") is True and not component.get("mc"):
+                out.append("%s: a required server mod needs a Minecraft compatibility range" % where)
             if reload_rule not in RELOADS:
                 out.append("%s: reload is %r, not one of %s"
                            % (where, reload_rule, ", ".join(RELOADS)))
@@ -240,6 +244,8 @@ class Manifest:
             problems.append("this package is for the %s side, not the %s side"
                             % (self.side, side))
         mods = self.mods_for(mc)
+        if not mods and any(c.get("kind") == "mod" and c.get("required") is True for c in self.components):
+            problems.append("this package requires a server mod, but none of its jars supports Minecraft %s" % mc)
         if len(mods) > 1:
             problems.append(
                 "%d of its jars claim Minecraft %s (%s): the package has to "

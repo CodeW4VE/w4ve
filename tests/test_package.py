@@ -66,6 +66,26 @@ class PackCase(unittest.TestCase):
             self.assertIn("w4ve.json", archive.namelist())
             self.assertIn("mod/demo-1.0.0+1.21.jar", archive.namelist())
 
+    def test_required_server_mod_rejects_an_unsupported_minecraft(self):
+        data = manifest()
+        data["components"][0]["required"] = True
+        data["components"].append({"kind": "asset", "file": "hub/main.py"})
+        package_manifest = package.Manifest(data)
+        actions, problems = package_manifest.install_plan("1.21.4")
+        self.assertTrue(any("requires a server mod" in problem for problem in problems))
+        self.assertFalse(any(action["kind"] == "mod" for action in actions))
+        actions, problems = package_manifest.install_plan("1.21.1")
+        self.assertEqual(problems, [])
+        self.assertEqual(sum(action["kind"] == "mod" for action in actions), 1)
+
+    def test_required_mod_flag_needs_a_boolean_and_compatibility(self):
+        data = manifest()
+        data["components"][0]["required"] = "yes"
+        self.assertTrue(any("required must be a boolean" in p for p in package.Manifest(data).problems()))
+        data["components"][0]["required"] = True
+        data["components"][0].pop("mc")
+        self.assertTrue(any("compatibility range" in p for p in package.Manifest(data).problems()))
+
     def test_a_manifest_that_lies_does_not_get_packed(self):
         folder = build(self.tmp / "src", manifest())   # the jar is missing
         with self.assertRaises(package.PackageError) as caught:

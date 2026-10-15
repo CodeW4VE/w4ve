@@ -2,11 +2,12 @@
 
 W4VE now provides paired-instance proofs, scoped player sessions and live
 resource grants. This is a local control-plane API, not a public login service.
-Discord account linking, role synchronization and the installation wizard are
-still pending. Minecraft companion support for this new proof is also pending.
+Guided local pairing and the WaveChat companion/client proof handshake exist
+in development. Discord account linking, role synchronization, remote enrollment,
+the advanced policy wizard and real Minecraft/GL validation are still pending.
 
 `w4ve api token wavechat --scope identity` issues a service token. It permits
-only identity session/inspect/authorize routes; it cannot read server logs or
+only identity routes (including health and typed instance sessions); it cannot read server logs or
 control processes/jobs/plugins. `admin` can pair instances, change grants and
 block accounts. Every identity route requires a token, including on Unix sockets
 configured to allow tokenless access for other operations.
