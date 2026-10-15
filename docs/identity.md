@@ -75,7 +75,20 @@ the API reports that limitation and can be tested over token-protected loopback.
 `POST /v1/identity/health` (SDK `identity_health()`) exige scope `identity` o
 `admin`, incluso cuando el API local tiene tokens desactivados. Devuelve
 `ok`, `service: identity`, `schema: 1`, sin credenciales ni datos de jugadores.
+También devuelve `capabilities`, objeto de versiones de protocolo: player_proof,
+instance_sessions, connection_context, resource_recipients y policy_revision,
+todas con versión entera 1. Los consumidores pueden exigir esas garantías sin
+deducirlas de la versión de desarrollo del producto. Una capacidad futura se
+añade sin quitar las versiones compatibles; un booleano no es una versión.
 Confirma acceso al servicio; no certifica emisores, grants, guardian o Minecraft.
+
+WaveChat exige estas capacidades antes de cada operación del SDK de identidad,
+sin caché positiva que sobreviva a un cambio de runtime. Una inspección debe
+incluir connection incluso para una sesión legacy (cadena vacía); omitir el
+campo ya no permite rebajar silenciosamente la protección de reconexiones.
+La sonda /ready de WaveChat devuelve 503 ante incompatibilidad o dependencia
+caída; /health permanece 200 como diagnóstico. El manifest del servicio usa
+/ready para que el guardian represente disponibilidad y no solo proceso vivo.
 
 ## Managed service credential
 

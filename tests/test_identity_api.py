@@ -63,7 +63,10 @@ class IdentityApiTests(unittest.TestCase):
                 client.identity_health()
         for scope in ("identity", "admin"):
             self.assertEqual(self.clients[scope].identity_health(),
-                             {"ok": True, "service": "identity", "schema": 1})
+                             {"ok": True, "service": "identity", "schema": 1, "capabilities": {
+                                 "player_proof": 1, "instance_sessions": 1,
+                                 "connection_context": 1, "resource_recipients": 1,
+                                 "policy_revision": 1}})
         self.api.tokens_required = False
         with self.assertRaises(Denied):
             self.anonymous.identity_health()

@@ -635,7 +635,12 @@ class Api:
         authority = self._authority
         try:
             if path == "/v1/identity/health":
-                result = {"service": "identity", "schema": 1}
+                # Version the guarantees, not the product release. Clients may
+                # require these without guessing what a 0.x build implements.
+                result = {"service": "identity", "schema": 1, "capabilities": {
+                    "player_proof": 1, "instance_sessions": 1,
+                    "connection_context": 1, "resource_recipients": 1,
+                    "policy_revision": 1}}
             elif path == "/v1/identity/instances":
                 result = authority.register_instance(body["community"], body["instance"],
                                                      body.get("secret"), body.get("enabled", True))
