@@ -96,6 +96,11 @@ A service component may declare `w4ve_api: identity`. The installed guardian
 supplies its SDK through PYTHONPATH, an absolute W4VE_SERVER_ROOT, the configured
 API address and W4VE_IDENTITY_TOKEN. The credential stays out of TOML and process
 commands. Other operator scopes cannot be requested through this declaration.
+W4VE_GAME_DIR is the absolute Minecraft working directory, taken from the
+registered game process or, if absent, server.game_dir in the guardian config.
+Managed metadata overrides conflicting piece environment defaults. Consumers
+can resolve game files without reading the guardian's private state or guessing
+the MCDR layout. Explicit user-selected paths remain the consumer's choice.
 The API starts before services and requires tokens on all protected routes when
 identity services are present, including Unix sockets. Existing anonymous local
 API consumers then need their own credentials. An explicitly disabled API is

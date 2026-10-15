@@ -112,6 +112,7 @@ class RuntimeBootstrapTests(unittest.TestCase):
             code = ("import os,json; from pathlib import Path; from w4ve_client import W4VE; "
                     "result=W4VE(os.environ['W4VE_SERVER_ROOT'], "
                     "token=os.environ['W4VE_IDENTITY_TOKEN']).identity_health(); "
+                    "result['game_dir']=os.environ['W4VE_GAME_DIR']; "
                     "Path('probe.json').write_text(json.dumps(result))")
             host = ("import sys; import runtime; "
                     "g=runtime.Guardian(sys.argv[1], {'plugins':False}); "
@@ -127,6 +128,7 @@ class RuntimeBootstrapTests(unittest.TestCase):
                 journal = Path(temp) / "w4ve/run/journal.log"
                 self.assertTrue(probe.exists(), journal.read_text() if journal.exists() else "guardian failed to start")
                 self.assertTrue(json.loads(probe.read_text())["ok"])
+                self.assertEqual(json.loads(probe.read_text())["game_dir"], str(Path(temp).resolve()))
             finally:
                 if process.poll() is None:
                     process.terminate()
@@ -145,6 +147,7 @@ class RuntimeBootstrapTests(unittest.TestCase):
             service = guardian.add_service("chat", [sys.executable, "-c", "pass"], temp,
                                            env={"PYTHONPATH": "/custom"}, w4ve_api="identity")
             self.assertEqual(service.env["W4VE_SERVER_ROOT"], temp)
+            self.assertEqual(service.env["W4VE_GAME_DIR"], str(Path(temp).resolve()))
             self.assertTrue(service.env["PYTHONPATH"].endswith(os.pathsep + "/custom"))
             token = service.env["W4VE_IDENTITY_TOKEN"]
             again = runtime.Guardian(temp).add_service("chat", ["true"], temp, w4ve_api="identity")
@@ -172,6 +175,23 @@ class RuntimeBootstrapTests(unittest.TestCase):
                     guardian.add_service("chat", ["true"], temp, w4ve_api=scope)
                 self.assertFalse(guardian.watched)
                 self.assertFalse(api.Tokens(temp).listing())
+
+    def test_service_game_directory_comes_from_config_not_piece_environment(self):
+        import runtime
+        with tempfile.TemporaryDirectory() as temp:
+            guardian = runtime.Guardian(temp, {"server": {"game_dir": "games/technical"}})
+            service = guardian.add_service("chat", ["true"], temp, w4ve_api="identity",
+                                           env={"W4VE_GAME_DIR": "/incorrect-piece-default"})
+            self.assertEqual(service.env["W4VE_GAME_DIR"], str((Path(temp) / "games/technical").resolve()))
+
+    def test_registered_game_process_cwd_is_the_authoritative_directory(self):
+        import runtime
+        with tempfile.TemporaryDirectory() as temp:
+            guardian = runtime.Guardian(temp, {"server": {"game_dir": "old-layout"}})
+            current = Path(temp) / "actual-game"
+            guardian.add_server(["true"], current, flavor="vanilla")
+            service = guardian.add_service("chat", ["true"], temp, w4ve_api="identity")
+            self.assertEqual(service.env["W4VE_GAME_DIR"], str(current.resolve()))
 
     def test_manifest_accepts_only_identity_service_scope(self):
         import package

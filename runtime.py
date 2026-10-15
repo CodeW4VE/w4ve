@@ -959,6 +959,9 @@ class Guardian:
             from api import Tokens
             env["W4VE_IDENTITY_TOKEN"] = Tokens(self.root).service_identity(name)
             env["W4VE_SERVER_ROOT"] = str(self.root)
+            game = self.watched.get("server")
+            game_dir = game.cwd if game is not None else self.root / (self.config.get("server") or {}).get("game_dir", ".")
+            env["W4VE_GAME_DIR"] = str(game_dir.resolve())
             env["W4VE_IDENTITY_ADDRESS"] = str((self.config.get("api") or {}).get("listen") or "")
             existing = env.get("PYTHONPATH") or os.environ.get("PYTHONPATH")
             env["PYTHONPATH"] = str(sdk) + (os.pathsep + existing if existing else "")
