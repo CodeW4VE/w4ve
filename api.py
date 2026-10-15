@@ -76,6 +76,10 @@ ROUTES = {
     ("POST", "/v1/identity/inspect"): "identity",
     ("POST", "/v1/identity/authorize"): "identity",
     ("POST", "/v1/identity/health"): "identity",
+    ("POST", "/v1/identity/instance-resources"): "admin",
+    ("POST", "/v1/identity/instance-session"): "identity",
+    ("POST", "/v1/identity/instance-inspect"): "identity",
+    ("POST", "/v1/identity/instance-recipients"): "identity",
 }
 
 # The two routes above with an `{id}` in them, as (method, prefix, suffix).
@@ -648,6 +652,15 @@ class Api:
                 result = authority.inspect(body["session"], body["audience"])
             elif path == "/v1/identity/authorize":
                 result = authority.authorize(body["session"], body["audience"], body["resource"], body["operation"])
+            elif path == "/v1/identity/instance-resources":
+                authority.set_instance_resources(body["community"], body["instance"], body["audience"], body["resources"])
+                result = {}
+            elif path == "/v1/identity/instance-session":
+                result = authority.create_instance_session(body["proof"], body["audience"])
+            elif path == "/v1/identity/instance-inspect":
+                result = authority.inspect_instance(body["session"], body["audience"])
+            elif path == "/v1/identity/instance-recipients":
+                result = authority.instance_recipients(body["session"], body["audience"], body["resource"], body["operation"], body["players"])
             else:
                 return 404, {"ok": False, "error": "unknown identity operation"}
             return 200, {"ok": True, **result}

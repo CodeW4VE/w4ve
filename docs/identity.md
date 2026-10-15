@@ -93,3 +93,25 @@ registry fail without overwriting existing data. Removing a service revokes its
 token. Manual revocation denies the running process; a later restart creates a
 new credential if that service is still declared. This is API capability control,
 not an operating-system sandbox for services sharing the guardian's user.
+
+## Paired instance transport role (14 October 2026)
+
+`w4ve-instance1.<base64url JSON>.<HMAC-SHA256>` uses the paired issuer secret,
+but has exactly community/instance/audience/issued/expires/nonce claims and no
+player UUID or display name. It cannot be exchanged as `w4ve1` player proof.
+Instance sessions last 300 seconds, are stored hashed in a separate table,
+and are invalidated by issuer rotation/disable. Proof replay is persisted.
+
+Identity-scoped SDK methods are `identity_instance_session(proof, audience)`,
+`identity_instance_inspect(session, audience)` and
+`identity_instance_recipients(session, audience, resource, operation, players)`.
+The latter accepts at most 100 canonical lowercase UUID hex strings from the
+trusted paired instance's connected roster. A recipient needs both explicit
+instance/resource sharing and current member operation permission; blocked
+members are excluded. An instance session never becomes a player subject.
+
+`POST /v1/identity/instance-resources` is admin-only and replaces that instance's
+resource list (empty revokes all). Guided pairing initializes sharing once.
+Old local bindings are upgraded only by an explicit configure operation;
+later revocations survive repeated configure. This does not implement remote
+instance enrollment, channel administration UI or Discord account linking.

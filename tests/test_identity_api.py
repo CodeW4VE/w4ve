@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "sdk/client"))
 import api
 from w4ve_client import W4VE, Denied, W4VEError
 from test_identity import proof
+from test_identity_instance import instance_proof
 
 
 class IdentityApiTests(unittest.TestCase):
@@ -38,7 +39,7 @@ class IdentityApiTests(unittest.TestCase):
 
     def test_only_admin_can_pair_grant_or_block(self):
         for scope in ("read", "write", "identity"):
-            for route in ("instances", "grants", "block"):
+            for route in ("instances", "grants", "block", "instance-resources"):
                 with self.subTest(scope=scope, route=route):
                     with self.assertRaises(Denied):
                         self.clients[scope].call("POST", "/v1/identity/" + route, {})
@@ -90,6 +91,33 @@ class IdentityApiTests(unittest.TestCase):
             self.clients["identity"].identity_session("sensitive-invalid-proof", "wavechat")
         self.assertNotIn("sensitive-invalid-proof", str(caught.exception))
         self.assertTrue(self.anonymous.hello()["ok"])
+
+    def test_instance_sdk_requires_explicit_resource_and_live_member_acl(self):
+        secret = self.admin("instances", community="alpha", instance="smp")["secret"]
+        now = int(time.time())
+        service = self.clients["identity"]
+        note = instance_proof(secret, issued=now, expires=now + 100)
+        token = service.identity_instance_session(note, "wavechat")["token"]
+        self.assertEqual(service.identity_instance_inspect(token, "wavechat")["kind"], "instance")
+        with self.assertRaises(Denied):
+            service.identity_inspect(token, "wavechat")
+        alice = "466a0fbd7b87431cab58c1887f577deb"
+        self.admin("grants", community="alpha", audience="wavechat", resource="channel:general",
+                   subject="minecraft:" + alice, operations=["chat.read"])
+        def recipients():
+            return service.identity_instance_recipients(token, "wavechat", "channel:general",
+                                                        "chat.read", [alice])["players"]
+        self.assertEqual(recipients(), [])
+        self.admin("instance-resources", community="alpha", instance="smp", audience="wavechat",
+                   resources=["channel:general"])
+        self.assertEqual(recipients(), [alice])
+        self.admin("block", community="alpha", subject="minecraft:" + alice, blocked=True)
+        self.assertEqual(recipients(), [])
+        for client in (self.anonymous, self.clients["read"], self.clients["write"]):
+            with self.assertRaises(Denied):
+                client.identity_instance_inspect(token, "wavechat")
+        with self.assertRaises(Denied):
+            service.identity_instance_session(note, "wavechat")
 
     def test_identity_routes_require_tokens_even_with_other_local_checks_disabled(self):
         self.api.tokens_required = False

@@ -113,6 +113,16 @@ class W4VE:
         """Probe the identity service using its scoped service credential."""
         return self.call("POST", "/v1/identity/health", {})
 
+    def identity_instance_session(self, proof, audience):
+        return self.call("POST", "/v1/identity/instance-session", {"proof": proof, "audience": audience})
+
+    def identity_instance_inspect(self, session, audience):
+        return self.call("POST", "/v1/identity/instance-inspect", {"session": session, "audience": audience})
+
+    def identity_instance_recipients(self, session, audience, resource, operation, players):
+        return self.call("POST", "/v1/identity/instance-recipients", {"session": session, "audience": audience,
+                         "resource": resource, "operation": operation, "players": players})
+
     def hello(self):
         """What this is and what it can do. The only route with no token."""
         return self.call("GET", "/v1/hello")

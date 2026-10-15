@@ -71,9 +71,18 @@ class Authority:
                     community TEXT NOT NULL,subject TEXT NOT NULL,PRIMARY KEY(community,subject));
                 CREATE TABLE IF NOT EXISTS identity_bindings (
                     owner TEXT PRIMARY KEY,audience TEXT NOT NULL,community TEXT NOT NULL,
-                    instance TEXT NOT NULL,resources TEXT NOT NULL);
+                    instance TEXT NOT NULL,resources TEXT NOT NULL,transport_initialized INTEGER NOT NULL DEFAULT 1);
+                CREATE TABLE IF NOT EXISTS identity_instance_sessions (
+                    digest TEXT PRIMARY KEY,community TEXT NOT NULL,instance TEXT NOT NULL,
+                    audience TEXT NOT NULL,expires INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS identity_instance_resources (
+                    community TEXT NOT NULL,instance TEXT NOT NULL,audience TEXT NOT NULL,resource TEXT NOT NULL,
+                    PRIMARY KEY(community,instance,audience,resource));
             """)
             db.execute("BEGIN IMMEDIATE")
+            binding_columns = {row[1] for row in db.execute("PRAGMA table_info(identity_bindings)")}
+            if "transport_initialized" not in binding_columns:
+                db.execute("ALTER TABLE identity_bindings ADD COLUMN transport_initialized INTEGER NOT NULL DEFAULT 0")
             meta = dict(db.execute("SELECT key,value FROM identity_meta"))
             if meta and meta.get("schema") != "1":
                 raise ValueError("unsupported identity schema")
@@ -109,6 +118,7 @@ class Authority:
                        (community, instance, secret, int(enabled)))
             # Re-pair/rotation invalidates every session issued by this instance.
             db.execute("DELETE FROM identity_sessions WHERE community=? AND instance=?", (community, instance))
+            db.execute("DELETE FROM identity_instance_sessions WHERE community=? AND instance=?", (community, instance))
             self._changed(db, community)
         return {"community": community, "instance": instance, "secret": secret, "enabled": enabled}
 
@@ -150,18 +160,127 @@ class Authority:
                                     (binding["community"], binding["instance"])).fetchone()
                 if issuer is None or not issuer["enabled"]:
                     raise ValueError("paired instance is disabled or missing")
+                if not binding["transport_initialized"]:
+                    # Explicit configure upgrades a pre-transport binding once.
+                    # Later resource revocations remain untouched.
+                    db.executemany("INSERT OR IGNORE INTO identity_instance_resources VALUES (?,?,?,?)",
+                                   [(issuer["community"], issuer["instance"], audience, item["id"]) for item in normalized])
+                    db.execute("UPDATE identity_bindings SET transport_initialized=1 WHERE owner=?", (owner,))
+                    self._changed(db, issuer["community"])
                 return {"community": issuer["community"], "instance": issuer["instance"],
                         "secret": issuer["secret"], "resources": normalized}
             community, instance, secret = "c_" + uuid.uuid4().hex, "i_" + uuid.uuid4().hex, secrets.token_hex(32)
             db.execute("INSERT INTO identity_instances VALUES (?,?,?,1)", (community, instance, secret))
-            db.execute("INSERT INTO identity_bindings VALUES (?,?,?,?,?)",
+            db.execute("INSERT INTO identity_bindings VALUES (?,?,?,?,?,1)",
                        (owner, audience, community, instance, encoded))
             for resource in normalized:
+                db.execute("INSERT INTO identity_instance_resources VALUES (?,?,?,?)",
+                           (community, instance, audience, resource["id"]))
                 db.executemany("INSERT INTO identity_grants VALUES (?,?,?,?,?)",
                                [(community, audience, resource["id"], "*", op)
                                 for op in resource["operations"]])
             self._changed(db, community)
             return {"community": community, "instance": instance, "secret": secret, "resources": normalized}
+
+    def set_instance_resources(self, community, instance, audience, resources):
+        for value in (community, instance, audience):
+            key(value)
+        if not isinstance(resources, list) or len(resources) > 64:
+            raise ValueError("invalid instance resources")
+        resources = sorted(set(key(resource) for resource in resources))
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM identity_instances WHERE community=? AND instance=?", (community, instance)).fetchone():
+                raise ValueError("unknown paired instance")
+            db.execute("DELETE FROM identity_instance_resources WHERE community=? AND instance=? AND audience=?", (community, instance, audience))
+            db.executemany("INSERT INTO identity_instance_resources VALUES (?,?,?,?)",
+                           [(community, instance, audience, resource) for resource in resources])
+            db.execute("UPDATE identity_bindings SET transport_initialized=1 WHERE community=? AND instance=? AND audience=?",
+                       (community, instance, audience))
+            self._changed(db, community)
+
+    def create_instance_session(self, proof, audience):
+        """Typed issuer role: cannot be inspected or used as a player session."""
+        key(audience)
+        try:
+            if not isinstance(proof, str) or len(proof) > 2048:
+                raise ValueError()
+            version, body, signature = proof.split(".")
+            if version != "w4ve-instance1":
+                raise ValueError()
+            payload = json.loads(unpack(body))
+            if not isinstance(payload, dict) or set(payload) != {"community", "instance", "audience", "issued", "expires", "nonce"}:
+                raise ValueError()
+            community, instance, nonce = key(payload["community"]), key(payload["instance"]), key(payload["nonce"])
+            now, issued, expires = int(self.clock()), payload["issued"], payload["expires"]
+            if (payload["audience"] != audience or type(issued) is not int or type(expires) is not int
+                    or issued > now + self.CLOCK_SKEW or expires <= now or expires <= issued
+                    or expires - issued > self.PROOF_LIFETIME):
+                raise ValueError()
+            received = unpack(signature)
+        except (ValueError, TypeError, KeyError, UnicodeError):
+            raise IdentityDenied("instance proof refused") from None
+        token = secrets.token_urlsafe(32)
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            issuer = db.execute("SELECT * FROM identity_instances WHERE community=? AND instance=? AND enabled=1", (community, instance)).fetchone()
+            if issuer is None or not hmac.compare_digest(received, hmac.new(issuer["secret"].encode(),
+                        (version + "." + body).encode(), hashlib.sha256).digest()):
+                raise IdentityDenied("instance proof refused")
+            db.execute("DELETE FROM identity_proofs WHERE expires<=?", (now,))
+            db.execute("DELETE FROM identity_instance_sessions WHERE expires<=?", (now,))
+            try:
+                db.execute("INSERT INTO identity_proofs VALUES (?,?,?,?)", (community, instance, nonce, expires))
+            except sqlite3.IntegrityError:
+                raise IdentityDenied("instance proof refused") from None
+            until = now + 300
+            db.execute("INSERT INTO identity_instance_sessions VALUES (?,?,?,?,?)",
+                       (hashlib.sha256(token.encode()).hexdigest(), community, instance, audience, until))
+        return {"token": token, "expires": until}
+
+    def _instance_session(self, db, token, audience):
+        if not isinstance(token, str) or not 1 <= len(token) <= 128:
+            raise IdentityDenied("instance session unavailable")
+        row = db.execute("""SELECT s.* FROM identity_instance_sessions s JOIN identity_instances i
+            ON s.community=i.community AND s.instance=i.instance
+            WHERE s.digest=? AND s.audience=? AND s.expires>? AND i.enabled=1""",
+                         (hashlib.sha256(token.encode()).hexdigest(), audience, int(self.clock()))).fetchone()
+        if row is None:
+            raise IdentityDenied("instance session unavailable")
+        return row
+
+    def inspect_instance(self, token, audience):
+        key(audience)
+        with self._db() as db:
+            row = self._instance_session(db, token, audience)
+            return {"kind": "instance", "community": row["community"], "instance": row["instance"],
+                    "audience": row["audience"], "expires": row["expires"],
+                    "policy_revision": self._revision(db, row["community"])}
+
+    def instance_recipients(self, token, audience, resource, operation, players):
+        """Trust a paired server's bounded connected roster, then apply live member ACL."""
+        for value in (audience, resource, operation):
+            key(value)
+        if not isinstance(players, list) or len(players) > 100:
+            raise ValueError("invalid connected roster")
+        subjects = []
+        for player in players:
+            if not isinstance(player, str) or not re.fullmatch(r"[0-9a-f]{32}", player):
+                raise ValueError("invalid connected player UUID")
+            subjects.append("minecraft:" + player)
+        with self._db() as db:
+            row = self._instance_session(db, token, audience)
+            resource_granted = db.execute("SELECT 1 FROM identity_instance_resources WHERE community=? AND instance=? AND audience=? AND resource=?",
+                                          (row["community"], row["instance"], audience, resource)).fetchone()
+            allowed = []
+            if resource_granted:
+                for subject in sorted(set(subjects)):
+                    blocked = db.execute("SELECT 1 FROM identity_blocked WHERE community=? AND subject=?", (row["community"], subject)).fetchone()
+                    grant = db.execute("SELECT 1 FROM identity_grants WHERE community=? AND audience=? AND resource=? AND operation=? AND subject IN (?, '*')",
+                                       (row["community"], audience, resource, operation, subject)).fetchone()
+                    if not blocked and grant:
+                        allowed.append(subject[len("minecraft:"):])
+            return {"players": allowed, "policy_revision": self._revision(db, row["community"])}
 
     def set_grants(self, community, audience, resource, subject, operations):
         for value in (community, audience, resource):
