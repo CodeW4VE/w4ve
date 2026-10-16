@@ -3,6 +3,7 @@ const mineflayer = require('/qa/node/node_modules/mineflayer')
 const { once } = require('node:events')
 const fs = require('node:fs')
 const crypto = require('node:crypto')
+const https = require('node:https')
 // Generated only inside the disposable QA fixture. Never a production issuer.
 const fixturePath = '/qa/work/fixture-identity.json'
 const fixture = fs.existsSync(fixturePath) ? JSON.parse(fs.readFileSync(fixturePath, 'utf8')) : {
@@ -12,10 +13,13 @@ const bots = new Set()
 const proofs = []
 const announcements = new WeakMap()
 const controls = new Set()
+const relayCounts = new WeakMap()
+const filteredCounts = new WeakMap()
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const timer = setTimeout(() => fail(), 90000)
+let stage = 'joining'
 function fail () {
-  fs.writeFileSync('/qa/work/actors-done.json', JSON.stringify({ ok: false }))
+  fs.writeFileSync('/qa/work/actors-done.json', JSON.stringify({ ok: false, stage }))
   for (const bot of bots) bot.end()
   process.exit(1)
 }
@@ -28,6 +32,8 @@ async function join (username) {
   bots.add(bot)
   bot.on('message', message => {
     const text = message.toString()
+    if (text === '[general] BridgeQA_A: QA_NATIVE_RELAY') relayCounts.set(bot, (relayCounts.get(bot) || 0) + 1)
+    if (text === '[general] RemoteQA: QA_NATIVE_FILTERED') filteredCounts.set(bot, (filteredCounts.get(bot) || 0) + 1)
     for (const marker of ['QA_PRIVATE', 'QA_COMMAND_ME', 'QA_COMMAND_SAY']) {
       if (text.includes(marker)) controls.add(marker)
     }
@@ -48,7 +54,7 @@ async function join (username) {
   proofs.push(await proofFor(bot, username))
   return bot
 }
-async function proofFor (bot, username) {
+async function proofFor (bot, username, full = false) {
   await sleep(300)
   const received = once(bot._client, 'wavechat:identity_grant')
   bot._client.write('custom_payload', { channel: 'wavechat:identity_request', data: Buffer.alloc(0) })
@@ -58,7 +64,24 @@ async function proofFor (bot, username) {
   if (prefix !== 'w4ve1' || signature !== expected) throw new Error('invalid fixture proof')
   const actor = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'))
   if (actor.name !== username || actor.community !== fixture.community || actor.instance !== fixture.instance || !/^[a-f0-9]{32}$/.test(actor.connection)) throw new Error('missing fixture context')
-  return actor.connection // Never persist the full capability.
+  return full ? proof : actor.connection // Never persist the full capability.
+}
+function post (path, body, token = '') {
+  return new Promise((resolve, reject) => {
+    const request = https.request({ hostname: 'localhost', port: 8792, path: '/v2/chat/' + path,
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) } }, response => {
+      let text = ''
+      response.on('data', chunk => { text += chunk; if (text.length > 65536) response.destroy(new Error('QA response too large')) })
+      response.on('end', () => {
+        if (response.statusCode !== 200) return reject(new Error('QA HTTPS request refused'))
+        try { resolve(JSON.parse(text)) } catch (error) { reject(error) }
+      })
+      response.on('error', reject)
+    })
+    request.setTimeout(5000, () => request.destroy(new Error('QA request deadline')))
+    request.on('error', reject)
+    request.end(JSON.stringify(body))
+  })
 }
 async function quit (bot) {
   const ended = once(bot, 'end')
@@ -74,6 +97,38 @@ async function run () {
   await sleep(500)
   bob.chat('QA_PUBLIC_BOB')
   await sleep(500)
+  if (process.env.QA_REQUIRE_RELAY === 'true') {
+    stage = 'HTTPS-public-relay'
+    await sleep(2200)
+    const proof = await proofFor(alice, 'BridgeQA_A', true)
+    const session = await post('session', { proof })
+    await post('messages', { channel: 'general', body: 'QA_NATIVE_RELAY', nonce: 'qa-real-relay' }, session.token)
+    const deadline = Date.now() + 10000
+    while ((relayCounts.get(alice) !== 1 || relayCounts.get(bob) !== 1) && Date.now() < deadline) await sleep(100)
+    if (relayCounts.get(alice) !== 1 || relayCounts.get(bob) !== 1) throw new Error('native relay missing or duplicated')
+    await sleep(1500)
+    if (relayCounts.get(alice) !== 1 || relayCounts.get(bob) !== 1) throw new Error('native relay repeated')
+    const bobProof = await proofFor(bob, 'BridgeQA_B', true)
+    const bobSession = await post('session', { proof: bobProof })
+    stage = 'cross-origin-filter'
+    const now = Math.floor(Date.now() / 1000)
+    const claims = { community: fixture.community, instance: fixture.remote.instance, audience: 'wavechat',
+      uuid: alice.player.uuid.replaceAll('-', ''), name: 'RemoteQA', connection: 'f'.repeat(32),
+      issued: now, expires: now + 90, nonce: crypto.randomBytes(16).toString('hex') }
+    const remoteBody = 'w4ve1.' + Buffer.from(JSON.stringify(claims)).toString('base64url')
+    const remoteProof = remoteBody + '.' + crypto.createHmac('sha256', fixture.remote.secret).update(remoteBody).digest('base64url')
+    const remoteSession = await post('session', { proof: remoteProof })
+    await post('filters', { origin: fixture.remote.instance, mode: 'forever' }, bobSession.token)
+    await post('messages', { channel: 'general', body: 'QA_NATIVE_FILTERED', nonce: 'qa-real-filter' }, remoteSession.token)
+    const filteredDeadline = Date.now() + 10000
+    while (filteredCounts.get(alice) !== 1 && Date.now() < filteredDeadline) await sleep(100)
+    if (filteredCounts.get(alice) !== 1 || filteredCounts.get(bob)) throw new Error('muted origin reached an excluded recipient')
+    await sleep(1200)
+    await post('filters', { origin: fixture.remote.instance, mode: 'on' }, bobSession.token)
+    await sleep(1500)
+    if (filteredCounts.get(alice) !== 1 || filteredCounts.get(bob)) throw new Error('unmute replayed a skipped live message')
+  }
+  stage = 'private-controls-respawn-reconnect'
   alice.chat('/msg BridgeQA_B QA_PRIVATE')
   await sleep(500)
   alice.chat('/me QA_COMMAND_ME')
@@ -102,7 +157,7 @@ async function run () {
   await quit(alice)
   await quit(bob)
   if (controls.size !== 3) throw new Error('private or command control message did not reach clients')
-  fs.writeFileSync('/qa/work/actors-done.json', JSON.stringify({ ok: true, proofs, respawn: true, respawnDiscovery: discoveryRenewed, controls: [...controls].sort() }))
+  fs.writeFileSync('/qa/work/actors-done.json', JSON.stringify({ ok: true, proofs, respawn: true, respawnDiscovery: discoveryRenewed, controls: [...controls].sort(), nativeRelay: process.env.QA_REQUIRE_RELAY === 'true' ? 'passed' : 'not tested', nativeFilterNoReplay: process.env.QA_REQUIRE_RELAY === 'true' ? 'passed' : 'not tested' }))
   clearTimeout(timer)
 }
 run().catch(fail)

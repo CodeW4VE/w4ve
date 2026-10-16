@@ -11,6 +11,7 @@ import os
 from pathlib import Path, PurePosixPath
 import shutil
 import sqlite3
+import ssl
 import subprocess
 import sys
 import time
@@ -42,6 +43,9 @@ def main():
     if hub_mode not in ("true", "false"):
         raise ValueError("invalid QA hub mode")
     hub_mode = hub_mode == "true"
+    relay_mode = os.environ.get('QA_REQUIRE_RELAY') == 'true'
+    if relay_mode and not hub_mode:
+        raise ValueError('relay fixture requires installed hub')
     if hub_mode and not chat_enabled:
         raise ValueError("hub ingestion fixture requires explicit chat capture")
     root = Path("/qa/work")
@@ -102,6 +106,9 @@ def main():
         import package
         start = ['/qa/jre/bin/java', '-Xms256m', '-Xmx1024m', '-Duser.home=/tmp',
                  '-jar', 'fabric-server-launch.jar', 'nogui']
+        if relay_mode:
+            start[1:1] = ['-Djavax.net.ssl.trustStore=/qa/inputs/qa-trust.p12',
+                          '-Djavax.net.ssl.trustStorePassword=fixture-only']
         (community / 'w4ve.toml').write_text(
             'plugins=false\n[server]\nkind="server"\nmc="1.21"\ngame_dir="game"\nflavor="fabric"\n'
             + 'start=' + json.dumps(start) + '\n[bridge]\nenabled=true\nchat=true\nretention=300\n')
@@ -117,18 +124,31 @@ def main():
         installation.apply(actions)
         installation.commit()
         server.set_setting('wavechat-server', 'python_bin', sys.executable)
+        public_url = 'https://localhost:8792' if relay_mode else 'https://qa.example.invalid'
         if w4ve.main(['--dir', str(community), 'configure', 'wavechat-server',
-                      '--set', 'native_chat=true', '--set', 'public_url=https://qa.example.invalid']):
+                      '--set', 'native_chat=true', '--set', 'public_url=' + public_url]):
             raise AssertionError('installed QA hub pairing failed')
         server = w4ve.Server(community)
         fields = dict(server.config['services']['wavechat-hub'])
+        if relay_mode:
+            fields['command'] += ['--ssl-keyfile', '/qa/inputs/qa-tls.key', '--ssl-certfile', '/qa/inputs/qa-tls.crt']
+            (config / 'wavechat-server.json').write_text(json.dumps({'native_relay': True}))
         fields['w4ve_events'] = 'chat'
         fields['env'] = {**fields.get('env', {}), 'W4VE_CAPTURE_CHANNEL': 'general',
                          'W4VE_DATA_DIR': str(root / 'hub-data'), 'W4VE_UPLOAD': 'false', 'W4VE_DM': 'false'}
         server.set_service('wavechat-hub', fields, owner='wavechat-server')
         paired = json.loads(binding.read_text())
         fixture = root / 'fixture-identity.json'
-        fixture.write_text(json.dumps({key: paired[key] for key in ('secret', 'community', 'instance')}))
+        fixture_data = {key: paired[key] for key in ('secret', 'community', 'instance')}
+        if relay_mode:
+            # A second issuer is a synthetic QA origin, not a claim that another
+            # Minecraft server was launched. Exercise the real authority/session
+            # path; never fake a cross-origin message by changing a stored row.
+            from identity import Authority
+            authority = Authority(community / 'w4ve/identity/authority.sqlite3')
+            fixture_data['remote'] = authority.register_instance(paired['community'], 'qa-remote')
+            authority.set_instance_resources(paired['community'], 'qa-remote', 'wavechat', ['channel:general'])
+        fixture.write_text(json.dumps(fixture_data))
         os.chmod(fixture, 0o600)
     token = Tokens(community).issue("bridge-game-qa", "admin")
     client = W4VE(root=community, token=token, timeout=2)
@@ -155,7 +175,9 @@ def main():
             if hub_mode:
                 def hub_ready():
                     try:
-                        with urllib.request.urlopen('http://127.0.0.1:8792/ready', timeout=2) as response:
+                        url = 'https://localhost:8792/ready' if relay_mode else 'http://127.0.0.1:8792/ready'
+                        context = ssl.create_default_context(cafile=str(inputs / 'qa-tls.crt')) if relay_mode else None
+                        with urllib.request.urlopen(url, timeout=2, context=context) as response:
                             return response.status == 200 and json.load(response).get('ok') is True
                     except OSError:
                         return False
@@ -207,9 +229,16 @@ def main():
                 try:
                     messages = [dict(row) for row in database.execute('SELECT * FROM core_messages ORDER BY rowid')]
                     echoes = database.execute('SELECT COUNT(*) FROM core_outbox').fetchone()[0]
+                    if relay_mode:
+                        relayed = [m for m in messages if m['body'] in ('QA_NATIVE_RELAY', 'QA_NATIVE_FILTERED')]
+                        if len(relayed) != 2 or actors.get('nativeRelay') != 'passed' or actors.get('nativeFilterNoReplay') != 'passed':
+                            raise AssertionError('real HTTPS to Minecraft relay not observed by both actors')
+                        if database.execute('SELECT COUNT(*) FROM core_outbox WHERE delivered=1').fetchone()[0] != 2:
+                            raise AssertionError('real relay did not acknowledge its delivery')
+                        messages = [m for m in messages if m['id'] not in {r['id'] for r in relayed}]
                 finally:
                     database.close()
-                if ([message['body'] for message in messages] != expected_chat or echoes != 0
+                if ([message['body'] for message in messages] != expected_chat or echoes != (2 if relay_mode else 0)
                         or any(message['channel'] != 'general' or message['origin'] != paired['instance'] for message in messages)
                         or [message['subject'] for message in messages] != ['minecraft:' + chat['data']['uuid'] for chat in chats]):
                     raise AssertionError('actual Fabric capture did not reach canonical hub without origin echo')
@@ -217,7 +246,7 @@ def main():
                 if os.environ.get('QA_REQUIRE_PROVENANCE') == 'true':
                     database = sqlite3.connect(root / 'hub-data/wavechat-core.sqlite3')
                     try:
-                        rows = database.execute('SELECT p.payload FROM core_provenance p JOIN core_messages m ON m.id=p.message ORDER BY m.rowid').fetchall()
+                        rows = database.execute("SELECT p.payload FROM core_provenance p JOIN core_messages m ON m.id=p.message WHERE m.body NOT IN ('QA_NATIVE_RELAY','QA_NATIVE_FILTERED') ORDER BY m.rowid").fetchall()
                     finally:
                         database.close()
                     provenance = [json.loads(row[0]) for row in rows]
@@ -254,6 +283,8 @@ def main():
                 result['online_auth_gl_relay'] = 'not tested'
                 result['respawn_native_discovery'] = 'passed' if actors.get('respawnDiscovery') else 'not required'
                 result['canonical_capture_provenance'] = 'passed' if os.environ.get('QA_REQUIRE_PROVENANCE') == 'true' else 'not required'
+                result['real_https_to_game_relay'] = 'passed' if relay_mode else 'not tested'
+                result['real_origin_filter_no_replay'] = 'passed' if relay_mode else 'not tested'
             (root / "result.json").write_text(json.dumps(result, sort_keys=True, indent=2))
             print(json.dumps(result, sort_keys=True), flush=True)
         finally:
