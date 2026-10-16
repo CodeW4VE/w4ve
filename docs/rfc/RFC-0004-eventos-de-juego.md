@@ -1,5 +1,22 @@
 # RFC-0004: eventos tipados y registro acotado del juego
 
+Actualización16/10: grants separados por servicio y autorización histórica
+por ID/origen inmutable ya están implementados (`../game-event-services.md`
+y `../game-captured-origin.md`). Runtime instalado191 PASS. El hub instalado
+consumió cuatro chats de Minecraft real con dos clientes TCP, sin incluir
+privados/comandos ni eco al origen. Ver
+`WaveChat-Server/docs/FABRIC-HUB-REAL-2026-10-16.md` del workspace. Todavía falta
+relay de salida, asistente/distribución automática y el resto de portabilidad.
+Las secciones del15 y14 que siguen son evidencia histórica, no el estado actual.
+
+Actualización15/10: el adapter Fabric y el spool JVM ya capturan lifecycle,
+join/leave y chat público opt-in, con contexto compartido y transferencia por
+respawn. Minecraft real bajo guardian instalado y clientes TCP pasan con chat
+activado y desactivado. Evidencia en
+`WaveChat-Server/docs/FUENTE-FABRIC-2026-10-15.md` del workspace. La descripción
+del14 que sigue conserva su alcance histórico. Consumidores, grants, actor
+histórico y relay siguen pendientes; no hay portabilidad completa ni release.
+
 Estado14/10/2026: núcleo, API local y lifecycle de guardian implementados y
 probados con productor simulado. Adapter Fabric real, spool JVM y consumidores
 de servicio todavía en implementación. No afirmar chat Minecraft real entregado.

@@ -169,6 +169,8 @@ def main():
                 raise AssertionError("control messages did not really reach TCP clients")
             if actors.get("respawn") is not True:
                 raise AssertionError("actual game respawn was not checked")
+            if os.environ.get('QA_REQUIRE_RESPAWN_DISCOVERY') == 'true' and actors.get('respawnDiscovery') is not True:
+                raise AssertionError('native discovery was not renewed after actual respawn')
             def captured():
                 events = client.game_events(chat=chat_enabled)["events"]
                 return events if len([event for event in events if event["kind"] == "player.left"]) == 3 else None
@@ -238,6 +240,7 @@ def main():
                 result['hub_messages'] = len(messages)
                 result['origin_echo_suppressed'] = 'passed'
                 result['online_auth_gl_relay'] = 'not tested'
+                result['respawn_native_discovery'] = 'passed' if actors.get('respawnDiscovery') else 'not required'
             (root / "result.json").write_text(json.dumps(result, sort_keys=True, indent=2))
             print(json.dumps(result, sort_keys=True), flush=True)
         finally:

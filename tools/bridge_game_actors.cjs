@@ -10,6 +10,7 @@ const fixture = fs.existsSync(fixturePath) ? JSON.parse(fs.readFileSync(fixtureP
 }
 const bots = new Set()
 const proofs = []
+const announcements = new WeakMap()
 const controls = new Set()
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const timer = setTimeout(() => fail(), 90000)
@@ -36,6 +37,14 @@ async function join (username) {
   await once(bot, 'spawn')
   bot.physicsEnabled = false
   bot._client.registerChannel('wavechat:identity_grant', 'string', true)
+  bot._client.on('wavechat:identity_announcement', value => {
+    try {
+      const announcement = JSON.parse(value)
+      if (announcement.protocol !== 2 || announcement.community !== fixture.community || announcement.instance !== fixture.instance) throw new Error('wrong fixture announcement')
+      announcements.set(bot, (announcements.get(bot) || 0) + 1)
+    } catch (_) { fail() }
+  })
+  bot._client.registerChannel('wavechat:identity_announcement', 'string', true)
   proofs.push(await proofFor(bot, username))
   return bot
 }
@@ -72,9 +81,16 @@ async function run () {
   alice.chat('/say QA_COMMAND_SAY')
   await sleep(500)
   const respawned = once(alice, 'spawn')
+  const beforeRespawn = announcements.get(alice) || 0
   alice.chat('/kill')
   await respawned
   await sleep(500)
+  if (process.env.QA_REQUIRE_RESPAWN_DISCOVERY === 'true') {
+    const discoveryDeadline = Date.now() + 5000
+    while ((announcements.get(alice) || 0) <= beforeRespawn && Date.now() < discoveryDeadline) await sleep(50)
+  }
+  const discoveryRenewed = (announcements.get(alice) || 0) > beforeRespawn
+  if (process.env.QA_REQUIRE_RESPAWN_DISCOVERY === 'true' && !discoveryRenewed) throw new Error('respawn did not renew native discovery')
   const respawnContext = await proofFor(alice, 'BridgeQA_A')
   if (respawnContext !== proofs[0]) throw new Error('respawn changed the shared connection identity')
   alice.chat('QA_PUBLIC_RESPAWN')
@@ -86,7 +102,7 @@ async function run () {
   await quit(alice)
   await quit(bob)
   if (controls.size !== 3) throw new Error('private or command control message did not reach clients')
-  fs.writeFileSync('/qa/work/actors-done.json', JSON.stringify({ ok: true, proofs, respawn: true, controls: [...controls].sort() }))
+  fs.writeFileSync('/qa/work/actors-done.json', JSON.stringify({ ok: true, proofs, respawn: true, respawnDiscovery: discoveryRenewed, controls: [...controls].sort() }))
   clearTimeout(timer)
 }
 run().catch(fail)
