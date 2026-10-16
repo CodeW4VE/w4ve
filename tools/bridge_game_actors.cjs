@@ -15,6 +15,12 @@ const announcements = new WeakMap()
 const controls = new Set()
 const relayCounts = new WeakMap()
 const filteredCounts = new WeakMap()
+const readyTimers = new WeakMap()
+const nativeMessages = []
+function observeRelayText (bot, text) {
+  if (text === '[general] BridgeQA_A: QA_NATIVE_RELAY') relayCounts.set(bot, (relayCounts.get(bot) || 0) + 1)
+  if (text === '[general] RemoteQA: QA_NATIVE_FILTERED') filteredCounts.set(bot, (filteredCounts.get(bot) || 0) + 1)
+}
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const timer = setTimeout(() => fail(), 90000)
 let stage = 'joining'
@@ -32,8 +38,7 @@ async function join (username) {
   bots.add(bot)
   bot.on('message', message => {
     const text = message.toString()
-    if (text === '[general] BridgeQA_A: QA_NATIVE_RELAY') relayCounts.set(bot, (relayCounts.get(bot) || 0) + 1)
-    if (text === '[general] RemoteQA: QA_NATIVE_FILTERED') filteredCounts.set(bot, (filteredCounts.get(bot) || 0) + 1)
+    observeRelayText(bot, text)
     for (const marker of ['QA_PRIVATE', 'QA_COMMAND_ME', 'QA_COMMAND_SAY']) {
       if (text.includes(marker)) controls.add(marker)
     }
@@ -84,6 +89,7 @@ function post (path, body, token = '') {
   })
 }
 async function quit (bot) {
+  clearInterval(readyTimers.get(bot))
   const ended = once(bot, 'end')
   bot.quit()
   await ended
@@ -93,6 +99,23 @@ async function quit (bot) {
 async function run () {
   let alice = await join('BridgeQA_A')
   const bob = await join('BridgeQA_B')
+  if (process.env.QA_REQUIRE_NATIVE_PAYLOAD === 'true') {
+    // Protocol actor, not the graphical client. Alice advertises native support;
+    // Bob deliberately remains vanilla to exercise both dispatch branches.
+    alice._client.registerChannel('wavechat:native_delivery', 'string', true)
+    alice._client.on('wavechat:native_delivery', text => {
+      try {
+        const envelope = JSON.parse(text), message = envelope.message
+        if (envelope.protocol !== 2 || envelope.instance !== fixture.instance || envelope.connection !== proofs[0]
+          || message.community !== fixture.community || message.channel !== 'general' || !/^m_[a-f0-9]{32}$/.test(message.id)
+          || message.revision !== 1 || message.provenance.kind !== 'native') throw new Error('native delivery scope mismatch')
+        nativeMessages.push({ id: message.id, connection: envelope.connection, revision: message.revision })
+        observeRelayText(alice, '[' + message.channel + '] ' + message.name + ': ' + message.body)
+      } catch (_) { fail() }
+    })
+    const heartbeat = () => alice._client.write('custom_payload', { channel: 'wavechat:native_ready', data: Buffer.concat([Buffer.from([32]), Buffer.from(proofs[0])]) })
+    heartbeat(); readyTimers.set(alice, setInterval(heartbeat, 1500))
+  }
   alice.chat('QA_PUBLIC_FIRST')
   await sleep(500)
   bob.chat('QA_PUBLIC_BOB')
@@ -156,8 +179,9 @@ async function run () {
   await sleep(500)
   await quit(alice)
   await quit(bob)
+  if (process.env.QA_REQUIRE_NATIVE_PAYLOAD === 'true' && (nativeMessages.length !== 2 || new Set(nativeMessages.map(m => m.id)).size !== 2)) throw new Error('typed native messages missing or repeated')
   if (controls.size !== 3) throw new Error('private or command control message did not reach clients')
-  fs.writeFileSync('/qa/work/actors-done.json', JSON.stringify({ ok: true, proofs, respawn: true, respawnDiscovery: discoveryRenewed, controls: [...controls].sort(), nativeRelay: process.env.QA_REQUIRE_RELAY === 'true' ? 'passed' : 'not tested', nativeFilterNoReplay: process.env.QA_REQUIRE_RELAY === 'true' ? 'passed' : 'not tested' }))
+  fs.writeFileSync('/qa/work/actors-done.json', JSON.stringify({ ok: true, proofs, respawn: true, respawnDiscovery: discoveryRenewed, controls: [...controls].sort(), nativeRelay: process.env.QA_REQUIRE_RELAY === 'true' ? 'passed' : 'not tested', nativeFilterNoReplay: process.env.QA_REQUIRE_RELAY === 'true' ? 'passed' : 'not tested', nativeMessages }))
   clearTimeout(timer)
 }
 run().catch(fail)

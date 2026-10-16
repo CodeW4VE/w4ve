@@ -233,6 +233,10 @@ def main():
                         relayed = [m for m in messages if m['body'] in ('QA_NATIVE_RELAY', 'QA_NATIVE_FILTERED')]
                         if len(relayed) != 2 or actors.get('nativeRelay') != 'passed' or actors.get('nativeFilterNoReplay') != 'passed':
                             raise AssertionError('real HTTPS to Minecraft relay not observed by both actors')
+                        if os.environ.get('QA_REQUIRE_NATIVE_PAYLOAD') == 'true':
+                            native_messages = actors.get('nativeMessages', [])
+                            if len(native_messages) != 2 or {m['id'] for m in native_messages} != {m['id'] for m in relayed}:
+                                raise AssertionError('native wire payload did not retain canonical message IDs')
                         if database.execute('SELECT COUNT(*) FROM core_outbox WHERE delivered=1').fetchone()[0] != 2:
                             raise AssertionError('real relay did not acknowledge its delivery')
                         messages = [m for m in messages if m['id'] not in {r['id'] for r in relayed}]
@@ -285,6 +289,7 @@ def main():
                 result['canonical_capture_provenance'] = 'passed' if os.environ.get('QA_REQUIRE_PROVENANCE') == 'true' else 'not required'
                 result['real_https_to_game_relay'] = 'passed' if relay_mode else 'not tested'
                 result['real_origin_filter_no_replay'] = 'passed' if relay_mode else 'not tested'
+                result['native_wire_ids_and_vanilla_fallback'] = 'passed' if os.environ.get('QA_REQUIRE_NATIVE_PAYLOAD') == 'true' else 'not tested'
             (root / "result.json").write_text(json.dumps(result, sort_keys=True, indent=2))
             print(json.dumps(result, sort_keys=True), flush=True)
         finally:
