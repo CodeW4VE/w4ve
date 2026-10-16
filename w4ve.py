@@ -3797,6 +3797,57 @@ def runtime_pieces(server, rt):
     return guardian, command
 
 
+def cmd_exec_service(args, index):
+    """One local maintenance command, with exactly the installed service grants.
+    Does not start/restart the guardian or accept credentials on the command line.
+    """
+    server = need_server(args)
+    raw = (server.config.get('services') or {}).get(args.service)
+    command = list(args.command)
+    if command[:1] == ['--']:
+        command = command[1:]
+    if not isinstance(raw, dict) or (not command and not args.python_module):
+        problem('use an existing service name and a command after --')
+        return 1
+    if args.dry_run:
+        say('would run one command with the declared service environment; no processes or credentials changed')
+        return 0
+    try:
+        pid = owner_of(server, 'services', args.service)
+        service, answers = with_answers(server, pid, {**raw, 'name': args.service})
+        if args.python_module:
+            original = service.get('command')
+            if (not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.]{0,127}', args.python_module)
+                    or not isinstance(original, list) or len(original) < 2 or original[1] != '-m'):
+                raise ValueError('module maintenance requires a configured Python module service')
+            command = [original[0], '-m', args.python_module, *command]
+        environment = {**answers, **(service.get('env') or {})}
+        binding = (server.state['pieces'].get(pid) or {}).get('pairing') if pid else None
+        if binding and service.get('w4ve_api') == 'identity':
+            from pairing import contained, declaration
+            environment['W4VE_PAIRING_CONFIG'] = str(contained(server.root, declaration(binding)['consumer_config']))
+        module = settings_module()
+        if module and module.unresolved(environment):
+            raise ValueError('service settings are incomplete')
+        from api import service_environment
+        environment = service_environment(server.root, server.config, args.service, env=environment,
+            w4ve_api=service.get('w4ve_api'), w4ve_events=service.get('w4ve_events'),
+            game_dir=server.root / server.game_dir)
+        if service.get('mcdr'):
+            compat = Path(__file__).resolve().parent / 'compat'
+            if not (compat / 'mcdreforged/__init__.py').is_file():
+                raise ValueError('MCDR compatibility package is missing')
+            environment['PYTHONPATH'] = str(compat) + os.pathsep + environment.get('PYTHONPATH', '')
+        inherited = {key: value for key, value in os.environ.items() if not key.startswith('W4VE_')}
+        inherited.update(environment)
+        return subprocess.run(command, cwd=server.root / service.get('cwd', '.'), env=inherited).returncode
+    except (ValueError, OSError, ImportError, AttributeError):
+        # Do not echo expanded settings, commands or exception text: they can
+        # contain credentials. The child owns its domain-specific diagnostics.
+        problem('service maintenance could not start; check its settings, runtime SDK and executable')
+        return 1
+
+
 def cmd_run(args, index):
     """Own the server in the foreground, which is what a container wants."""
     rt = need_runtime()
@@ -4133,6 +4184,11 @@ def build_parser():
                      help="take the running server, console and all, from the "
                           "guardian that has it, without restarting it")
 
+    maintenance = add('exec-service', cmd_exec_service, 'run one maintenance command with an installed service environment')
+    maintenance.add_argument('--python-module', help='use this module with the configured Python service interpreter')
+    maintenance.add_argument('service', help='existing service name')
+    maintenance.add_argument('command', nargs=argparse.REMAINDER, help='command and arguments after --')
+
     start = add("start", cmd_start, "start the server with the guardian already up")
     start.add_argument("process", nargs="?", default="server",
                        help="which process (default: the server)")
@@ -4160,7 +4216,7 @@ def build_parser():
                       help="the guardian journal instead of the console")
 
     for name in ("run", "start", "stop", "console", "logs", "pack", "repair",
-                 "plugins", "configure", "http", "storage", "dev", "api"):
+                 "plugins", "configure", "http", "storage", "dev", "api", "exec-service"):
         subparsers.choices[name].set_defaults(needs_index=False)
 
     for name, sub in subparsers.choices.items():

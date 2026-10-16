@@ -474,6 +474,33 @@ class Tokens:
             return False
 
 
+def service_environment(root, config, name, *, env=None, w4ve_api=None, w4ve_events=None, game_dir=None):
+    """Same declared credentials/SDK for a supervised service or an operator's
+    one-shot maintenance command. Never allocate operator scopes to a service.
+    """
+    root, env = Path(root), dict(env or {})
+    if w4ve_api not in (None, 'identity') or w4ve_events not in (None, 'presence', 'chat'):
+        raise ValueError('invalid service API grant')
+    if (w4ve_api or w4ve_events) and (config.get('api') or {}).get('enabled') is False:
+        raise ValueError('service requires the local API, which is explicitly disabled')
+    if w4ve_api or w4ve_events:
+        sdk = Path(__file__).resolve().parent / 'sdk/client'
+        if not (sdk / 'w4ve_client.py').is_file():
+            raise ValueError('W4VE client SDK is missing from this runtime')
+        existing = env.get('PYTHONPATH') or os.environ.get('PYTHONPATH')
+        env['PYTHONPATH'] = str(sdk) + (os.pathsep + existing if existing else '')
+        env['W4VE_SERVER_ROOT'] = str(root)
+    # Ordinary services still work with an absent/broken token registry.
+    env['W4VE_EVENTS_TOKEN'] = Tokens(root).service_events(name, w4ve_events) if w4ve_events else ''
+    env['W4VE_EVENTS_ADDRESS'] = str((config.get('api') or {}).get('listen') or '')
+    if w4ve_api:
+        env['W4VE_IDENTITY_TOKEN'] = Tokens(root).service_identity(name)
+        game_dir = Path(game_dir) if game_dir is not None else root / (config.get('server') or {}).get('game_dir', '.')
+        env['W4VE_GAME_DIR'] = str(game_dir.resolve())
+        env['W4VE_IDENTITY_ADDRESS'] = str((config.get('api') or {}).get('listen') or '')
+    return env
+
+
 def allowed(scope, needed):
     """Is `scope` enough for something that needs `needed`?"""
     if needed is None:

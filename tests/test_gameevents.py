@@ -50,6 +50,18 @@ class GameEventTests(unittest.TestCase):
             self.assertNotIn(self.source.token, json.dumps(list(db.execute("SELECT * FROM game_sources"))))
         self.assertNotIn(self.source.token, json.dumps(self.journal.poll()))
 
+    def test_poll_tail_is_atomic_and_independent_of_page_or_hidden_chat(self):
+        self.join()
+        self.journal.append(self.source, self.chat())
+        page = self.journal.poll(limit=1)
+        self.assertEqual((page['floor'], page['cursor'], page['tail'], page['more']), (0, 1, 3, True))
+        hidden = self.journal.poll(2, epoch=page['epoch'], limit=1)
+        self.assertEqual(hidden['events'], [])
+        self.assertEqual((hidden['cursor'], hidden['tail'], hidden['more']), (3, 3, False))
+        visible = self.journal.poll(2, epoch=page['epoch'], limit=1, chat=True)
+        self.assertEqual(visible['events'][0]['kind'], 'player.chat')
+        self.assertEqual((visible['cursor'], visible['tail']), (3, 3))
+
     def test_receipt_replay_survives_restart_without_reapplying_old_join(self):
         first = self.join()
         receipt = self.journal.append(self.source, first)

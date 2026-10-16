@@ -342,7 +342,8 @@ class GameEvents:
             events = [{"cursor": row["cursor"], **json.loads(row["payload"])} for row in rows
                       if chat or row["kind"] != "player.chat"]
             return {"epoch": current, "reset": reset, "floor": floor,
-                    "cursor": rows[-1]["cursor"] if rows else cursor, "events": events, "more": bool(rows and rows[-1]["cursor"] < tail)}
+                    "cursor": rows[-1]["cursor"] if rows else cursor, "tail": tail,
+                    "events": events, "more": bool(rows and rows[-1]["cursor"] < tail)}
 
     def roster(self, source):
         with self._db() as db:
