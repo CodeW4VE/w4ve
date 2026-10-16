@@ -202,6 +202,61 @@ class Authority:
                        (community, instance, audience))
             self._changed(db, community)
 
+    def capture_bindings(self):
+        """Internal boot snapshot, without issuer secrets or player sessions.
+
+        A boot created before enrollment must not acquire an origin later.
+        The authority epoch prevents relabeling after replacing its database.
+        """
+        with self._db() as db:
+            db.execute("BEGIN")
+            rows = db.execute("""SELECT b.owner,b.community,b.instance,b.audience
+                FROM identity_bindings b JOIN identity_instances i
+                ON i.community=b.community AND i.instance=b.instance
+                WHERE i.enabled=1 ORDER BY b.owner LIMIT 65""").fetchall()
+            if len(rows) > 64:
+                raise ValueError("too many capture bindings")
+            return {"epoch": db.execute("SELECT value FROM identity_meta WHERE key='epoch'").fetchone()[0],
+                    "owners": {row["owner"]: {name: row[name] for name in ("community", "instance", "audience")}
+                               for row in rows}}
+
+    def authorize_captured_chat(self, captured, owner, resource):
+        """Internal: authorize a journal lookup, never a caller-supplied actor.
+
+        This returns no session or bearer credential. Leaving the game does
+        not invalidate captured history; current blocks/sharing/grants do.
+        """
+        key(owner); key(resource)
+        event, bindings = captured["event"], captured["bindings"]
+        if event["kind"] != "player.chat" or not bindings:
+            raise IdentityDenied("capture has no enrolled origin")
+        origin = bindings["owners"].get(owner)
+        if origin is None:
+            raise IdentityDenied("capture has no enrolled origin")
+        community, instance, audience = (origin[name] for name in ("community", "instance", "audience"))
+        subject = "minecraft:" + event["data"]["uuid"]
+        with self._db() as db:
+            db.execute("BEGIN")
+            epoch = db.execute("SELECT value FROM identity_meta WHERE key='epoch'").fetchone()[0]
+            binding = db.execute("""SELECT b.community,b.instance,b.audience FROM identity_bindings b
+                JOIN identity_instances i ON i.community=b.community AND i.instance=b.instance
+                WHERE b.owner=? AND i.enabled=1""", (owner,)).fetchone()
+            if epoch != bindings["epoch"] or binding is None or tuple(binding) != (community, instance, audience):
+                raise IdentityDenied("capture origin is no longer available")
+            shared = db.execute("""SELECT 1 FROM identity_instance_resources
+                WHERE community=? AND instance=? AND audience=? AND resource=?""",
+                                (community, instance, audience, resource)).fetchone()
+            blocked = db.execute("SELECT 1 FROM identity_blocked WHERE community=? AND subject=?",
+                                 (community, subject)).fetchone()
+            operations = {row[0] for row in db.execute("""SELECT operation FROM identity_grants
+                WHERE community=? AND audience=? AND resource=? AND subject IN (?, '*')""",
+                                                       (community, audience, resource, subject))}
+            return {"kind": "captured-chat", "community": community, "origin": instance,
+                    "audience": audience, "subject": subject, "name": event["data"]["name"],
+                    "connection": event["data"]["connection"], "resource": resource,
+                    "allowed": shared is not None and blocked is None and {"chat.read", "chat.publish"} <= operations,
+                    "policy_revision": self._revision(db, community)}
+
     def create_instance_session(self, proof, audience):
         """Typed issuer role: cannot be inspected or used as a player session."""
         key(audience)

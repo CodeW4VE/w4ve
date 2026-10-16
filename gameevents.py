@@ -100,6 +100,11 @@ class GameEvents:
                     boot TEXT NOT NULL,uuid TEXT NOT NULL,connection TEXT NOT NULL,name TEXT NOT NULL,
                     PRIMARY KEY(boot,uuid),FOREIGN KEY(boot) REFERENCES game_sources(boot));
             """)
+            db.execute("BEGIN IMMEDIATE")
+            if "bindings" not in {row[1] for row in db.execute("PRAGMA table_info(game_sources)")}:
+                # Existing boots remain explicitly unattributed. Never backfill
+                # their origin from a pairing created after capture.
+                db.execute("ALTER TABLE game_sources ADD COLUMN bindings TEXT NOT NULL DEFAULT '{}'")
             for key, value in (("schema", "1"), ("epoch", uuid.uuid4().hex), ("floor", "0"), ("received", "0")):
                 db.execute("INSERT OR IGNORE INTO game_meta VALUES (?,?)", (key, value))
             if self._meta(db, "schema") != "1":
@@ -135,18 +140,57 @@ class GameEvents:
             db.execute("DELETE FROM game_players WHERE boot=?", (boot,))
             db.execute("DELETE FROM game_sources WHERE boot=?", (boot,))
 
-    def open_source(self, label="server"):
+    def open_source(self, label="server", *, bindings=None):
         if not isinstance(label, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", label):
             raise ValueError("invalid game source label")
+        bindings = self._bindings({} if bindings is None else bindings)
         source = Source(uuid.uuid4().hex, secrets.token_urlsafe(32))
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             self._prune(db, int(self.clock()))
             if db.execute("SELECT COUNT(*) FROM game_sources").fetchone()[0] >= 64:
                 raise Backpressure("game source quota reached")
-            db.execute("INSERT INTO game_sources(boot,digest,label,created) VALUES (?,?,?,?)",
-                       (source.boot, hashlib.sha256(source.token.encode()).hexdigest(), label, int(self.clock())))
+            db.execute("INSERT INTO game_sources(boot,digest,label,created,bindings) VALUES (?,?,?,?,?)",
+                       (source.boot, hashlib.sha256(source.token.encode()).hexdigest(), label, int(self.clock()), encode(bindings)))
         return source
+
+    @staticmethod
+    def _bindings(value):
+        if value == {}:
+            return {}
+        from identity import key
+        if (not isinstance(value, dict) or set(value) != {"epoch", "owners"}
+                or not isinstance(value["owners"], dict) or len(value["owners"]) > 64):
+            raise ValueError("invalid source identity bindings")
+        hex_id(value["epoch"])
+        for owner, binding in value["owners"].items():
+            key(owner)
+            if not isinstance(binding, dict) or set(binding) != {"community", "instance", "audience"}:
+                raise ValueError("invalid source identity binding")
+            for item in binding.values():
+                key(item)
+        return value
+
+    def captured_chat(self, epoch, boot, event_id):
+        """Internal immutable capture lookup; not a player or presence proof.
+
+        Callers must separately check reader grants and current channel policy.
+        Only references are accepted; no caller-supplied UUID/body/connection.
+        """
+        hex_id(epoch); hex_id(boot); hex_id(event_id)
+        if not self.chat:
+            raise ChatDisabled("game chat journal is disabled")
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._prune(db, int(self.clock()))
+            if self._meta(db, "epoch") != epoch:
+                raise SourceDenied("capture unavailable")
+            row = db.execute("""SELECT e.payload,s.bindings FROM game_events e
+                JOIN game_sources s ON s.boot=e.boot
+                WHERE e.boot=? AND e.event_id=? AND e.kind='player.chat'""", (boot, event_id)).fetchone()
+            if row is None:
+                raise SourceDenied("capture unavailable")
+            return {"event": json.loads(row["payload"]), "bindings": self._bindings(json.loads(row["bindings"]))}
 
     @staticmethod
     def _source(db, source):
@@ -328,6 +372,11 @@ class SourceRuntime:
         self.lock = threading.RLock()
         self.journal = GameEvents(self.root / "w4ve/game/events.sqlite3", **{
             key: value for key, value in policy.items() if key != "enabled"})
+        self.spool = self.root / "w4ve/game/capture-spool"
+        if self.spool.is_symlink():
+            raise ValueError("capture spool may not be a symlink")
+        self.spool.mkdir(exist_ok=True, mode=0o700)
+        os.chmod(self.spool, 0o700)
 
     @contextmanager
     def _locked(self):
@@ -434,11 +483,17 @@ class SourceRuntime:
             except SourceDenied:
                 pass
         endpoint = self._endpoint(api)
-        source = self.journal.open_source()
+        authority_path = self.root / "w4ve/identity/authority.sqlite3"
+        bindings = {}
+        if authority_path.exists() or authority_path.is_symlink():
+            from identity import Authority
+            bindings = Authority(authority_path).capture_bindings()
+        source = self.journal.open_source(bindings=bindings)
         try:
             self._write({"schema": 1, "owner": "w4ve-game-source", "boot": source.boot, "token": source.token,
                          "pid": None, "starttime": None, "chat": self.journal.chat,
-                         "created": int(self.journal.clock()), "last_alive": int(self.journal.clock()), **endpoint})
+                         "created": int(self.journal.clock()), "last_alive": int(self.journal.clock()),
+                         "spool": str(self.spool), "retention": self.journal.retention, **endpoint})
         except Exception:
             self.journal.retire_source(source)
             raise

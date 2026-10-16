@@ -83,6 +83,7 @@ ROUTES = {
     ("POST", "/v1/game/source/status"): "game-source",
     ("POST", "/v1/game/source/append"): "game-source",
     ("POST", "/v1/game/events/poll"): "game-events",
+    ("POST", "/v1/game/events/authorize-chat"): "game-chat",
 }
 
 # The two routes above with an `{id}` in them, as (method, prefix, suffix).
@@ -573,7 +574,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._fail(401, "no valid token")
                 return
             scope = entry.get("scope", "read")
-            if path == "/v1/game/events/poll" and not self.server.api.tokens.event_grant_active(entry):
+            if path.startswith("/v1/game/events/") and not self.server.api.tokens.event_grant_active(entry):
                 self._fail(403, "service event grant is no longer active")
                 return
             if not allowed(scope, needed):
@@ -813,8 +814,29 @@ class Api:
         except (ValueError, KeyError, TypeError):
             return 400, {"ok": False, "error": "invalid identity request"}
 
+    def _captured_chat(self, body):
+        if self.game_events is None:
+            return 503, {"ok": False, "error": "game event source is disabled"}
+        if not isinstance(body, dict) or set(body) != {"epoch", "boot", "id", "owner", "resource"}:
+            return 400, {"ok": False, "error": "invalid capture reference"}
+        from gameevents import SourceDenied
+        from identity import Authority, IdentityDenied
+        try:
+            captured = self.game_events.captured_chat(body["epoch"], body["boot"], body["id"])
+            with self._authority_lock:
+                if self._authority is None:
+                    self._authority = Authority(self.root / "w4ve/identity/authority.sqlite3")
+            claims = self._authority.authorize_captured_chat(captured, body["owner"], body["resource"])
+            return 200, {"ok": True, **claims, "event": captured["event"]}
+        except (SourceDenied, IdentityDenied):
+            return 403, {"ok": False, "error": "capture unavailable"}
+        except (ValueError, TypeError, KeyError):
+            return 400, {"ok": False, "error": "invalid capture reference"}
+
     def run(self, route, body, job_id=None):
         method, path = route
+        if path == "/v1/game/events/authorize-chat":
+            return self._captured_chat(body)
         if path == "/v1/game/events/poll":
             return self._game_poll(body)
         if path.startswith("/v1/identity/"):

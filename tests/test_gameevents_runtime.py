@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import itertools
 import json
 from pathlib import Path
+import os
 from types import SimpleNamespace
 import tempfile
 import unittest
@@ -45,6 +46,35 @@ class SourceRuntimeTests(unittest.TestCase):
         self.assertEqual(after["api_address"], "127.0.0.1:4321")
         self.assertEqual(after["last_alive"], self.now)
         self.assertEqual(successor.journal.authenticate(source.token), source)
+
+    def test_capture_spool_metadata_is_private_and_stable_across_handover(self):
+        self.start()
+        before = json.loads(self.bridge.path.read_text())
+        spool = self.root / "w4ve/game/capture-spool"
+        self.assertEqual(before["spool"], str(spool))
+        self.assertEqual(before["retention"], self.bridge.journal.retention)
+        self.assertTrue(before["chat"])
+        if os.name != "nt":
+            self.assertEqual(spool.stat().st_mode & 0o777, 0o700)
+        capture = spool / "preserved-fixture"
+        capture.write_bytes(b"private fixture")
+        successor = self.manager()
+        self.assertTrue(successor.reattach(self.proc, self.api))
+        self.assertEqual(json.loads(successor.path.read_text())["spool"], before["spool"])
+        self.assertEqual(capture.read_bytes(), b"private fixture")
+
+    @unittest.skipIf(os.name == "nt", "symlink fixture requires Linux")
+    def test_capture_spool_symlink_is_rejected_without_modifying_its_target(self):
+        spool = self.root / "w4ve/game/capture-spool"
+        spool.rmdir()
+        target = self.root / "unrelated-directory"
+        target.mkdir(mode=0o755)
+        (target / "original").write_bytes(b"preserved")
+        spool.symlink_to(target, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            self.manager()
+        self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+        self.assertEqual((target / "original").read_bytes(), b"preserved")
 
     def test_live_descriptor_cannot_be_replaced_and_restart_gets_a_new_capability(self):
         source = self.start()

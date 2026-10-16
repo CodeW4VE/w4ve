@@ -125,6 +125,14 @@ class W4VE:
         """Probe the identity service using its scoped service credential."""
         return self.call("POST", "/v1/identity/health", {})
 
+    def game_event_authorize_chat(self, epoch, boot, event_id, owner, resource):
+        """Resolve a captured chat reference with current sharing/player grants.
+
+        Requires the chat reader scope. The response is not a player session.
+        """
+        return self.call("POST", "/v1/game/events/authorize-chat", {
+            "epoch": epoch, "boot": boot, "id": event_id, "owner": owner, "resource": resource})
+
     def identity_instance_session(self, proof, audience):
         return self.call("POST", "/v1/identity/instance-session", {"proof": proof, "audience": audience})
 
