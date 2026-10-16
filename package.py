@@ -421,6 +421,8 @@ def timer_problems(component):
 
 def service_problems(component):
     out = []
+    if component.get("w4ve_events") not in (None, "presence", "chat"):
+        out.append("w4ve_events must be presence or chat")
     if component.get("w4ve_api") not in (None, "identity"):
         out.append("w4ve_api must be identity; services cannot request operator scopes")
     python = component.get("python") or {}
@@ -713,6 +715,8 @@ class Install:
             fields["mcdr"] = True
         if component.get("w4ve_api"):
             fields["w4ve_api"] = component["w4ve_api"]
+        if component.get("w4ve_events"):
+            fields["w4ve_events"] = component["w4ve_events"]
         if component.get("stop_grace"):
             fields["stop_grace"] = int(component["stop_grace"])
         self.server.set_service(component["name"], fields,

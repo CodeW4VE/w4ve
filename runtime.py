@@ -858,6 +858,7 @@ class Guardian:
         # The local API (M8), if this w4ve carries it and the server wants it.
         self.api = None
         self.identity_services = set()
+        self.event_services = set()
         self.game_bridge = None
         self._source_check_at = 0
 
@@ -969,25 +970,36 @@ class Guardian:
 
     def add_service(self, name, command, cwd, restart="on-failure",
                     health=None, health_every=30, env=None, mcdr=False,
-                    stop_grace=SERVICE_GRACE, after=(), w4ve_api=None):
+                    stop_grace=SERVICE_GRACE, after=(), w4ve_api=None, w4ve_events=None):
         env = dict(env or {})
-        if w4ve_api is not None:
-            if w4ve_api != "identity":
-                raise ValueError("services may request only the identity API scope")
-            if (self.config.get("api") or {}).get("enabled") is False:
-                raise ValueError("identity service requires the local API, which is explicitly disabled")
+        if w4ve_api not in (None, "identity") or w4ve_events not in (None, "presence", "chat"):
+            raise ValueError("invalid service API grant")
+        if (w4ve_api or w4ve_events) and (self.config.get("api") or {}).get("enabled") is False:
+            raise ValueError("service requires the local API, which is explicitly disabled")
+        if w4ve_api or w4ve_events:
             sdk = Path(__file__).resolve().parent / "sdk" / "client"
             if not (sdk / "w4ve_client.py").is_file():
                 raise ValueError("W4VE client SDK is missing from this runtime")
-            from api import Tokens
-            env["W4VE_IDENTITY_TOKEN"] = Tokens(self.root).service_identity(name)
+            existing = env.get("PYTHONPATH") or os.environ.get("PYTHONPATH")
+            env["PYTHONPATH"] = str(sdk) + (os.pathsep + existing if existing else "")
             env["W4VE_SERVER_ROOT"] = str(self.root)
+        from api import Tokens
+        # Ordinary services do not depend on a healthy API token registry.
+        # Removed declarations are rejected at request time by the API; removal
+        # through the CLI also revokes the stored credential.
+        event_token = Tokens(self.root).service_events(name, w4ve_events) if w4ve_events else ""
+        env["W4VE_EVENTS_TOKEN"] = event_token
+        env["W4VE_EVENTS_ADDRESS"] = str((self.config.get("api") or {}).get("listen") or "")
+        if w4ve_events:
+            self.event_services.add(name)
+        else:
+            self.event_services.discard(name)
+        if w4ve_api is not None:
+            env["W4VE_IDENTITY_TOKEN"] = Tokens(self.root).service_identity(name)
             game = self.watched.get("server")
             game_dir = game.cwd if game is not None else self.root / (self.config.get("server") or {}).get("game_dir", ".")
             env["W4VE_GAME_DIR"] = str(game_dir.resolve())
             env["W4VE_IDENTITY_ADDRESS"] = str((self.config.get("api") or {}).get("listen") or "")
-            existing = env.get("PYTHONPATH") or os.environ.get("PYTHONPATH")
-            env["PYTHONPATH"] = str(sdk) + (os.pathsep + existing if existing else "")
             self.identity_services.add(name)
         if mcdr:
             # The service said it imports `mcdreforged`. ChatBridge's daemon
@@ -1354,7 +1366,7 @@ class Guardian:
         """
         section = self.config.get("api") or {}
         bridge = self.config.get("bridge") or {}
-        if not section.get("enabled", bool(self.identity_services) or bridge.get("enabled") is True):
+        if not section.get("enabled", bool(self.identity_services or self.event_services) or bridge.get("enabled") is True):
             return False, "the api is off for this server"
         try:
             from api import Api
@@ -1370,7 +1382,7 @@ class Guardian:
                 self.game_bridge = None
         instance = Api(self.root, guardian=self,
                        address=section.get("listen") or None,
-                       tokens_required=True if self.identity_services or self.game_bridge else section.get("tokens"),
+                       tokens_required=True if self.identity_services or self.event_services or self.game_bridge else section.get("tokens"),
                        game_events=self.game_bridge.journal if self.game_bridge else None)
         ok, message = instance.start()
         self.log("api: " + message)
@@ -1858,6 +1870,7 @@ def services_from(config):
             # get one class out of it.
             "mcdr": bool(entry.get("mcdr")),
             "w4ve_api": entry.get("w4ve_api"),
+            "w4ve_events": entry.get("w4ve_events"),
         })
     return out
 

@@ -49,7 +49,7 @@ VERSION = 1
 # Operator scopes are cumulative: `write` implies `read`, because
 # a client allowed to stop a server and not to look at it is a client that has
 # to guess. `identity` is a separate service scope, never server control.
-SCOPES = ("read", "write", "admin", "identity")
+SCOPES = ("read", "write", "admin", "identity", "game-events", "game-chat")
 
 # Every operation, and the least scope it needs. A method that is not in here
 # does not exist, which is the only way to be sure the list is the whole list.
@@ -82,7 +82,7 @@ ROUTES = {
     ("POST", "/v1/identity/instance-recipients"): "identity",
     ("POST", "/v1/game/source/status"): "game-source",
     ("POST", "/v1/game/source/append"): "game-source",
-    ("POST", "/v1/game/events/poll"): "admin",
+    ("POST", "/v1/game/events/poll"): "game-events",
 }
 
 # The two routes above with an `{id}` in them, as (method, prefix, suffix).
@@ -403,6 +403,33 @@ class Tokens:
                 self._write(data)
         return len(gone)
 
+    def service_events(self, name, policy):
+        """A separate, revocable reader credential; changing policy rotates it.
+
+        No identity, producer or operator privileges are inherited. Passing
+        None removes the reader grant, including at guardian reconfiguration.
+        """
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", name):
+            raise ValueError("invalid service name")
+        if policy not in (None, "presence", "chat"):
+            raise ValueError("w4ve_events must be presence or chat")
+        owner = "service-events:" + name
+        scope = {"presence": "game-events", "chat": "game-chat"}.get(policy)
+        with self._locked():
+            data = self._read(strict=True)
+            found = [(token, entry) for token, entry in data.items() if entry.get("name") == owner]
+            if (len(found) > 1 or any(entry.get("scope") not in ("game-events", "game-chat") for _, entry in found)):
+                raise ValueError("service event token registry conflicts; revoke it first")
+            if scope and found and found[0][1].get("scope") == scope:
+                return found[0][0]
+            for token, _ in found:
+                del data[token]
+            if scope:
+                return self._issue(data, owner, scope)
+            if found:
+                self._write(data)
+            return ""
+
     def listing(self):
         """Names and scopes. **Never the tokens themselves.**"""
         return sorted(({"name": e.get("name"), "scope": e.get("scope"),
@@ -426,6 +453,25 @@ class Tokens:
             return False
         return bool(stat.S_IMODE(self.path.stat().st_mode) & 0o077)
 
+    def event_grant_active(self, entry):
+        """Recheck managed reader declarations, even after a hand edit/removal.
+
+        Operator-issued tokens are explicit grants in the registry itself.
+        Managed service tokens additionally require their current declaration.
+        Never cache this across requests or rely on the guardian's old config.
+        """
+        name = entry.get("name", "")
+        if not isinstance(name, str) or not name.startswith("service-events:"):
+            return True
+        try:
+            from w4ve import read_toml
+            config = read_toml(self.path.parent.parent / "w4ve.toml")
+            service = (config.get("services") or {}).get(name[len("service-events:"):]) or {}
+            expected = {"presence": "game-events", "chat": "game-chat"}.get(service.get("w4ve_events"))
+            return expected is not None and expected == entry.get("scope")
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+
 
 def allowed(scope, needed):
     """Is `scope` enough for something that needs `needed`?"""
@@ -435,7 +481,9 @@ def allowed(scope, needed):
         return False
     if scope == "admin":
         return True
-    if scope == "identity" or needed == "identity":
+    if needed == "game-events" and scope == "game-chat":
+        return True
+    if scope in ("identity", "game-events", "game-chat") or needed in ("identity", "game-events", "game-chat"):
         return scope == needed
     hierarchy = ("read", "write", "admin")
     return hierarchy.index(scope) >= hierarchy.index(needed)
@@ -525,6 +573,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._fail(401, "no valid token")
                 return
             scope = entry.get("scope", "read")
+            if path == "/v1/game/events/poll" and not self.server.api.tokens.event_grant_active(entry):
+                self._fail(403, "service event grant is no longer active")
+                return
             if not allowed(scope, needed):
                 self._fail(403, "this token is %s and that needs %s"
                            % (scope, needed), needed=needed, scope=scope)
@@ -534,6 +585,10 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._fail(400, str(exc))
             return
+        if path == "/v1/game/events/poll" and isinstance(body, dict) and body.get("chat") is True:
+            if not allowed(scope, "game-chat"):
+                self._fail(403, "reading game chat requires a separate chat grant")
+                return
         try:
             code, payload = self.server.api.run(route, body, job_id)
         except Exception as exc:            # noqa: BLE001

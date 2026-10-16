@@ -180,6 +180,7 @@ class InstallCase(unittest.TestCase):
              "command": ["python3", "app.py"], "cwd": "w4ve/services/thing",
              "restart": "on-failure", "reload": "hot",
              "w4ve_api": "identity",
+             "w4ve_events": "chat",
              "python": {"requires": ["json"]},
              "health": {"http": "http://127.0.0.1:9/health", "every": 15}},
         ])
@@ -202,6 +203,7 @@ class InstallCase(unittest.TestCase):
         self.assertEqual(service["health_url"], "http://127.0.0.1:9/health")
         self.assertEqual(service["python_requires"], ["json"])
         self.assertEqual(service["w4ve_api"], "identity")
+        self.assertEqual(service["w4ve_events"], "chat")
 
     def test_removing_takes_out_what_it_put_in_and_leaves_the_rest(self):
         data = manifest(id="withservice", components=[

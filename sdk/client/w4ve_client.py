@@ -117,7 +117,7 @@ class W4VE:
         return self.call("POST", "/v1/game/source/append", event)
 
     def game_events(self, cursor=0, *, epoch="", limit=100, chat=False):
-        """Administrative journal inspection; service grants are separate work."""
+        """Read typed captures with an event-reader grant; chat needs its own grant."""
         return self.call("POST", "/v1/game/events/poll", {
             "cursor": cursor, "epoch": epoch, "limit": limit, "chat": chat})
 

@@ -549,6 +549,10 @@ class Server:
         comment and change by hand, in the same file as everything else about
         this server.
         """
+        old = (self.config.get("services") or {}).get(name) or {}
+        if old.get("w4ve_events") != fields.get("w4ve_events"):
+            from api import Tokens
+            Tokens(self.root).service_events(name, None)
         self._set_block("services", name, fields, owner)
 
     def set_watch(self, name, fields, owner=""):
@@ -679,6 +683,7 @@ class Server:
     def remove_service(self, name):
         from api import Tokens
         Tokens(self.root).revoke("service:" + name)
+        Tokens(self.root).service_events(name, None)
         self._remove_block("services", name)
 
     def remove_watch(self, name):
@@ -3772,6 +3777,7 @@ def runtime_pieces(server, rt):
                                  env=environment,
                                  mcdr=service.get("mcdr", False),
                                  w4ve_api=service.get("w4ve_api"),
+                                 w4ve_events=service.get("w4ve_events"),
                                  stop_grace=service.get("stop_grace", rt.SERVICE_GRACE),
                                  after=service.get("after") or ())
         except (ValueError, OSError) as exc:
