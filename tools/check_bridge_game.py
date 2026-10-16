@@ -214,6 +214,18 @@ def main():
                         or [message['subject'] for message in messages] != ['minecraft:' + chat['data']['uuid'] for chat in chats]):
                     raise AssertionError('actual Fabric capture did not reach canonical hub without origin echo')
                 (root / 'hub-messages.json').write_text(json.dumps(messages, sort_keys=True, indent=2))
+                if os.environ.get('QA_REQUIRE_PROVENANCE') == 'true':
+                    database = sqlite3.connect(root / 'hub-data/wavechat-core.sqlite3')
+                    try:
+                        rows = database.execute('SELECT p.payload FROM core_provenance p JOIN core_messages m ON m.id=p.message ORDER BY m.rowid').fetchall()
+                    finally:
+                        database.close()
+                    provenance = [json.loads(row[0]) for row in rows]
+                    expected_provenance = [{'kind': 'game-capture', 'boot': chat['boot'], 'event': chat['id'],
+                        'connection': chat['data']['connection'], 'signature_sha256': chat['data']['signature_sha256']} for chat in chats]
+                    if provenance != expected_provenance:
+                        raise AssertionError('canonical hub lost actual Fabric capture provenance')
+                    (root / 'hub-provenance.json').write_text(json.dumps(provenance, sort_keys=True, indent=2))
             process.terminate()
             if process.wait(timeout=60) != 0:
                 raise AssertionError("guardian did not shut down cleanly")
@@ -241,6 +253,7 @@ def main():
                 result['origin_echo_suppressed'] = 'passed'
                 result['online_auth_gl_relay'] = 'not tested'
                 result['respawn_native_discovery'] = 'passed' if actors.get('respawnDiscovery') else 'not required'
+                result['canonical_capture_provenance'] = 'passed' if os.environ.get('QA_REQUIRE_PROVENANCE') == 'true' else 'not required'
             (root / "result.json").write_text(json.dumps(result, sort_keys=True, indent=2))
             print(json.dumps(result, sort_keys=True), flush=True)
         finally:
