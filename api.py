@@ -75,6 +75,8 @@ ROUTES = {
     ("POST", "/v1/identity/session"): "identity",
     ("POST", "/v1/identity/inspect"): "identity",
     ("POST", "/v1/identity/authorize"): "identity",
+    ("POST", "/v1/identity/profile"): "identity",
+    ("POST", "/v1/identity/profile-update"): "identity",
     ("POST", "/v1/identity/health"): "identity",
     ("POST", "/v1/identity/instance-resources"): "admin",
     ("POST", "/v1/identity/instance-session"): "identity",
@@ -830,7 +832,7 @@ class Api:
             return 400, {"ok": False, "error": "invalid game event query"}
 
     def _identity(self, path, body):
-        from identity import Authority, IdentityDenied
+        from identity import Authority, IdentityDenied, IdentityForbidden, IdentityConflict
         if not isinstance(body, dict):
             return 400, {"ok": False, "error": "identity request must be an object"}
         with self._authority_lock:
@@ -844,7 +846,7 @@ class Api:
                 result = {"service": "identity", "schema": 1, "capabilities": {
                     "player_proof": 1, "instance_sessions": 1,
                     "connection_context": 1, "resource_recipients": 1,
-                    "policy_revision": 1}}
+                    "policy_revision": 1, "editable_profiles": 1}}
             elif path == "/v1/identity/instances":
                 result = authority.register_instance(body["community"], body["instance"],
                                                      body.get("secret"), body.get("enabled", True))
@@ -861,6 +863,14 @@ class Api:
                 result = authority.inspect(body["session"], body["audience"])
             elif path == "/v1/identity/authorize":
                 result = authority.authorize(body["session"], body["audience"], body["resource"], body["operation"])
+            elif path in ("/v1/identity/profile", "/v1/identity/profile-update"):
+                fields = {'session', 'audience'} | ({'profile', 'revision'} if path.endswith('-update') else set())
+                if set(body) != fields:
+                    raise ValueError('invalid profile fields')
+                if path.endswith('-update') and (not isinstance(body['profile'], dict) or type(body['revision']) is not int):
+                    raise ValueError('invalid profile update')
+                result = authority.own_profile(body['session'], body['audience'],
+                    update=body.get('profile'), revision=body.get('revision'))
             elif path == "/v1/identity/instance-resources":
                 authority.set_instance_resources(body["community"], body["instance"], body["audience"], body["resources"])
                 result = {}
@@ -873,6 +883,10 @@ class Api:
             else:
                 return 404, {"ok": False, "error": "unknown identity operation"}
             return 200, {"ok": True, **result}
+        except IdentityForbidden:
+            return 403, {"ok": False, "error": "identity operation not granted"}
+        except IdentityConflict:
+            return 409, {"ok": False, "error": "identity revision changed"}
         except IdentityDenied:
             return 401, {"ok": False, "error": "identity unavailable"}
         except (ValueError, KeyError, TypeError):

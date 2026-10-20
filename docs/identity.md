@@ -141,3 +141,28 @@ resource list (empty revokes all). Guided pairing initializes sharing once.
 Old local bindings are upgraded only by an explicit configure operation;
 later revocations survive repeated configure. This does not implement remote
 instance enrollment, channel administration UI or Discord account linking.
+
+## Editable self profile (19 October 2026)
+
+The optional `editable_profiles:1` identity capability provides POST
+`/v1/identity/profile` (`session`, `audience`) and
+`/v1/identity/profile-update` (also `profile`, `revision`). Both require the
+identity service scope and a current player session. The player additionally
+needs `profile.read` or `profile.edit` on `profile:self`, granted explicitly by
+the operator. Pairing does not silently extend an existing resource policy.
+
+The profile object accepts exactly `display_name` (up to48 Unicode code points)
+and `bio` (up to500). Empty strings clear fields. Control/format characters are
+rejected, except newline in bio. The expected revision is zero initially;
+updates atomically increment it or return409. Invalid input returns400, an
+absent player grant403, and an invalid/expired player session401.
+
+The response contains community, subject, account_name, display_name, bio and
+revision. Subject/community always come from the verified session. Account_name
+is the issuer-attested Minecraft name, never the editable display name. No
+external account identifiers, links, avatars or other subjects can be supplied.
+Profiles persist across reconnects and are isolated per community. This self-only
+API does not expose a player directory or imply consent to publish a profile.
+Verified external account linking and public profile visibility remain separate
+work. SDK methods: identity_profile and identity_update_profile. SDK exceptions
+now preserve the HTTP code in an optional `status` attribute.

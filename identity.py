@@ -16,9 +16,18 @@ import secrets
 import sqlite3
 import time
 import uuid
+import unicodedata
 
 
 class IdentityDenied(Exception):
+    pass
+
+
+class IdentityForbidden(IdentityDenied):
+    pass
+
+
+class IdentityConflict(Exception):
     pass
 
 
@@ -68,6 +77,10 @@ class Authority:
                     community TEXT NOT NULL,audience TEXT NOT NULL,resource TEXT NOT NULL,
                     subject TEXT NOT NULL,operation TEXT NOT NULL,
                     PRIMARY KEY(community,audience,resource,subject,operation));
+                CREATE TABLE IF NOT EXISTS identity_profiles (
+                    community TEXT NOT NULL,subject TEXT NOT NULL,display_name TEXT NOT NULL,
+                    bio TEXT NOT NULL,revision INTEGER NOT NULL,
+                    PRIMARY KEY(community,subject));
                 CREATE TABLE IF NOT EXISTS identity_blocked (
                     community TEXT NOT NULL,subject TEXT NOT NULL,PRIMARY KEY(community,subject));
                 CREATE TABLE IF NOT EXISTS identity_bindings (
@@ -459,3 +472,42 @@ class Authority:
             grant = db.execute("SELECT 1 FROM identity_grants WHERE community=? AND audience=? AND resource=? AND operation=? AND subject IN (?, '*')",
                                (row["community"], audience, resource, operation, row["subject"])).fetchone()
             return {"allowed": grant is not None, "policy_revision": self._revision(db, row["community"])}
+
+    def own_profile(self, token, audience, *, update=None, revision=None):
+        """Editable community presentation; never changes verified account claims.
+
+        Deliberately self-only. Reading another player's profile or claiming an
+        external account requires a separate privacy/proof contract.
+        """
+        key(audience)
+        if update is not None:
+            if (not isinstance(update, dict) or set(update) != {'display_name', 'bio'}
+                    or type(revision) is not int or not 0 <= revision < 2 ** 31 - 1):
+                raise ValueError('invalid profile update')
+            for field, maximum in (('display_name', 48), ('bio', 500)):
+                value = update[field]
+                if (not isinstance(value, str) or len(value) > maximum
+                        or any(unicodedata.category(char).startswith('C') and not (field == 'bio' and char == '\n') for char in value)):
+                    raise ValueError('invalid profile text')
+            update = {field: value.strip() for field, value in update.items()}
+        elif revision is not None:
+            raise ValueError('revision requires a profile update')
+        with self._db() as db:
+            db.execute('BEGIN IMMEDIATE' if update is not None else 'BEGIN')
+            session = self._session(db, token, audience)
+            operation = 'profile.edit' if update is not None else 'profile.read'
+            grant = db.execute("SELECT 1 FROM identity_grants WHERE community=? AND audience=? AND resource='profile:self' AND operation=? AND subject IN (?, '*')",
+                               (session['community'], audience, operation, session['subject'])).fetchone()
+            if grant is None:
+                raise IdentityForbidden('profile operation not granted')
+            row = db.execute('SELECT display_name,bio,revision FROM identity_profiles WHERE community=? AND subject=?',
+                             (session['community'], session['subject'])).fetchone()
+            profile = dict(row) if row else {'display_name': '', 'bio': '', 'revision': 0}
+            if update is not None:
+                if revision != profile['revision']:
+                    raise IdentityConflict('profile revision changed')
+                profile = {**update, 'revision': revision + 1}
+                db.execute('INSERT INTO identity_profiles VALUES (?,?,?,?,?) ON CONFLICT(community,subject) DO UPDATE SET display_name=excluded.display_name,bio=excluded.bio,revision=excluded.revision',
+                           (session['community'], session['subject'], profile['display_name'], profile['bio'], profile['revision']))
+            return {'community': session['community'], 'subject': session['subject'],
+                    'account_name': session['name'], **profile}

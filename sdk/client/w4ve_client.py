@@ -31,6 +31,9 @@ __all__ = ["W4VE", "W4VEError", "Denied", "NotRunning"]
 
 class W4VEError(Exception):
     """Something went wrong, and the message says what."""
+    def __init__(self, message, *, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 class Denied(W4VEError):
@@ -102,9 +105,9 @@ class W4VE:
         except (ValueError, UnicodeDecodeError):
             raise W4VEError("W4VE answered something that is not JSON")
         if code in (401, 403):
-            raise Denied(answer.get("error", "not allowed"))
+            raise Denied(answer.get("error", "not allowed"), status=code)
         if code >= 400 or not answer.get("ok", True):
-            raise W4VEError(answer.get("error") or "W4VE said no")
+            raise W4VEError(answer.get("error") or "W4VE said no", status=code)
         return answer
 
     # --------------------------------------------------------------- asking
@@ -228,6 +231,13 @@ class W4VE:
 
     def identity_inspect(self, session, audience):
         return self.call("POST", "/v1/identity/inspect", {"session": session, "audience": audience})
+
+    def identity_profile(self, session, audience):
+        return self.call("POST", "/v1/identity/profile", {"session": session, "audience": audience})
+
+    def identity_update_profile(self, session, audience, profile, revision):
+        return self.call("POST", "/v1/identity/profile-update",
+                         {"session": session, "audience": audience, "profile": profile, "revision": revision})
 
     def identity_authorize(self, session, audience, resource, operation):
         return self.call("POST", "/v1/identity/authorize",

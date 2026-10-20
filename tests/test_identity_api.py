@@ -66,10 +66,34 @@ class IdentityApiTests(unittest.TestCase):
                              {"ok": True, "service": "identity", "schema": 1, "capabilities": {
                                  "player_proof": 1, "instance_sessions": 1,
                                  "connection_context": 1, "resource_recipients": 1,
-                                 "policy_revision": 1}})
+                                 "policy_revision": 1, "editable_profiles": 1}})
         self.api.tokens_required = False
         with self.assertRaises(Denied):
             self.anonymous.identity_health()
+
+    def test_profile_sdk_requires_service_and_player_grants_and_rejects_claims(self):
+        token = self.mint()
+        service = self.clients['identity']
+        with self.assertRaises(Denied):
+            service.identity_profile(token, 'wavechat')
+        self.admin('grants', community='alpha', audience='wavechat', resource='profile:self',
+                   subject='*', operations=['profile.read', 'profile.edit'])
+        first = service.identity_profile(token, 'wavechat')
+        self.assertEqual(first['revision'], 0)
+        changed = service.identity_update_profile(token, 'wavechat', {'display_name': 'Alias', 'bio': 'Community bio'}, 0)
+        self.assertEqual(changed['account_name'], 'Alice')
+        self.assertEqual(changed['revision'], 1)
+        with self.assertRaises(W4VEError) as conflict:
+            service.identity_update_profile(token, 'wavechat', {'display_name': 'Lost edit', 'bio': ''}, 0)
+        self.assertEqual(conflict.exception.status, 409)
+        for scope in ('read', 'write'):
+            with self.assertRaises(Denied):
+                self.clients[scope].identity_profile(token, 'wavechat')
+        for body in ({'session': token, 'audience': 'wavechat', 'subject': 'forged'},
+                     {'session': token, 'audience': 'wavechat', 'profile': None, 'revision': None}):
+            with self.assertRaises(W4VEError):
+                service.call('POST', '/v1/identity/profile-update', body)
+        self.assertEqual(service.identity_profile(token, 'wavechat'), changed)
 
     def test_complete_sdk_session_grant_revoke_path(self):
         token = self.mint()
