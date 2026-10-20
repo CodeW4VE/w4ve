@@ -419,15 +419,44 @@ def timer_problems(component):
     return out
 
 
+def diagnostic_problems(declaration):
+    if not isinstance(declaration, dict) or set(declaration) - {'python_module', 'args', 'when_env'}:
+        return ['diagnostic must declare a Python module, arguments and optional environment condition']
+    module, args, condition = declaration.get('python_module'), declaration.get('args', []), declaration.get('when_env', '')
+    if (not isinstance(module, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.]{0,127}', module)
+            or not isinstance(args, list) or len(args) > 32
+            or any(not isinstance(arg, str) or len(arg) > 256 or '\x00' in arg for arg in args)
+            or not isinstance(condition, str) or (condition and not re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}', condition))):
+        return ['invalid diagnostic module, arguments or environment condition']
+    return []
+
+
 def service_problems(component):
     out = []
+    if 'diagnostic' in component:
+        out.extend(diagnostic_problems(component['diagnostic']))
     if component.get("w4ve_events") not in (None, "presence", "chat"):
         out.append("w4ve_events must be presence or chat")
     if component.get("w4ve_api") not in (None, "identity"):
         out.append("w4ve_api must be identity; services cannot request operator scopes")
+    condition = component.get('w4ve_events_when')
+    if condition is not None and (not isinstance(condition, str) or not re.fullmatch(r'[a-z][a-z0-9_]{0,63}', condition)):
+        out.append('w4ve_events_when must name a boolean setting')
+    conditions = component.get('env_when', {})
+    if (not isinstance(conditions, dict) or any(not isinstance(key, str) or not re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}', key)
+            or not isinstance(value, str) or not re.fullmatch(r'[a-z][a-z0-9_]{0,63}', value) for key, value in conditions.items())):
+        out.append('env_when must map environment variables to boolean settings')
     python = component.get("python") or {}
     if python and not isinstance(python.get("requires", []), list):
         out.append("python.requires has to be a list of module names")
+    if python and isinstance(python.get('requires', []), list):
+        from serviceprep import requirements_valid
+        if not requirements_valid(python.get('requires', [])):
+            out.append('python.requires must use distribution names and version constraints')
+    if 'extras' in python:
+        from serviceprep import extras_valid
+        if not extras_valid(python['extras']):
+            out.append('python.extras must declare named conditional requirements')
     if not component.get("name"):
         out.append("a service needs a name")
     elif not ID_RE.match(component["name"]):
@@ -697,6 +726,8 @@ class Install:
         requires = (component.get("python") or {}).get("requires")
         if requires:
             fields["python_requires"] = list(requires)
+        if (component.get('python') or {}).get('extras'):
+            fields['python_extras'] = component['python']['extras']
         health = component.get("health") or {}
         if health.get("http"):
             fields["health_url"] = health["http"]
@@ -717,8 +748,13 @@ class Install:
             fields["w4ve_api"] = component["w4ve_api"]
         if component.get("w4ve_events"):
             fields["w4ve_events"] = component["w4ve_events"]
+        for conditional in ('w4ve_events_when', 'env_when'):
+            if component.get(conditional):
+                fields[conditional] = component[conditional]
         if component.get("stop_grace"):
             fields["stop_grace"] = int(component["stop_grace"])
+        if component.get('diagnostic'):
+            fields['diagnostic'] = dict(component['diagnostic'])
         self.server.set_service(component["name"], fields,
                                 owner=self.manifest.id)
         record["services"].append(component["name"])

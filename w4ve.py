@@ -1935,6 +1935,12 @@ def cmd_doctor(args, index):
                 problems.append(f"service {service['name']} needs the Python "
                                 f"package {module}, which is not installed "
                                 f"for {Path(interpreter).name}")
+    for name, entry in (server.config.get('services') or {}).items():
+        if isinstance(entry, dict) and entry.get('diagnostic') is not None:
+            outcome = diagnose_service(server, name, entry)
+            if outcome not in ('healthy', 'disabled'):
+                problems.append(f"service {name}: diagnostic {outcome}; "
+                                "run its maintenance diagnostic for details")
 
     # 8. pieces that were installed and never answered. This is the most
     # common way a piece is "broken": it was never told what it needed.
@@ -3797,6 +3803,78 @@ def runtime_pieces(server, rt):
     return guardian, command
 
 
+def service_execution(server, name, command, python_module=None, *, issue_tokens=True):
+    """Resolve one service's executable, settings, pairing, SDK and exact grants."""
+    raw = (server.config.get('services') or {}).get(name)
+    if not isinstance(raw, dict):
+        raise ValueError('existing service required')
+    pid = owner_of(server, 'services', name)
+    service, answers = with_answers(server, pid, {**raw, 'name': name})
+    if python_module:
+        original = service.get('command')
+        if (not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.]{0,127}', python_module)
+                or not isinstance(original, list) or len(original) < 2 or original[1] != '-m'):
+            raise ValueError('module maintenance requires a configured Python module service')
+        command = [original[0], '-m', python_module, *command]
+    environment = {**answers, **(service.get('env') or {})}
+    binding = (server.state['pieces'].get(pid) or {}).get('pairing') if pid else None
+    if binding and service.get('w4ve_api') == 'identity':
+        from pairing import contained, declaration
+        environment['W4VE_PAIRING_CONFIG'] = str(contained(server.root, declaration(binding)['consumer_config']))
+    module = settings_module()
+    if module and module.unresolved([environment, command]):
+        raise ValueError('service settings are incomplete')
+    from api import service_environment
+    environment = service_environment(server.root, server.config, name, env=environment,
+        w4ve_api=service.get('w4ve_api'), w4ve_events=service.get('w4ve_events'),
+        game_dir=server.root / server.game_dir, issue_tokens=issue_tokens)
+    if service.get('mcdr'):
+        compat = Path(__file__).resolve().parent / 'compat'
+        if not (compat / 'mcdreforged/__init__.py').is_file():
+            raise ValueError('MCDR compatibility package is missing')
+        environment['PYTHONPATH'] = str(compat) + os.pathsep + environment.get('PYTHONPATH', '')
+    inherited = {key: value for key, value in os.environ.items() if not key.startswith('W4VE_')}
+    inherited.update(environment)
+    return command, server.root / service.get('cwd', '.'), inherited
+
+
+def diagnose_service(server, name, raw, *, timeout=10):
+    """Declared installed code, bounded wait, static output and existing grants.
+    The diagnostic's JSON is interpreted, never printed alongside credentials.
+    """
+    try:
+        import package
+        spec = raw['diagnostic']
+        if package.diagnostic_problems(spec):
+            return 'invalid declaration'
+        owner = owner_of(server, 'services', name)
+        service, answers = with_answers(server, owner, raw)
+        env = {**answers, **(service.get('env') or {})}
+        condition = spec.get('when_env')
+        if condition and str(env.get(condition, '')).strip().lower() in ('', 'false', '0', 'no', 'off'):
+            return 'disabled'
+        command, cwd, environment = service_execution(server, name, spec.get('args', []),
+            spec['python_module'], issue_tokens=False)
+        with tempfile.TemporaryFile() as output:
+            result = subprocess.run(command, cwd=cwd, env=environment, stdout=output,
+                stderr=subprocess.DEVNULL, timeout=timeout)
+            output.seek(0)
+            data = output.read(16385)
+        if result.returncode or len(data) > 16384:
+            return 'unavailable'
+        payload = json.loads(data)
+        if not isinstance(payload, dict) or payload.get('ok') is not True:
+            return 'unavailable'
+        health = payload.get('result')
+        if not isinstance(health, dict) or type(health.get('healthy')) is not bool:
+            return 'invalid response'
+        return 'healthy' if health['healthy'] else 'requires attention'
+    except subprocess.TimeoutExpired:
+        return 'timed out'
+    except (OSError, ValueError, TypeError, KeyError, ImportError, AttributeError):
+        return 'unavailable'
+
+
 def cmd_exec_service(args, index):
     """One local maintenance command, with exactly the installed service grants.
     Does not start/restart the guardian or accept credentials on the command line.
@@ -3813,38 +3891,36 @@ def cmd_exec_service(args, index):
         say('would run one command with the declared service environment; no processes or credentials changed')
         return 0
     try:
-        pid = owner_of(server, 'services', args.service)
-        service, answers = with_answers(server, pid, {**raw, 'name': args.service})
-        if args.python_module:
-            original = service.get('command')
-            if (not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.]{0,127}', args.python_module)
-                    or not isinstance(original, list) or len(original) < 2 or original[1] != '-m'):
-                raise ValueError('module maintenance requires a configured Python module service')
-            command = [original[0], '-m', args.python_module, *command]
-        environment = {**answers, **(service.get('env') or {})}
-        binding = (server.state['pieces'].get(pid) or {}).get('pairing') if pid else None
-        if binding and service.get('w4ve_api') == 'identity':
-            from pairing import contained, declaration
-            environment['W4VE_PAIRING_CONFIG'] = str(contained(server.root, declaration(binding)['consumer_config']))
-        module = settings_module()
-        if module and module.unresolved(environment):
-            raise ValueError('service settings are incomplete')
-        from api import service_environment
-        environment = service_environment(server.root, server.config, args.service, env=environment,
-            w4ve_api=service.get('w4ve_api'), w4ve_events=service.get('w4ve_events'),
-            game_dir=server.root / server.game_dir)
-        if service.get('mcdr'):
-            compat = Path(__file__).resolve().parent / 'compat'
-            if not (compat / 'mcdreforged/__init__.py').is_file():
-                raise ValueError('MCDR compatibility package is missing')
-            environment['PYTHONPATH'] = str(compat) + os.pathsep + environment.get('PYTHONPATH', '')
-        inherited = {key: value for key, value in os.environ.items() if not key.startswith('W4VE_')}
-        inherited.update(environment)
-        return subprocess.run(command, cwd=server.root / service.get('cwd', '.'), env=inherited).returncode
+        command, cwd, environment = service_execution(server, args.service, command, args.python_module)
+        return subprocess.run(command, cwd=cwd, env=environment).returncode
     except (ValueError, OSError, ImportError, AttributeError):
         # Do not echo expanded settings, commands or exception text: they can
         # contain credentials. The child owns its domain-specific diagnostics.
         problem('service maintenance could not start; check its settings, runtime SDK and executable')
+        return 1
+
+
+def cmd_prepare(args, index):
+    import serviceprep
+    server = need_server(args)
+    options = {'python': args.python, 'include': args.include,
+               'wheelhouse': args.wheelhouse, 'no_index': args.no_index}
+    try:
+        planned = serviceprep.plan(server, args.service, **options)
+        say(f"prepare {args.service}: isolated Python environment")
+        say('  packages: ' + ', '.join(planned['requirements']))
+        say('  extras: ' + (', '.join(planned['extras']) or 'none'))
+        if args.dry_run:
+            say('dry run; no environment, settings, packages or credentials changed')
+            return 0
+        if not (args.yes or ask('prepare these packages and activate the environment after validation?', default=False)):
+            return 0
+        result = serviceprep.prepare(server, args.service, **options)
+        say(f"prepared {args.service}: {result['interpreter']}")
+        say('the service was not restarted; previous environments are retained')
+        return 0
+    except (ValueError, OSError, subprocess.SubprocessError):
+        problem('preparation failed; check the declared packages, interpreter and package source; previous service interpreter preserved')
         return 1
 
 
@@ -4189,6 +4265,13 @@ def build_parser():
     maintenance.add_argument('service', help='existing service name')
     maintenance.add_argument('command', nargs=argparse.REMAINDER, help='command and arguments after --')
 
+    preparation = add('prepare', cmd_prepare, 'explicitly prepare an installed Python service in its own environment')
+    preparation.add_argument('service', help='existing service name')
+    preparation.add_argument('--python', help='Python executable used to build the environment')
+    preparation.add_argument('--include', action='append', default=[], help='additional declared extra to prepare')
+    preparation.add_argument('--wheelhouse', help='local directory of wheels')
+    preparation.add_argument('--no-index', action='store_true', help='do not contact package indexes')
+
     start = add("start", cmd_start, "start the server with the guardian already up")
     start.add_argument("process", nargs="?", default="server",
                        help="which process (default: the server)")
@@ -4216,7 +4299,7 @@ def build_parser():
                       help="the guardian journal instead of the console")
 
     for name in ("run", "start", "stop", "console", "logs", "pack", "repair",
-                 "plugins", "configure", "http", "storage", "dev", "api", "exec-service"):
+                 "plugins", "configure", "http", "storage", "dev", "api", "exec-service", "prepare"):
         subparsers.choices[name].set_defaults(needs_index=False)
 
     for name, sub in subparsers.choices.items():

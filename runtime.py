@@ -976,7 +976,7 @@ class Guardian:
         env = service_environment(self.root, self.config, name, env=env,
                                   w4ve_api=w4ve_api, w4ve_events=w4ve_events,
                                   game_dir=game.cwd if game is not None else None)
-        if w4ve_events:
+        if env.get('W4VE_EVENTS_TOKEN'):
             self.event_services.add(name)
         else:
             self.event_services.discard(name)

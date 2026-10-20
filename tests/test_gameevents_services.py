@@ -66,6 +66,32 @@ class EventServiceTests(unittest.TestCase):
             client.game_events(chat=True)
         self.assertEqual(len(client.game_events()["events"]), 2)
 
+    def test_boolean_opt_in_revokes_existing_reader_immediately_and_reconfigure_rotates(self):
+        import w4ve
+        server = w4ve.Server(self.root)
+        server.state['pieces']['qa-piece'] = {'services': ['chat']}
+        server.save_state()
+        server.set_setting('qa-piece', 'capture', True)
+        server.set_service('chat', {'command': ['python3', '-m', 'qa'], 'w4ve_events': 'chat',
+            'w4ve_events_when': 'capture', 'env_when': {'W4VE_CAPTURE_CHANNEL': 'capture'}})
+        environment = api.service_environment(self.root, server.config, 'chat', w4ve_events='chat',
+            env={'W4VE_CAPTURE_CHANNEL': 'general'})
+        old = environment['W4VE_EVENTS_TOKEN']
+        self.assertEqual(environment['W4VE_CAPTURE_CHANNEL'], 'general')
+        self.assertTrue(self.client(old).game_events(chat=True)['ok'])
+        server.set_setting('qa-piece', 'capture', False)
+        with self.assertRaises(Denied):
+            self.client(old).game_events(chat=True)
+        disabled = api.service_environment(self.root, server.config, 'chat', w4ve_events='chat',
+            env={'W4VE_CAPTURE_CHANNEL': 'general'})
+        self.assertEqual(disabled['W4VE_EVENTS_TOKEN'], '')
+        self.assertNotIn('W4VE_CAPTURE_CHANNEL', disabled)
+        self.assertIsNone(self.tokens.check(old))
+        server.set_setting('qa-piece', 'capture', True)
+        enabled = api.service_environment(self.root, server.config, 'chat', w4ve_events='chat')
+        self.assertNotEqual(enabled['W4VE_EVENTS_TOKEN'], old)
+        self.assertTrue(self.client(enabled['W4VE_EVENTS_TOKEN']).game_events(chat=True)['ok'])
+
     def test_reuse_downgrade_and_removal_revoke_previous_token_on_existing_socket_api(self):
         old = self.tokens.service_events("chat", "chat")
         identity = self.tokens.service_identity("chat")

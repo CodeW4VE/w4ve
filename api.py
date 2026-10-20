@@ -394,6 +394,18 @@ class Tokens:
                 return found[0][0]
             return self._issue(data, owner, "identity")
 
+    def existing_service(self, name, scope):
+        """Read an already issued exact service grant; diagnosis never mints one."""
+        if not isinstance(name, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', name):
+            raise ValueError('invalid service name')
+        if scope not in ('identity', 'game-events', 'game-chat'):
+            raise ValueError('invalid service scope')
+        owner = ('service:' if scope == 'identity' else 'service-events:') + name
+        found = [(token, entry) for token, entry in self._read(strict=True).items() if entry.get('name') == owner]
+        if len(found) != 1 or found[0][1].get('scope') != scope:
+            raise ValueError('existing service grant unavailable')
+        return found[0][0]
+
     def revoke(self, name):
         with self._locked():
             data = self._read(strict=True)
@@ -468,19 +480,40 @@ class Tokens:
             from w4ve import read_toml
             config = read_toml(self.path.parent.parent / "w4ve.toml")
             service = (config.get("services") or {}).get(name[len("service-events:"):]) or {}
-            expected = {"presence": "game-events", "chat": "game-chat"}.get(service.get("w4ve_events"))
+            policy = service.get('w4ve_events')
+            if service.get('w4ve_events_when') and not service_condition(self.path.parent.parent, config,
+                    name[len('service-events:'):], service['w4ve_events_when']):
+                policy = None
+            expected = {"presence": "game-events", "chat": "game-chat"}.get(policy)
             return expected is not None and expected == entry.get("scope")
         except (OSError, ValueError, TypeError, AttributeError):
             return False
 
 
-def service_environment(root, config, name, *, env=None, w4ve_api=None, w4ve_events=None, game_dir=None):
+def service_condition(root, config, name, condition):
+    if not isinstance(condition, str) or not re.fullmatch(r'[a-z][a-z0-9_]{0,63}', condition):
+        raise ValueError('invalid service condition')
+    from w4ve import Server, owner_of
+    owner = owner_of(Server(root), 'services', name)
+    if not owner:
+        raise ValueError('conditional grants require an installed service owner')
+    return ((config.get('settings') or {}).get(owner) or {}).get(condition) is True
+
+
+def service_environment(root, config, name, *, env=None, w4ve_api=None, w4ve_events=None, game_dir=None, issue_tokens=True):
     """Same declared credentials/SDK for a supervised service or an operator's
     one-shot maintenance command. Never allocate operator scopes to a service.
     """
     root, env = Path(root), dict(env or {})
     if w4ve_api not in (None, 'identity') or w4ve_events not in (None, 'presence', 'chat'):
         raise ValueError('invalid service API grant')
+    raw = ((config.get('services') or {}).get(name) or {})
+    declared_events = w4ve_events
+    if w4ve_events and raw.get('w4ve_events_when') and not service_condition(root, config, name, raw['w4ve_events_when']):
+        w4ve_events = None
+    for variable, condition in (raw.get('env_when') or {}).items():
+        if not service_condition(root, config, name, condition):
+            env.pop(variable, None)
     if (w4ve_api or w4ve_events) and (config.get('api') or {}).get('enabled') is False:
         raise ValueError('service requires the local API, which is explicitly disabled')
     if w4ve_api or w4ve_events:
@@ -491,10 +524,14 @@ def service_environment(root, config, name, *, env=None, w4ve_api=None, w4ve_eve
         env['PYTHONPATH'] = str(sdk) + (os.pathsep + existing if existing else '')
         env['W4VE_SERVER_ROOT'] = str(root)
     # Ordinary services still work with an absent/broken token registry.
-    env['W4VE_EVENTS_TOKEN'] = Tokens(root).service_events(name, w4ve_events) if w4ve_events else ''
+    tokens = Tokens(root)
+    if issue_tokens and declared_events and not w4ve_events:
+        tokens.service_events(name, None)
+    env['W4VE_EVENTS_TOKEN'] = ((tokens.service_events(name, w4ve_events) if issue_tokens else
+        tokens.existing_service(name, {'presence': 'game-events', 'chat': 'game-chat'}[w4ve_events])) if w4ve_events else '')
     env['W4VE_EVENTS_ADDRESS'] = str((config.get('api') or {}).get('listen') or '')
     if w4ve_api:
-        env['W4VE_IDENTITY_TOKEN'] = Tokens(root).service_identity(name)
+        env['W4VE_IDENTITY_TOKEN'] = tokens.service_identity(name) if issue_tokens else tokens.existing_service(name, 'identity')
         game_dir = Path(game_dir) if game_dir is not None else root / (config.get('server') or {}).get('game_dir', '.')
         env['W4VE_GAME_DIR'] = str(game_dir.resolve())
         env['W4VE_IDENTITY_ADDRESS'] = str((config.get('api') or {}).get('listen') or '')
