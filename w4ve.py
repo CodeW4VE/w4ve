@@ -2023,6 +2023,42 @@ def api_module():
         return None
 
 
+def cmd_permissions(args, index):
+    """Review or explicitly edit member operations of an already paired piece."""
+    import sqlite3
+    from identity import Authority, IdentityConflict, key
+    from pairing import contained
+    server = need_server(args)
+    if server is None: return 2
+    try:
+        grants, revokes = set(args.grant or []), set(args.revoke or [])
+        if grants & revokes or (args.clear and (grants or revokes)):
+            raise ValueError('use separate grant/revoke operations, or clear alone')
+        for operation in grants | revokes: key(operation)
+        path = contained(server.root, 'w4ve/identity/authority.sqlite3')
+        previous = Authority.read_binding_policy(path, args.piece, args.resource, args.subject)
+        wanted = [] if args.clear else sorted((set(previous['direct']) | grants) - revokes)
+        if len(wanted) > 64: raise ValueError('too many member operations')
+        say(f"{args.piece}: {args.resource} / {args.subject}")
+        say('  direct now: ' + (', '.join(previous['direct']) or '(none)'))
+        say('  direct after: ' + (', '.join(wanted) or '(none)'))
+        say('  inherited from *: ' + (', '.join(previous['inherited']) or '(none)'))
+        say('  effective after: ' + (', '.join(sorted(set(wanted) | set(previous['inherited']))) or '(none)'))
+        if not args.apply or args.dry_run:
+            note('preview only; use --apply after reviewing the effective permissions')
+            return 0
+        if wanted == previous['direct']:
+            note('permissions already match; no policy changed')
+            return 0
+        if not (args.yes or ask('apply these member permissions?', default=False)): return 0
+        Authority(path).change_binding_grants(args.piece,args.resource,args.subject,wanted,previous['revision'])
+        say('saved  member permissions; existing sessions use the new policy immediately')
+        return 0
+    except (OSError, ValueError, TypeError, IdentityConflict, sqlite3.Error):
+        problem('member policy could not be read or changed; preserve the identity database and review the inputs/current policy')
+        return 1
+
+
 def cmd_api(args, index):
     """The local API: tokens, and asking it things from the command line."""
     module = api_module()
@@ -4265,6 +4301,14 @@ def build_parser():
                          help="the token's name, or the route for `get`")
     api_cmd.add_argument("--scope", default="read", choices=["read", "write", "admin", "identity"],
                          help="what the token may do (default: read)")
+    permissions = add('permissions', cmd_permissions, 'preview or explicitly change paired member permissions')
+    permissions.add_argument('piece', help='already paired piece owner')
+    permissions.add_argument('--resource', required=True, help='exact resource, for example profile:self')
+    permissions.add_argument('--subject', required=True, help='canonical player subject, or * for every admitted player')
+    permissions.add_argument('--grant', action='append', help='add one operation; may be repeated')
+    permissions.add_argument('--revoke', action='append', help='remove one direct operation; wildcard grants still apply')
+    permissions.add_argument('--clear', action='store_true', help='remove all direct grants for this resource/subject only')
+    permissions.add_argument('--apply', action='store_true', help='apply after the printed preview; otherwise read only')
 
     dev = add("dev", cmd_dev, "write a plugin: scaffold it, check it, try it")
     dev.add_argument("action",
@@ -4346,7 +4390,7 @@ def build_parser():
                       help="the guardian journal instead of the console")
 
     for name in ("run", "start", "stop", "console", "logs", "pack", "repair",
-                 "plugins", "configure", "http", "storage", "dev", "api", "exec-service", "prepare", "source"):
+                 "plugins", "configure", "http", "storage", "dev", "api", "exec-service", "prepare", "source", "permissions"):
         subparsers.choices[name].set_defaults(needs_index=False)
 
     for name, sub in subparsers.choices.items():

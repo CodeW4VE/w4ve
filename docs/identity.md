@@ -3,8 +3,10 @@
 W4VE now provides paired-instance proofs, scoped player sessions and live
 resource grants. This is a local control-plane API, not a public login service.
 Guided local pairing and the WaveChat companion/client proof handshake exist
-in development. Discord account linking, role synchronization, remote enrollment,
-the advanced policy wizard and real Minecraft/GL validation are still pending.
+in development. Real Minecraft/OpenGL fixtures validate the native chat and
+self-profile editor; online authentication remains outside those offline tests.
+Discord account linking, role synchronization, remote enrollment and the
+advanced policy wizard remain pending.
 
 `w4ve api token wavechat --scope identity` issues a service token. It permits
 only identity routes (including health and typed instance sessions); it cannot read server logs or
@@ -166,3 +168,27 @@ API does not expose a player directory or imply consent to publish a profile.
 Verified external account linking and public profile visibility remain separate
 work. SDK methods: identity_profile and identity_update_profile. SDK exceptions
 now preserve the HTTP code in an optional `status` attribute.
+
+## Review member permissions without copying pairing identifiers
+
+`w4ve permissions PIECE --resource RESOURCE --subject SUBJECT` reads an existing
+local binding and prints direct, wildcard and effective grants. It does not
+create an authority database, mint tokens or expose an issuer secret. Use `*`
+for every admitted player or a canonical subject such as `minecraft:<uuidhex>`.
+`--grant OP` and `--revoke OP` can be repeated; `--clear` removes all direct
+operations for only that resource/subject. A wildcard grant still applies when
+a player's direct grant is removed. The preview displays that distinction.
+
+Example for an explicitly enabled self-profile editor:
+
+```sh
+w4ve permissions wavechat-server --resource profile:self --subject '*' --grant profile.read --grant profile.edit
+w4ve permissions wavechat-server --resource profile:self --subject '*' --grant profile.read --grant profile.edit --apply -y
+```
+
+Changes require `--apply`; `--dry-run` always prevents applying. Without `-y`,
+apply asks after showing the concrete before/after view. The write compares the
+community policy revision from the preview in a SQLite transaction, rejecting
+concurrent policy changes. It preserves other resources, subjects, pairing
+secrets, sessions and declared binding resources. A no-op keeps the revision.
+Member grants never override blocked/expired accounts or instance sharing.

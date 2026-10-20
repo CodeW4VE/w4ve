@@ -369,6 +369,63 @@ class Authority:
                            [(community, audience, resource, subject, operation) for operation in operations])
             self._changed(db, community)
 
+    @staticmethod
+    def _binding_policy(db, owner, resource, subject):
+        key(owner); key(resource)
+        if subject != '*': key(subject)
+        binding = db.execute('SELECT community,audience FROM identity_bindings WHERE owner=?', (owner,)).fetchone()
+        if binding is None:
+            raise ValueError('piece has no existing local pairing')
+        community, audience = binding['community'], binding['audience']
+        key(community); key(audience)
+        direct = sorted(row[0] for row in db.execute('SELECT operation FROM identity_grants WHERE community=? AND audience=? AND resource=? AND subject=?',
+                                                   (community, audience, resource, subject)))
+        inherited = [] if subject == '*' else sorted(row[0] for row in db.execute("SELECT operation FROM identity_grants WHERE community=? AND audience=? AND resource=? AND subject='*'",
+                                                                                 (community, audience, resource)))
+        epoch_row = db.execute("SELECT value FROM identity_meta WHERE key='epoch'").fetchone()
+        revision_row = db.execute('SELECT revision FROM identity_communities WHERE id=?', (community,)).fetchone()
+        if epoch_row is None or revision_row is None: raise ValueError('incomplete stored policy')
+        epoch, revision = epoch_row[0], revision_row[0]
+        if (not isinstance(epoch, str) or not re.fullmatch('[0-9a-f]{32}', epoch)
+                or type(revision) is not int or revision < 0 or len(direct) > 64 or len(inherited) > 64):
+            raise ValueError('invalid stored policy')
+        for operation in direct + inherited: key(operation)
+        return {'owner': owner, 'community': community, 'audience': audience, 'resource': resource,
+                'subject': subject, 'direct': direct, 'inherited': inherited,
+                'effective': sorted(set(direct) | set(inherited)), 'revision': epoch + ':' + str(revision)}
+
+    @staticmethod
+    def read_binding_policy(path, owner, resource, subject):
+        path = Path(path)
+        if not path.is_file() or path.is_symlink():
+            raise ValueError('existing regular identity database required; configure the piece first')
+        db = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=15)
+        db.row_factory = sqlite3.Row
+        try:
+            db.execute('BEGIN')
+            schema = db.execute("SELECT value FROM identity_meta WHERE key='schema'").fetchone()
+            if schema is None or schema[0] != '1': raise ValueError('unsupported identity schema')
+            return Authority._binding_policy(db, owner, resource, subject)
+        finally:
+            db.close()
+
+    def change_binding_grants(self, owner, resource, subject, operations, expected_revision):
+        if not isinstance(operations, list) or len(operations) > 64:
+            raise ValueError('operations must be a bounded list')
+        operations = sorted(set(key(operation) for operation in operations))
+        with self._db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            previous = self._binding_policy(db, owner, resource, subject)
+            if previous['revision'] != expected_revision:
+                raise IdentityConflict('policy changed after preview; review it again')
+            if previous['direct'] != operations:
+                db.execute('DELETE FROM identity_grants WHERE community=? AND audience=? AND resource=? AND subject=?',
+                           (previous['community'], previous['audience'], resource, subject))
+                db.executemany('INSERT INTO identity_grants VALUES (?,?,?,?,?)',
+                    [(previous['community'], previous['audience'], resource, subject, operation) for operation in operations])
+                self._changed(db, previous['community'])
+            return self._binding_policy(db, owner, resource, subject)
+
     def set_blocked(self, community, subject, blocked):
         key(community)
         key(subject)
