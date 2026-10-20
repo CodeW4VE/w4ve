@@ -1992,6 +1992,13 @@ def cmd_doctor(args, index):
     if server.pending:
         warnings.append(f"waiting for a restart: {', '.join(server.pending)}")
 
+    if (server.config.get('bridge') or {}).get('enabled') is True:
+        try:
+            import sourceprep
+            sourceprep.check(server)
+        except (OSError, ValueError, KeyError, ImportError, subprocess.SubprocessError):
+            problems.append('Fabric source dependency preflight failed; review `w4ve source prepare --dry-run` before restarting')
+
     for line in problems:
         say(f"{Out.bad('problem')}  {line}")
     for line in warnings:
@@ -3924,6 +3931,37 @@ def cmd_prepare(args, index):
         return 1
 
 
+def cmd_source(args, index):
+    import sourceprep
+    import zipfile
+    server = need_server(args)
+    if args.action == 'status':
+        policy = server.config.get('bridge') or {}
+        if not isinstance(policy, dict):
+            problem('source policy is invalid; preserve the configuration for review')
+            return 1
+        say(json.dumps({'enabled': policy.get('enabled') is True, 'chat': policy.get('chat') is True,
+            'retention': policy.get('retention', 300), 'game': str((server.root / server.game_dir).resolve())}))
+        return 0
+    options = {'bridge': args.bridge_file, 'fabric_api': args.fabric_api, 'chat': args.chat, 'retention': args.retention, 'java': args.java}
+    try:
+        planned = sourceprep.plan(server, **options)
+        say('prepare local Fabric source; public chat capture: ' + ('on' if planned['chat'] else 'off'))
+        for item in planned['artifacts']:
+            say(f"  {item['id']} {item['version']}: " + ('reuse identical installed jar' if item['reuse'] else 'install reviewed jar'))
+        if args.dry_run:
+            say('dry run; no mods, source policy, descriptors or credentials changed')
+            return 0
+        if not (args.yes or ask('prepare these source artifacts and this capture policy?', default=False)):
+            return 0
+        sourceprep.prepare(server, **options)
+        say('source prepared; review/restart the game with the guardian to activate it; no process was restarted')
+        return 0
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile, subprocess.SubprocessError):
+        problem('source preparation refused; check bundled/selected jars, Minecraft compatibility and existing mods; nothing was restarted')
+        return 1
+
+
 def cmd_run(args, index):
     """Own the server in the foreground, which is what a container wants."""
     rt = need_runtime()
@@ -4271,6 +4309,15 @@ def build_parser():
     preparation.add_argument('--include', action='append', default=[], help='additional declared extra to prepare')
     preparation.add_argument('--wheelhouse', help='local directory of wheels')
     preparation.add_argument('--no-index', action='store_true', help='do not contact package indexes')
+    source = add('source', cmd_source, 'prepare or inspect the local Fabric game source')
+    source.add_argument('action', choices=['status', 'prepare'])
+    source.add_argument('--bridge-file', help='reviewed W4VE bridge jar (default: bundled artifact)')
+    source.add_argument('--fabric-api', help='reviewed Fabric API jar (default: bundled artifact)')
+    source.add_argument('--java', help='Java executable to check (default: configured game executable or PATH)')
+    source.add_argument('--retention', type=int, help='source event retention, 5 to 3600 seconds')
+    source_policy = source.add_mutually_exclusive_group()
+    source_policy.add_argument('--chat', dest='chat', action='store_const', const=True, default=None, help='explicitly capture public chat')
+    source_policy.add_argument('--no-chat', dest='chat', action='store_const', const=False, help='capture presence only')
 
     start = add("start", cmd_start, "start the server with the guardian already up")
     start.add_argument("process", nargs="?", default="server",
@@ -4299,7 +4346,7 @@ def build_parser():
                       help="the guardian journal instead of the console")
 
     for name in ("run", "start", "stop", "console", "logs", "pack", "repair",
-                 "plugins", "configure", "http", "storage", "dev", "api", "exec-service", "prepare"):
+                 "plugins", "configure", "http", "storage", "dev", "api", "exec-service", "prepare", "source"):
         subparsers.choices[name].set_defaults(needs_index=False)
 
     for name, sub in subparsers.choices.items():

@@ -11,11 +11,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULES = ("w4ve.py", "runtime.py", "package.py", "piecesettings.py",
-           "discover.py", "worker.py", "api.py", "rcon.py", "pluginhost.py", "identity.py", "pairing.py", "gameevents.py", "serviceprep.py")
+           "discover.py", "worker.py", "api.py", "rcon.py", "pluginhost.py", "identity.py", "pairing.py", "gameevents.py", "serviceprep.py", "sourceprep.py")
 TREES = ("mcdr", "compat", "sdk", "docs")
 
 
-def build(source, output):
+def build(source, output, *, bridge=None, fabric_api=None):
     source, output = Path(source), Path(output)
     tree = ast.parse((source / "w4ve.py").read_text(encoding="utf-8"))
     version = next(ast.literal_eval(node.value) for node in tree.body
@@ -37,6 +37,12 @@ def build(source, output):
         if path.suffix in (".py", ".sh", ".md"):
             content = content.replace(b"\r\n", b"\n")
         payload[relative] = content
+    for name, supplied in (('w4ve-fabric-source.jar', bridge), ('fabric-api.jar', fabric_api)):
+        if supplied is not None:
+            supplied = Path(supplied)
+            if not supplied.is_file() or supplied.is_symlink() or supplied.stat().st_size > 48 * 1024 * 1024:
+                raise ValueError('invalid bundled source artifact')
+            payload['lib/' + name] = supplied.read_bytes()
     manifest = {"schema": 1, "version": version,
                 "files": {name: hashlib.sha256(data).hexdigest()
                           for name, data in payload.items()}}
@@ -61,5 +67,7 @@ def build(source, output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=ROOT / "build" / "distribution")
+    parser.add_argument('--bridge', type=Path, help='bundle a reviewed Fabric source jar')
+    parser.add_argument('--fabric-api', type=Path, help='bundle a reviewed Fabric API jar')
     args = parser.parse_args()
-    print(build(ROOT, args.out))
+    print(build(ROOT, args.out, bridge=args.bridge, fabric_api=args.fabric_api))
