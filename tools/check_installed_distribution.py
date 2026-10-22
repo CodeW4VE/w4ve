@@ -13,6 +13,10 @@ import install
 
 
 def check(archive, tests_dir=None):
+    # The installed copy runs from a scratch directory, so a relative path
+    # would be looked up there and the tests would silently not be found.
+    archive = Path(archive).resolve()
+    tests_dir = Path(tests_dir).resolve() if tests_dir is not None else None
     version, _, _ = install.read_archive(archive)
     with tempfile.TemporaryDirectory(prefix="w4ve-dist-check-") as scratch:
         root = Path(scratch)

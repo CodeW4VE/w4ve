@@ -22,32 +22,79 @@ only `w4ve.py` does not provide that runtime.
 
 ## Install
 
-The complete distribution is currently built from this checkout; a public
-runtime release is still pending. On Linux, with Python available:
+**What it needs.** Linux (a VM or a container is fine) and Python 3.11 or
+newer; it was last checked with Python 3.11.14. Nothing outside the standard
+library. The runtime uses Unix sockets and `fcntl`, so it does not run on
+Windows itself: on a Windows machine, run it inside a Linux VM or container.
+Java is whatever your Minecraft server needs; W4VE does not install it.
+
+**There is no public release of the complete runtime yet.** The `v0.1.0` and
+`v0.1.1` releases on GitHub are a single `w4ve.py` from August: the catalog
+command only, without the guardian, packages, API or SDK. Do not install that
+file on its own. Until the release is published (pending), the complete
+distribution is built from a checkout of the branch that carries `install.py`
+and `tools/build_distribution.py`:
 
 ```sh
+cd w4ve                                    # the checkout
 python3 tools/build_distribution.py --out build/distribution
+cd build/distribution && sha256sum -c w4ve-0.3.0.tar.gz.sha256 && cd ../..
 python3 install.py --archive build/distribution/w4ve-0.3.0.tar.gz
-~/.local/bin/w4ve --help
+export PATH="$HOME/.local/bin:$PATH"       # add this to your shell profile too
+w4ve --version                             # w4ve 0.3.0
 ```
 
-The archive contains all runtime modules and a SHA256 manifest. The installer
-validates it before activation, keeps versioned releases under
-`~/.local/share/w4ve/releases/` and atomically switches `~/.local/bin/w4ve`.
-Use `--prefix` and `--bin-dir` to choose other locations. It does not restart
-servers or install piece dependencies. Add the bin directory to your PATH.
+The build is reproducible: the same checkout gives the same archive, byte for
+byte, on any machine. The archive carries every runtime module (`w4ve.py`,
+`runtime.py`, `package.py`, the API, identity, the MCDR compatibility layer,
+the SDK and these docs) and a `distribution.json` with the SHA256 of each file.
+`install.py` refuses an archive that is incomplete, altered, or contains
+symlinks or unsafe paths, keeps each version under
+`~/.local/share/w4ve/releases/<version>/` and switches `~/.local/bin/w4ve` to
+it atomically. `--prefix` and `--bin-dir` choose other places. It does not
+restart servers and does not install the Python dependencies of pieces.
 
-To reactivate a previously installed version:
+To check what you installed, in a scratch prefix, with the runtime's own tests
+run against the installed copy:
+
+```sh
+python3 tools/check_installed_distribution.py \
+    build/distribution/w4ve-0.3.0.tar.gz --tests-dir tests
+```
+
+It prints one JSON line with every check `passed`; `server_operations` stays
+`not tested` because it touches no server.
+
+To go back to a version that is already installed:
 
 ```sh
 python3 install.py --rollback 0.3.0
 ```
 
-Rollback rechecks the installed files. It switches the runtime command; it does
-not roll back worlds, databases, piece configuration or a running guardian.
-The manifest verifies content integrity; verify the archive's provenance before
-installing it. Runtime operation, update recovery and installed-piece tests
-remain release gates; a successful `--help` is not that certification.
+Rollback rechecks the installed files and switches the command. It does not
+roll back worlds, databases, piece configuration or a guardian that is already
+running.
+
+**First steps on a new server**, which is the walkthrough this section was
+checked with:
+
+```sh
+mkdir -p myserver/mods && cd myserver
+w4ve init --mc 1.21                        # writes w4ve.toml
+w4ve install gooderrails                   # pulls fabric-api in as well
+w4ve status                                # versions, updates, pending restarts
+w4ve doctor                                # 0 problems is the goal
+w4ve update                                # moves pieces to their newest version
+w4ve run                                   # the guardian: server and services
+```
+
+The catalog comes from `CodeW4VE/registry` over HTTPS. A machine without
+internet can point at a local copy with `--index /path/index.json` or
+`W4VE_INDEX`; the jars it names must then be reachable from that machine too.
+
+**Version note.** The public `main` branch also says `0.3.0`, with fewer
+modules and no `install.py`. Both cannot be published as the same version;
+the release will need a version number of its own.
 
 ## Use
 
