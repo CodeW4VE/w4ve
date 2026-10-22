@@ -59,8 +59,10 @@ def build(source, output, *, bridge=None, fabric_api=None):
                     item.mode = 0o755 if name.endswith(".sh") else 0o644
                     archive.addfile(item, io.BytesIO(data))
     digest = hashlib.sha256(target.read_bytes()).hexdigest()
-    target.with_name(target.name + ".sha256").write_text(
-        "%s  %s\n" % (digest, target.name), encoding="utf-8")
+    # Bytes, not text: on Windows write_text turns the newline into CRLF and
+    # `sha256sum -c` on Linux then looks for a file whose name ends in \r.
+    target.with_name(target.name + ".sha256").write_bytes(
+        ("%s  %s\n" % (digest, target.name)).encode("utf-8"))
     return target
 
 
