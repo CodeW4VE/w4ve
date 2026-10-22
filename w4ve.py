@@ -55,7 +55,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 USER_AGENT = f"w4ve/{VERSION} (+https://w4ve.xyz)"
 
 # The published catalog. Override with --index or W4VE_INDEX, which is how you

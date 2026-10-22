@@ -28,20 +28,26 @@ library. The runtime uses Unix sockets and `fcntl`, so it does not run on
 Windows itself: on a Windows machine, run it inside a Linux VM or container.
 Java is whatever your Minecraft server needs; W4VE does not install it.
 
-**There is no public release of the complete runtime yet.** The `v0.1.0` and
-`v0.1.1` releases on GitHub are a single `w4ve.py` from August: the catalog
-command only, without the guardian, packages, API or SDK. Do not install that
-file on its own. Until the release is published (pending), the complete
-distribution is built from a checkout of the branch that carries `install.py`
-and `tools/build_distribution.py`:
+**From the release** (`v0.4.0` is the first one that carries the whole
+runtime; `v0.1.x` were a single `w4ve.py` with the catalog command only, do
+not install that file on its own):
 
 ```sh
-cd w4ve                                    # the checkout
-python3 tools/build_distribution.py --out build/distribution
-cd build/distribution && sha256sum -c w4ve-0.3.0.tar.gz.sha256 && cd ../..
-python3 install.py --archive build/distribution/w4ve-0.3.0.tar.gz
+base=https://github.com/CodeW4VE/w4ve/releases/download/v0.4.0
+curl -LO $base/w4ve-0.4.0.tar.gz -LO $base/w4ve-0.4.0.tar.gz.sha256 -LO $base/install.py
+sha256sum -c w4ve-0.4.0.tar.gz.sha256
+python3 install.py --archive w4ve-0.4.0.tar.gz
 export PATH="$HOME/.local/bin:$PATH"       # add this to your shell profile too
-w4ve --version                             # w4ve 0.3.0
+w4ve --version                             # w4ve 0.4.0
+```
+
+**From a checkout**, which gives the same archive:
+
+```sh
+cd w4ve
+python3 tools/build_distribution.py --out build/distribution
+cd build/distribution && sha256sum -c w4ve-0.4.0.tar.gz.sha256 && cd ../..
+python3 install.py --archive build/distribution/w4ve-0.4.0.tar.gz
 ```
 
 The build is reproducible: the same checkout gives the same archive, byte for
@@ -59,7 +65,7 @@ run against the installed copy:
 
 ```sh
 python3 tools/check_installed_distribution.py \
-    build/distribution/w4ve-0.3.0.tar.gz --tests-dir tests
+    build/distribution/w4ve-0.4.0.tar.gz --tests-dir tests
 ```
 
 It prints one JSON line with every check `passed`; `server_operations` stays
@@ -68,7 +74,7 @@ It prints one JSON line with every check `passed`; `server_operations` stays
 To go back to a version that is already installed:
 
 ```sh
-python3 install.py --rollback 0.3.0
+python3 install.py --rollback 0.4.0
 ```
 
 Rollback rechecks the installed files and switches the command. It does not
@@ -92,9 +98,6 @@ The catalog comes from `CodeW4VE/registry` over HTTPS. A machine without
 internet can point at a local copy with `--index /path/index.json` or
 `W4VE_INDEX`; the jars it names must then be reachable from that machine too.
 
-**Version note.** The public `main` branch also says `0.3.0`, with fewer
-modules and no `install.py`. Both cannot be published as the same version;
-the release will need a version number of its own.
 
 ## Use
 

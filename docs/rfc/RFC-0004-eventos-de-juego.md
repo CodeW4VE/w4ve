@@ -135,8 +135,8 @@ permitir que el companion vacíe stopping/leave; luego reconcilia y cierra API.
 Windows:28 pruebas pasan y2 de guardian se saltan por requerir Linux.
 Linux aislado con runtime instalado:30 gameevents PASS, incluyendo dos guardianes
 reales, credencial recibida por hijo simulado, flush durante shutdown y handover
-sin cambiar PID/boot. Logs en D:/MineWave/W4VE/notas/ecosistema/
-qa-portabilidad-2026-10-13/identity-2026-10-14/game-events-*.txt.
+sin cambiar PID/boot. Los logs quedaron en las notas de QA del autor
+(`identity-2026-10-14/game-events-*.txt`).
 Se ejecutan además identity/API/package/pairing/settings/runtime/handover para
 detectar regresiones; conservar sus resultados completos por ejecución.
 

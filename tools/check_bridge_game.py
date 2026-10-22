@@ -56,7 +56,7 @@ def main():
     spec = importlib.util.spec_from_file_location("qa_install", inputs / "install.py")
     installer = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(installer)
-    archive = inputs / "w4ve-0.3.0.tar.gz"
+    archive = inputs / "w4ve-0.4.0.tar.gz"
     version, _, _ = installer.read_archive(archive)
     installer.install(archive, root / "runtime", root / "bin")
     release = root / "runtime/releases" / version
