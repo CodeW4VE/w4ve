@@ -21,6 +21,8 @@ exec python3 - "$@" <<'PYTHON'
 import hashlib, json, os, subprocess, sys, tempfile, urllib.request
 from pathlib import Path
 
+# Piped, Python would hold its own lines back and print them after install.py's.
+sys.stdout.reconfigure(line_buffering=True)
 if sys.version_info < (3, 11):
     sys.exit("W4VE needs Python 3.11 or newer, this is %d.%d." % sys.version_info[:2])
 if sys.platform.startswith("win"):
