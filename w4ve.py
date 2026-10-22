@@ -53,9 +53,10 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 USER_AGENT = f"w4ve/{VERSION} (+https://w4ve.xyz)"
 
 # The published catalog. Override with --index or W4VE_INDEX, which is how you
@@ -1293,42 +1294,287 @@ def need_server(args):
     return server
 
 
+# ------------------------------------------------------------ first contact
+#
+# `w4ve init` then `w4ve run` is the whole happy path. init looks before it
+# writes: it says what it found, says what it is going to do, and only then
+# does it. It never moves or deletes anything, and every question it asks has
+# a flag, so a script gets the same result as a person.
+
+FABRIC_META = "https://meta.fabricmc.net/v2/versions"
+EULA_URL = "https://aka.ms/MinecraftEULA"
+LAUNCHER = "fabric-server-launch.jar"
+
+
+def detect_game_dir(root, mcdr):
+    """Where the game runs, and why we think so.
+
+    Getting this wrong is the quiet kind of wrong: jars land where Minecraft
+    never reads, and a plugin writing a relative path writes it into the wrong
+    folder and says nothing.
+
+    ⚠️ MCDR's own config is asked FIRST, and it is the only one of these that
+    is a statement rather than a guess. Looking for `server/mods` was the only
+    test for a while, and it says "." for a vanilla server under MCDR, which is
+    every one that runs no mods.
+    """
+    if mcdr and mcdr.get("working_directory"):
+        return str(mcdr["working_directory"]).strip("/") or ".", "MCDR's config.yml says so"
+    if (root / "server" / "mods").is_dir():
+        return "server", "there is a server/mods here"
+    if (root / "server").is_dir() and any((root / "server").glob("*.jar")):
+        return "server", "the jar is in server/"
+    return ".", ""
+
+
+def detect_mc(game):
+    """The Minecraft version a server folder runs, and how we know.
+
+    In the order of how much each one is worth: what the server itself said
+    the last time it started, then what the jars carry inside. A version
+    guessed from a file name is not on the list on purpose: that is the
+    mistake that read PrimeBackup-v1.13.1 as a Minecraft 1.13 plugin.
+    """
+    log = game / "logs" / "latest.log"
+    if log.is_file():
+        try:
+            with open(log, encoding="utf-8", errors="replace") as handle:
+                for _, line in zip(range(400), handle):
+                    found = re.search(r"Starting minecraft server version (\S+)", line)
+                    if found:
+                        return found.group(1), "the server said so in logs/latest.log"
+        except OSError:
+            pass
+    # Since 1.18 the vanilla jar unpacks itself into versions/<version>/.
+    versions = game / "versions"
+    if versions.is_dir():
+        found = [d.name for d in versions.iterdir()
+                 if d.is_dir() and any(d.glob("server-*.jar"))]
+        if found:
+            return max(found, key=vtuple), "versions/ has its server jar"
+    for name in ("server.jar", "minecraft_server.jar"):
+        jar = game / name
+        if jar.is_file():
+            try:
+                with zipfile.ZipFile(jar) as archive:
+                    data = json.loads(archive.read("version.json"))
+                if data.get("id"):
+                    return str(data["id"]), f"{name} carries it inside"
+            except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+                pass
+    return None, None
+
+
+def detect_loader(game):
+    if (game / LAUNCHER).is_file() or (game / ".fabric").is_dir():
+        return "Fabric"
+    if (game / "mods").is_dir():
+        return "a modded server"
+    if any(game.glob("*.jar")):
+        return "vanilla, or a loader w4ve does not recognise"
+    return None
+
+
+def java_needed(mc):
+    """The Java a Minecraft version wants, as a major version string."""
+    version = vtuple(mc or "")[0]
+    if version >= (26,):
+        return "25"
+    if version >= (1, 20, 5):
+        return "21"
+    if version >= (1, 18):
+        return "17"
+    return "8"
+
+
+def java_on_path():
+    """The major version of the `java` on this machine's PATH, or None.
+
+    Reported, never written into w4ve.toml: on a host running containers the
+    `java` here is not the one the server runs, and a wrong value written down
+    makes `doctor` cry wolf forever.
+    """
+    java = shutil.which("java")
+    if not java:
+        return None
+    try:
+        result = subprocess.run([java, "-version"], capture_output=True,
+                                text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = re.search(r'version "(\d+)(?:\.(\d+))?', result.stderr + result.stdout)
+    if not found:
+        return None
+    major = int(found.group(1))
+    return 8 if major == 1 else major
+
+
+def suggested_memory():
+    """Gigabytes for -Xmx: half the machine, between 2 and 8."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemTotal:"):
+                    total = int(line.split()[1]) // (1024 * 1024)
+                    return max(2, min(8, total // 2))
+    except (OSError, ValueError):
+        pass
+    return 4
+
+
+def fabric_launcher_url(mc):
+    """The newest stable Fabric server launcher for a Minecraft version."""
+    loaders = json.loads(fetch(f"{FABRIC_META}/loader/{mc}", timeout=30))
+    if not loaders:
+        raise LookupError(f"Fabric has no loader for Minecraft {mc}")
+    loader = next((entry["loader"]["version"] for entry in loaders
+                   if entry.get("loader", {}).get("stable")),
+                  loaders[0]["loader"]["version"])
+    installers = json.loads(fetch(f"{FABRIC_META}/installer", timeout=30))
+    installer = next((entry["version"] for entry in installers if entry.get("stable")),
+                     installers[0]["version"])
+    return f"{FABRIC_META}/loader/{mc}/{loader}/{installer}/server/jar", loader
+
+
+def ask_text(question, default=""):
+    """A line of text. Non interactive gets the default, like ask()."""
+    if not sys.stdin.isatty():
+        return default
+    try:
+        answer = input(f"{question} [{default}] " if default else f"{question} ").strip()
+    except (EOFError, KeyboardInterrupt):
+        say()
+        return default
+    return answer or default
+
+
 def cmd_init(args, index):
+    """Adopt the server in this folder, or make one. Look first, then act."""
     root = Path(args.dir or ".").resolve()
     path = root / "w4ve.toml"
     if path.exists() and not args.force:
-        problem(f"{path} already exists (use --force to overwrite)")
+        problem(f"this folder is already set up ({path.name} is here)")
+        say(Out.dim("    `w4ve status` says how it is, `w4ve doctor` what is wrong; "
+                    "--force writes w4ve.toml again"))
         return 1
-    # Deliberately not detected: on a host running containers, the `java` on
-    # PATH is not the one the server runs, and a wrong value here makes
-    # `doctor` cry wolf forever.
-    java = ""
-    # Where the game runs. Getting this wrong is the quiet kind of wrong: jars
-    # land where Minecraft never reads, and a plugin writing a relative path
-    # writes it into the wrong folder and says nothing.
-    #
-    # ⚠️ MCDR's own config is asked FIRST, and it is the only one of these that
-    # is a statement rather than a guess. Looking for `server/mods` was the
-    # only test for a while, and it says "." for a vanilla server under MCDR,
-    # which is every one that runs no mods.
+    interactive = sys.stdin.isatty() and not args.yes
+    create = getattr(args, "create", False)
+    accept_eula = getattr(args, "accept_eula", False)
+
     mcdr = read_mcdr_config(root)
     start = (mcdr or {}).get("start_command") or ""
-    if mcdr and mcdr.get("working_directory"):
-        game_dir = str(mcdr["working_directory"]).strip("/") or "."
-        found = "MCDR's config.yml says so"
-    elif (root / "server" / "mods").is_dir():
-        game_dir, found = "server", "there is a server/mods here"
-    elif (root / "server").is_dir() and any(
-            (root / "server").glob("*.jar")):
-        game_dir, found = "server", "the jar is in server/"
+    game_dir, found = detect_game_dir(root, mcdr)
+    game = root / game_dir
+    detected, how = detect_mc(game)
+    mc = args.mc or detected
+    loader = detect_loader(game)
+    mods = sorted(p.name for p in (game / "mods").glob("*.jar")) if (game / "mods").is_dir() else []
+    plugins = sorted(p.name for p in (root / "plugins").iterdir()
+                     if p.suffix in (".mcdr", ".pyz", ".py")) if (root / "plugins").is_dir() else []
+    has_server = bool(start or loader)
+
+    # 1. What is here. Said before anything is written, because the first
+    # thing a tool says about your server is what decides if you trust it.
+    say(Out.bold(f"Looking at {root}"))
+    if args.client:
+        say("  a game instance (client)")
+    elif has_server:
+        say(f"  a server: {loader or 'started by MCDR'}"
+            + (f", game in {game_dir}/" if game_dir != "." else ""))
     else:
-        game_dir, found = ".", ""
+        say("  no Minecraft server here yet")
+    if mcdr:
+        say(f"  MCDReforged, with {len(plugins)} plugin{'s' if len(plugins) != 1 else ''}")
+    if mc:
+        say(f"  Minecraft {mc}" + (Out.dim(f"  ({how})") if not args.mc and how else ""))
+    else:
+        say("  Minecraft version: could not tell")
+    if mods:
+        say(f"  {len(mods)} mod{'s' if len(mods) != 1 else ''} in {game_dir}/mods")
+    if not args.client:
+        java = java_on_path()
+        wanted = java_needed(mc) if mc else None
+        if java is None:
+            say(f"  Java: none on this machine's PATH"
+                + (f" (Minecraft {mc} needs {wanted})" if wanted else ""))
+        elif wanted and java < int(wanted):
+            say(f"  Java {java} here, {Out.warn(f'Minecraft {mc} needs {wanted}')}")
+        else:
+            say(f"  Java {java}")
+
+    # 2. A folder with nothing in it: offer to make the server, never assume.
+    if not has_server and not args.client and not create:
+        if interactive:
+            say()
+            create = ask("Make a new Fabric server here?", default=True)
+        else:
+            say(Out.dim("  `w4ve init --create --mc <version> --accept-eula` makes one"))
+    if create and not mc:
+        mc = ask_text("Which Minecraft version?", default="1.21") if interactive else None
+        if not mc:
+            problem("say which Minecraft version to make: --mc 1.21")
+            return 2
+    memory = getattr(args, "memory", None) or suggested_memory()
+    if create:
+        start = f"java -Xms{memory}G -Xmx{memory}G -jar {LAUNCHER} nogui"
+    if not mc:
+        mc = "1.21"
+        note("could not tell the Minecraft version, writing 1.21: "
+             "change `mc` in w4ve.toml if it is another one")
+
+    # 3. The plan. Nothing here moves or deletes a file.
+    adopting = bool(index and (mods or plugins))
+    say()
+    say(Out.bold("Plan"))
+    say(f"  write w4ve.toml: Minecraft {mc}, game in {game_dir}/"
+        + (", start command copied from MCDR" if start and not create and mcdr else ""))
+    if adopting:
+        say(f"  write down the {len(mods) + len(plugins)} mods and plugins already here")
+    if create:
+        say(f"  download the Fabric server launcher for Minecraft {mc} into {LAUNCHER}")
+        say(f"  start it with {memory} GB of memory (--memory changes it)")
+        say(f"  write eula.txt, only if you accept the Minecraft EULA")
+    say(Out.dim("  nothing is moved or deleted"))
+    if args.dry_run:
+        say(Out.dim("\ndry run, nothing was written"))
+        return 0
+    if interactive and (create or adopting) and not ask("Go ahead?", default=True):
+        say("nothing was written")
+        return 0
+
+    # The EULA is the user's to accept, never ours, so it is asked before a
+    # single byte is downloaded: a server that cannot start is not a server.
+    if create:
+        if not accept_eula:
+            say()
+            say(f"Minecraft needs you to accept its EULA: {EULA_URL}")
+            accept_eula = interactive and ask("Do you accept it?", default=False)
+        if not accept_eula:
+            problem("not making a server without the EULA accepted "
+                    "(--accept-eula says you do)")
+            return 1
+        try:
+            url, version = fabric_launcher_url(mc)
+        except LookupError as err:
+            problem(str(err))
+            return 1
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError) as err:
+            problem(f"cannot reach Fabric's servers to download the launcher: {err}")
+            return 1
+        (game / "mods").mkdir(parents=True, exist_ok=True)
+        _, error = download(url, game / LAUNCHER)
+        if error:
+            problem(f"downloading the Fabric launcher failed: {error}")
+            return 1
+        (game / "eula.txt").write_text(
+            f"# Accepted through `w4ve init` on {time.strftime('%Y-%m-%d')}: {EULA_URL}\n"
+            "eula=true\n", encoding="utf-8")
+        say(f"{Out.ok('ok')}  Fabric loader {version} for Minecraft {mc}, in {LAUNCHER}")
+
     body = TEMPLATE.format(
         name=args.name or root.name,
         kind="client" if args.client else "server",
-        mc=args.mc or "1.21",
-        java=java or "21",
-        game_dir=game_dir)
+        mc=mc, java=java_needed(mc), game_dir=game_dir)
     if start:
         # Copied, never rewritten: the flags on it are somebody's tuning, and
         # a start command that is nearly right is a different server.
@@ -1339,9 +1585,23 @@ def cmd_init(args, index):
     say(f"{Out.ok('ok')}  wrote {path}")
     if found:
         say(Out.dim(f"    game_dir = \"{game_dir}\", because {found}"))
-    if start:
+    if start and mcdr and not create:
         say(Out.dim("    start command copied from MCDR's config.yml"))
-    say(Out.dim("    `w4ve adopt` writes down what is already installed"))
+    if adopting:
+        cmd_adopt(argparse.Namespace(dir=str(root), dry_run=False), index)
+
+    say()
+    if mcdr:
+        say("MCDR is still the one that starts this server. When you want W4VE to:")
+        say("  stop MCDR (nothing of it is moved), then `w4ve run`; "
+            "`w4ve plugins` first says whether your plugins will run")
+        say(Out.dim("  going back is starting MCDR again"))
+    elif args.client:
+        say(f"Next: {Out.bold('w4ve install <piece>')}  (`w4ve search <text>` finds one)")
+    else:
+        say(f"Next: {Out.bold('w4ve run')}  starts the server and looks after it")
+        say(Out.dim("  `w4ve install <piece>` adds something, "
+                    "`w4ve search <text>` finds it, `w4ve doctor` checks everything"))
     return 0
 
 
@@ -1557,6 +1817,7 @@ def cmd_install(args, index):
                 wanted.setdefault(dep, None)
 
     changed = 0
+    installed = []
     for pid, version in wanted.items():
         did, message = install_one(server, index, pid, version,
                                    args.file if len(wanted) == 1 else None,
@@ -1564,7 +1825,36 @@ def cmd_install(args, index):
         if message:
             say(message if did else f"{Out.warn('skip')}  {message}")
         changed += bool(did)
+        if did:
+            installed.append(pid)
+    offer_configure(server, installed, args, index)
     return report_pending(server, changed, args)
+
+
+def offer_configure(server, pids, args, index):
+    """Ask what a piece needs right after installing it, while it is in mind.
+
+    Sending somebody off to remember `w4ve configure <piece>` is how a piece
+    ends up installed and never working. Only asked of a person: a script
+    gets the same note it always got, and `configure` stays there for later.
+    """
+    if args.dry_run or args.yes or not sys.stdin.isatty() or settings_module() is None:
+        return
+    for pid in pids:
+        try:
+            missing = missing_settings(Server(server.root), pid)
+        except Exception:
+            continue
+        if not missing:
+            continue
+        say()
+        if ask(f"{pid} needs {len(missing)} answer{'s' if len(missing) != 1 else ''} "
+               "to work. Answer now?", default=True):
+            cmd_configure(argparse.Namespace(
+                id=pid, all=False, show=False, set=None, dry_run=False,
+                yes=False, dir=str(server.root)), index)
+        else:
+            say(Out.dim(f"    later: w4ve configure {pid}"))
 
 
 def cmd_update(args, index):
@@ -1739,7 +2029,7 @@ def cmd_status(args, index):
         report_runtime(server, rt)
     entries = server.state["pieces"]
     if not entries:
-        say("nothing installed yet. `w4ve sync` installs what w4ve.toml says.")
+        say("nothing installed yet. `w4ve install <piece>` adds one, `w4ve search <text>` finds it.")
         return 0
     width = max(len(pid) for pid in entries)
     for pid in sorted(entries):
@@ -4202,26 +4492,169 @@ def report_runtime(server, rt):
 
 # ----------------------------------------------------------------------- main
 
+# The commands somebody needs on a normal day. `w4ve --help` shows these and
+# nothing else; the other twenty are one `w4ve help` away. A first screen with
+# thirty commands on it does not say "this is easy", it says "read the manual".
+EVERYDAY = ("init", "run", "status", "doctor", "install", "update", "remove",
+            "search", "self-update", "help")
+COMMAND_HELP = {}
+
+GETTING_STARTED = """\
+getting started:
+  w4ve init      look at this folder and set it up: adopts the server that is
+                 here, or makes a new Fabric one
+  w4ve run       start the server and look after it
+
+`w4ve help` lists every command, `w4ve <command> --help` explains one.
+Docs: https://docs.w4ve.xyz"""
+
+
+def cmd_help(args, index):
+    """Every command, the everyday ones first."""
+    if args.names:
+        for name in COMMAND_HELP:
+            say(name)
+        return 0
+    width = max(len(name) for name in COMMAND_HELP) + 2
+    say(Out.bold("Everyday"))
+    for name in EVERYDAY:
+        say(f"  {name.ljust(width)}{COMMAND_HELP[name]}")
+    say()
+    say(Out.bold("Everything else"))
+    for name, text in COMMAND_HELP.items():
+        if name not in EVERYDAY:
+            say(f"  {name.ljust(width)}{text}")
+    say()
+    say(Out.dim("`w4ve <command> --help` explains one"))
+    return 0
+
+
+RELEASES_API = "https://api.github.com/repos/CodeW4VE/w4ve/releases/latest"
+
+
+def installed_layout():
+    """(prefix, bin_dir) when this w4ve was installed by install.py, else None.
+
+    install.py keeps every version in <prefix>/releases/<version>/ and points
+    a launcher in <bin_dir> at one of them. A w4ve running from a checkout is
+    somebody's working copy, and replacing it from under them is not ours to do.
+    """
+    here = Path(__file__).resolve()
+    if here.parent.parent.name != "releases":
+        return None
+    launcher = Path(sys.argv[0])
+    bin_dir = (launcher.parent if launcher.name == "w4ve"
+               else Path.home() / ".local" / "bin")
+    return here.parents[2], bin_dir
+
+
+def cmd_self_update(args, index):
+    """Install the newest w4ve release next to this one, and switch to it."""
+    try:
+        release = json.loads(fetch(RELEASES_API, timeout=30))
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as err:
+        problem(f"cannot ask GitHub for the newest release: {err}")
+        return 1
+    newest = str(release.get("tag_name", "")).lstrip("v")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", newest):
+        problem(f"the newest release has a tag w4ve does not understand: {newest!r}")
+        return 1
+    if vtuple(newest) <= vtuple(VERSION):
+        say(f"{Out.ok('ok')}  w4ve {VERSION} is the newest")
+        return 0
+    say(f"w4ve {newest} is out, this is {VERSION}")
+    say(Out.dim(f"    {release.get('html_url', '')}"))
+    if args.check:
+        return 0
+    layout = installed_layout()
+    if layout is None:
+        problem("this w4ve runs from a checkout, not from an install: "
+                "update it with git, or install the release (see the README)")
+        return 2
+    prefix, bin_dir = layout
+    assets = {a.get("name"): a.get("browser_download_url")
+              for a in release.get("assets") or []}
+    archive = f"w4ve-{newest}.tar.gz"
+    wanted = (archive, archive + ".sha256", "install.py")
+    missing = [name for name in wanted if not assets.get(name)]
+    if missing:
+        problem(f"the {newest} release is missing {', '.join(missing)}")
+        return 1
+    say(f"  install it into {prefix}/releases/{newest}/ and point {bin_dir}/w4ve at it")
+    say(Out.dim(f"  {VERSION} stays installed, so going back is one command"))
+    if args.dry_run:
+        say(Out.dim("dry run, nothing was downloaded"))
+        return 0
+    if not args.yes:
+        if not sys.stdin.isatty():
+            problem("not updating without -y when nobody can be asked")
+            return 2
+        if not ask("Update now?", default=True):
+            return 0
+    with tempfile.TemporaryDirectory(prefix="w4ve-update-") as work:
+        work = Path(work)
+        for name in wanted:
+            _, error = download(assets[name], work / name, quiet=True)
+            if error:
+                problem(f"downloading {name} failed: {error}")
+                return 1
+        expected = (work / (archive + ".sha256")).read_text().split()[0]
+        if sha256_of(work / archive) != expected:
+            problem(f"{archive} does not match its SHA256, not installing it")
+            return 1
+        result = subprocess.run([sys.executable, str(work / "install.py"),
+                                 "--archive", str(work / archive),
+                                 "--prefix", str(prefix), "--bin-dir", str(bin_dir)])
+        if result.returncode != 0:
+            problem("the installer refused it; nothing was switched")
+            return 1
+        # Kept beside the releases so going back does not need the internet.
+        shutil.copyfile(work / "install.py", prefix / "install.py")
+    say(f"{Out.ok('ok')}  w4ve {newest}")
+    where = "" if prefix == Path.home() / ".local/share/w4ve" else f" --prefix {prefix}"
+    if bin_dir != Path.home() / ".local/bin":
+        where += f" --bin-dir {bin_dir}"
+    say(Out.dim(f"    back to {VERSION}: python3 {prefix}/install.py --rollback {VERSION}{where}"))
+    say(Out.dim("    a guardian that is running keeps the old version until it restarts"))
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
-        prog="w4ve", description="Install and update W4VE pieces.")
+        prog="w4ve",
+        description="W4VE runs your Minecraft server and keeps it healthy.",
+        epilog=GETTING_STARTED,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--index", help="catalog path or URL")
     parser.add_argument("--refresh", action="store_true",
                         help="ignore the cached catalog")
     parser.add_argument("--dir", help="server folder (default: look upwards)")
     parser.add_argument("--version", action="version", version=f"w4ve {VERSION}")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command", metavar="<command>",
+                                       title="everyday commands")
 
     def add(name, function, help_text):
-        sub = subparsers.add_parser(name, help=help_text)
+        COMMAND_HELP[name] = help_text
+        # Without help= argparse leaves a command out of the list in --help,
+        # and it still works exactly the same.
+        sub = subparsers.add_parser(
+            name, description=help_text,
+            **({"help": help_text} if name in EVERYDAY else {}))
         sub.set_defaults(run=function)
         return sub
 
-    init = add("init", cmd_init, "write a w4ve.toml here")
+    init = add("init", cmd_init,
+               "set this folder up: adopt the server here, or make a new one")
     init.add_argument("--name", help="what to call this server (default: the folder)")
     init.add_argument("--mc", help="Minecraft version, if it cannot be worked out")
     init.add_argument("--client", action="store_true",
                       help="this folder is a game instance, not a server")
+    init.add_argument("--create", action="store_true",
+                      help="make a new Fabric server here if there is none")
+    init.add_argument("--accept-eula", action="store_true",
+                      help=f"you accept the Minecraft EULA ({EULA_URL})")
+    init.add_argument("--memory", type=int, metavar="GB",
+                      help="memory for a new server (default: half this machine, 2 to 8)")
     init.add_argument("--force", action="store_true",
                       help="overwrite an existing w4ve.toml")
 
@@ -4347,7 +4780,7 @@ def build_parser():
 
     # The runtime half. None of it needs the catalog, and that matters: a
     # server has to be startable when GitHub is down.
-    run = add("run", cmd_run, "own this server and watch it, in the foreground")
+    run = add("run", cmd_run, "start the server and look after it, in the foreground")
     run.add_argument("--no-start", action="store_true",
                      help="hold the server: start the guardian only")
     run.add_argument("--quiet", action="store_true",
@@ -4403,9 +4836,22 @@ def build_parser():
     logs.add_argument("--journal", action="store_true",
                       help="the guardian journal instead of the console")
 
+    self_update = add("self-update", cmd_self_update,
+                      "update w4ve itself to the newest release")
+    self_update.add_argument("--check", action="store_true",
+                             help="only say whether there is a newer one")
+    helping = add("help", cmd_help, "every command, the everyday ones first")
+    helping.add_argument("--names", action="store_true",
+                         help="only the names, one per line (for scripts)")
+
     for name in ("run", "start", "stop", "console", "logs", "pack", "repair",
-                 "plugins", "configure", "http", "storage", "dev", "api", "exec-service", "prepare", "source", "permissions"):
+                 "plugins", "configure", "http", "storage", "dev", "api", "exec-service",
+                 "prepare", "source", "permissions", "self-update", "help"):
         subparsers.choices[name].set_defaults(needs_index=False)
+
+    # --help lists them in the order somebody meets them, not the order the
+    # code happens to create them in.
+    subparsers._choices_actions.sort(key=lambda action: EVERYDAY.index(action.dest))
 
     for name, sub in subparsers.choices.items():
         # `logs -n` is a line count, so it does not get the global short flag.
@@ -4422,6 +4868,10 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    if not getattr(args, "run", None):
+        # Plain `w4ve` is somebody asking where to start, not a mistake.
+        parser.print_help()
+        return 0
     index = ({"schema": 1, "pieces": {}, "profiles": {}}
              if not getattr(args, "needs_index", True)
              else load_index(args.index, args.refresh))

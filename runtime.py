@@ -181,6 +181,11 @@ def detect_flavor(game_dir):
     if (game_dir / "mods").is_dir():
         return "fabric"
     jars = [p.name.lower() for p in game_dir.glob("*.jar")]
+    # A Fabric server that has not booted yet has no mods/ folder, only its
+    # launcher. Calling that vanilla told a brand new server it could not
+    # take mods.
+    if any(n.startswith("fabric-server") for n in jars) or (game_dir / ".fabric").is_dir():
+        return "fabric"
     if any("paper" in n or "spigot" in n or "purpur" in n for n in jars):
         return "paper"
     if (game_dir / "plugins").is_dir():

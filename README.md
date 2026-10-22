@@ -1,24 +1,40 @@
 # w4ve
 
-The command line for the [W4VE](https://w4ve.xyz) catalog: install and update the
-mods and plugins a technical Minecraft server runs, without remembering which jar
-went where.
+**W4VE, Ware 4 Vanilla Experience**, runs your Fabric server and keeps it
+healthy. It knows how to start it, what mods and plugins it has, how they are
+configured and how to go back when something breaks. Your MCDReforged plugins
+keep working, without MCDR. Your world, jars and configs stay normal files:
+if you stop using W4VE, the server still starts with plain Java.
 
+## Three commands
+
+```sh
+curl -fsSL https://github.com/CodeW4VE/w4ve/releases/latest/download/get.sh | sh
+cd your-server          # or an empty folder, and W4VE makes a Fabric server in it
+w4ve init               # looks first, shows the plan, then sets it up
+w4ve run                # starts the server and looks after it
 ```
-$ w4ve install --profile technical-survival
-ok  fabric-api  0.102.0+1.21  (waits for restart)
-ok  carpet  1.4.147  (waits for restart)
-ok  shapeboard  1.6.0  (waits for restart)
-ok  primebackup  1.13.1-w4ve.1  (reload it in place)
-...
 
-7 pieces waiting for a restart: fabric-api, carpet, carpet-extra, servux, ...
-run `docker restart -t 60 smp` now? [y/N]
+`w4ve init` says what it found (an existing server, MCDR and its plugins, the
+Minecraft version, Java, your mods) and what it is going to do before it does
+anything. It never moves or deletes a file. In an empty folder it offers to
+make a new Fabric server, and asks you to accept the Minecraft EULA.
+
+After that, the everyday ones:
+
+```sh
+w4ve install shapeboard     # add a piece; it asks what it needs to know
+w4ve status                 # what is running, what waits for a restart
+w4ve doctor                 # what is wrong, before the server finds out
+w4ve update                 # move everything to its newest version
+w4ve self-update            # update W4VE itself
 ```
 
-Standard library only. The complete runtime includes the catalog command,
-guardian, package manager, API, compatibility layer and plugin SDK. Installing
-only `w4ve.py` does not provide that runtime.
+`w4ve help` lists the rest. Every question has a flag, so a script does the
+same as a person: `w4ve init --create --mc 1.21 --accept-eula -y`.
+
+Standard library only. The runtime includes the guardian, package manager,
+local API, MCDR compatibility layer and plugin SDK.
 
 ## Install
 
@@ -28,17 +44,27 @@ library. The runtime uses Unix sockets and `fcntl`, so it does not run on
 Windows itself: on a Windows machine, run it inside a Linux VM or container.
 Java is whatever your Minecraft server needs; W4VE does not install it.
 
-**From the release** (`v0.4.0` is the first one that carries the whole
-runtime; `v0.1.x` were a single `w4ve.py` with the catalog command only, do
-not install that file on its own):
+**In one line** (for this user, no root, nothing outside `~/.local`):
 
 ```sh
-base=https://github.com/CodeW4VE/w4ve/releases/download/v0.4.0
-curl -LO $base/w4ve-0.4.0.tar.gz -LO $base/w4ve-0.4.0.tar.gz.sha256 -LO $base/install.py
-sha256sum -c w4ve-0.4.0.tar.gz.sha256
-python3 install.py --archive w4ve-0.4.0.tar.gz
+curl -fsSL https://github.com/CodeW4VE/w4ve/releases/latest/download/get.sh | sh
+```
+
+`get.sh` asks GitHub for the newest release (`W4VE_VERSION=0.5.0` picks one),
+checks its SHA256 and runs `install.py`, which checks every file again. It
+does not edit your shell profile: if `~/.local/bin` is not on your PATH it
+prints the line to add.
+
+**By hand**, the same steps (`v0.1.x` were a single `w4ve.py` with the
+catalog command only, do not install that file on its own):
+
+```sh
+base=https://github.com/CodeW4VE/w4ve/releases/download/v0.5.0
+curl -LO $base/w4ve-0.5.0.tar.gz -LO $base/w4ve-0.5.0.tar.gz.sha256 -LO $base/install.py
+sha256sum -c w4ve-0.5.0.tar.gz.sha256
+python3 install.py --archive w4ve-0.5.0.tar.gz
 export PATH="$HOME/.local/bin:$PATH"       # add this to your shell profile too
-w4ve --version                             # w4ve 0.4.0
+w4ve --version                             # w4ve 0.5.0
 ```
 
 **From a checkout**, which gives the same archive:
@@ -46,8 +72,8 @@ w4ve --version                             # w4ve 0.4.0
 ```sh
 cd w4ve
 python3 tools/build_distribution.py --out build/distribution
-cd build/distribution && sha256sum -c w4ve-0.4.0.tar.gz.sha256 && cd ../..
-python3 install.py --archive build/distribution/w4ve-0.4.0.tar.gz
+cd build/distribution && sha256sum -c w4ve-0.5.0.tar.gz.sha256 && cd ../..
+python3 install.py --archive build/distribution/w4ve-0.5.0.tar.gz
 ```
 
 The build is reproducible: the same checkout gives the same archive, byte for
@@ -65,7 +91,7 @@ run against the installed copy:
 
 ```sh
 python3 tools/check_installed_distribution.py \
-    build/distribution/w4ve-0.4.0.tar.gz --tests-dir tests
+    build/distribution/w4ve-0.5.0.tar.gz --tests-dir tests
 ```
 
 It prints one JSON line with every check `passed`; `server_operations` stays
@@ -74,7 +100,7 @@ It prints one JSON line with every check `passed`; `server_operations` stays
 To go back to a version that is already installed:
 
 ```sh
-python3 install.py --rollback 0.4.0
+python3 install.py --rollback 0.4.0   # the version to go back to
 ```
 
 Rollback rechecks the installed files and switches the command. It does not
@@ -85,8 +111,8 @@ running.
 checked with:
 
 ```sh
-mkdir -p myserver/mods && cd myserver
-w4ve init --mc 1.21                        # writes w4ve.toml
+mkdir myserver && cd myserver
+w4ve init --create --mc 1.21 --accept-eula # makes a Fabric server, writes w4ve.toml
 w4ve install gooderrails                   # pulls fabric-api in as well
 w4ve status                                # versions, updates, pending restarts
 w4ve doctor                                # 0 problems is the goal
@@ -103,8 +129,7 @@ internet can point at a local copy with `--index /path/index.json` or
 
 ```sh
 cd /path/to/your/server
-w4ve init                       # writes w4ve.toml
-w4ve adopt                      # writes down the mods this server already has
+w4ve init                       # looks, shows the plan, writes w4ve.toml and adopts what is here
 w4ve install shapeboard         # downloads it, puts it in mods/, writes it down
 w4ve status                     # what is installed, what needs a restart
 w4ve doctor                     # what is wrong before the server finds out
@@ -112,8 +137,8 @@ w4ve doctor                     # what is wrong before the server finds out
 
 | Command | What it does |
 |---|---|
-| `init` | write a `w4ve.toml` for this folder (`--client` for a game instance) |
-| `adopt` | take over a server that already exists: read what is in `mods/` and `plugins/` and write it down |
+| `init` | look at this folder and set it up: adopt the server and the mods already here, or make a new Fabric server (`--create`); `--client` for a game instance |
+| `adopt` | write down what is in `mods/` and `plugins/` again, after you added something by hand (`init` already does it once) |
 | `list` | what the catalog has (`--type`, `--side`, `--profile`, `--installed`) |
 | `search <text>` | find a piece |
 | `info <id>` | versions, dependencies, where it installs to |
@@ -123,6 +148,7 @@ w4ve doctor                     # what is wrong before the server finds out
 | `remove <id>` | delete the file and forget it |
 | `sync` | leave the server exactly as `w4ve.toml` says |
 | `status` | what is running, versions, available updates, pending restarts |
+| `self-update` | update W4VE itself to the newest release; the old version stays installed |
 | `doctor` | missing dependencies, duplicate jars, wrong Java, files changed by hand |
 | `repair` | undo an install that was killed halfway |
 | `plugins` | what MCDR plugins this server has, and what is wrong with them |

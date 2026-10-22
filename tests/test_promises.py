@@ -19,6 +19,8 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -156,11 +158,29 @@ class NoRemoteByDefaultCase(unittest.TestCase):
 class NoTouchingTheWorldCase(unittest.TestCase):
     """"modificar worlds como parte de un paquete", and "autoaceptar EULA"."""
 
-    def test_nothing_here_writes_an_eula(self):
-        # Accepting a licence on somebody's behalf is not a convenience.
+    def test_nothing_here_accepts_the_eula_for_anybody(self):
+        # Accepting a licence on somebody's behalf is not a convenience. Since
+        # `w4ve init --create` makes servers, the EULA is mentioned in exactly
+        # one place, and only a person's own answer writes it: the question
+        # defaults to no, and -y is not an answer to it.
         for name in SOURCES:
-            self.assertNotIn("eula", source_of(name).lower(),
-                             "%s mentions the EULA" % name)
+            if name != "w4ve.py":
+                self.assertNotIn("eula", source_of(name).lower(),
+                                 "%s mentions the EULA" % name)
+        text = source_of("w4ve.py")
+        self.assertEqual(text.count('"eula.txt"'), 1, "one place writes eula.txt")
+        self.assertIn('ask("Do you accept it?", default=False)', text)
+        self.assertIn('accept_eula = getattr(args, "accept_eula", False)', text)
+        self.assertNotIn("accept_eula = args.yes", text)
+
+    def test_yes_does_not_accept_the_eula(self):
+        root = Path(tempfile.mkdtemp(prefix="w4ve-eula-"))
+        args = argparse.Namespace(dir=str(root), name=None, mc="1.21", client=False,
+                                  force=False, dry_run=False, yes=True, create=True,
+                                  accept_eula=False, memory=None)
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            self.assertEqual(w4ve.cmd_init(args, None), 1)
+        self.assertFalse((root / "eula.txt").exists())
 
     def test_a_package_cannot_place_files_in_the_world(self):
         kinds = package.KINDS

@@ -24,7 +24,7 @@ def run(args):
     root.mkdir(mode=0o700)
     inputs = root / "inputs"
     inputs.mkdir()
-    files = {"install.py": args.installer, "w4ve-0.4.0.tar.gz": args.runtime,
+    files = {"install.py": args.installer, "w4ve-0.5.0.tar.gz": args.runtime,
              "game.zip": args.game, "fabric-api.jar": args.fabric_api,
              "bridge.jar": args.bridge, "wavechat.jar": args.companion,
              "check_bridge_game.py": TOOLS / "check_bridge_game.py",

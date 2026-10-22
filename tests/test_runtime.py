@@ -368,6 +368,10 @@ class HandlerCase(unittest.TestCase):
             self.assertEqual(runtime.detect_flavor(root), "paper")
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(runtime.detect_flavor(tmp), "vanilla")
+        with tempfile.TemporaryDirectory() as tmp:
+            # Made by `w4ve init --create` and not booted yet: no mods/ so far.
+            (Path(tmp) / "fabric-server-launch.jar").write_text("")
+            self.assertEqual(runtime.detect_flavor(tmp), "fabric")
 
 
 class IdentityCase(unittest.TestCase):
