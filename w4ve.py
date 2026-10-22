@@ -1974,12 +1974,8 @@ def cmd_doctor(args, index):
     # 10. routes that exist in w4ve.toml and in nobody's web server
     routes = http_routes(server)
     if routes:
-        applied = server.state.get("http_applied") or {}
-        current = {route["name"]: route["path"] for route in routes}
-        if applied != current:
-            warnings.append(f"{len(routes)} public route"
-                            f"{'s' if len(routes) != 1 else ''} declared here "
-                            f"are not in any web server yet (`w4ve http`)")
+        warnings.append(f"{len(routes)} public route{'s' if len(routes) != 1 else ''} declared; "
+                        "a generated file does not verify deployment. Check the public HTTPS endpoints (`w4ve http check --url ...`)")
 
     # 11. Running as root, which nothing here refuses and everything here
     # should mention. Refusing outright would break every container that runs
@@ -2874,7 +2870,8 @@ def render_nginx(server, routes):
             lines.append(f"    client_max_body_size {route['max_body']};")
         if route["serve"]:
             folder = (root / route["serve"]).as_posix().rstrip("/") + "/"
-            lines.append(f"    alias {folder};")
+            quoted = '"' + folder.replace('\\','\\\\').replace('"','\\"').replace('$','\\$') + '"'
+            lines.append(f"    alias {quoted};")
             lines.append("    autoindex off;")
             # Its own header, always: without it this location inherits
             # whatever the parent one says, and a Content-Disposition from a
@@ -2907,13 +2904,13 @@ def render_caddy(server, routes):
         if route["serve"]:
             folder = (root / route["serve"]).as_posix()
             lines.append(f"handle_path {matcher.rstrip('/')}/* {{")
-            lines.append(f"    root * {folder}")
-            if route["cache"] == "immutable":
-                lines.append('    header Cache-Control "public, max-age=604800, immutable"')
+            lines.append(f"    root * {json.dumps(folder,ensure_ascii=False)}")
+            cache = {'immutable': 'public, max-age=604800, immutable', 'short': 'public, max-age=60'}.get(route['cache'],'no-store')
+            lines.append(f'    header Cache-Control "{cache}"')
             lines.append("    file_server")
             lines.append("}")
         else:
-            lines.append(f"handle {matcher} {{")
+            lines.append(f"handle {matcher if route['exact'] else matcher + '*'} {{")
             if route["max_body"]:
                 lines.append(f"    request_body {{ max_size {route['max_body']} }}")
             lines.append(f"    reverse_proxy {route['proxy']}")
@@ -2924,6 +2921,15 @@ def render_caddy(server, routes):
 
 def cmd_http(args, index):
     """Print the web server configuration the installed pieces need."""
+    if args.flavour == 'check':
+        import httpprobe
+        if not args.url or args.out:
+            problem('http check requires --url and does not write a proxy configuration')
+            return 2
+        result = httpprobe.check(args.url,expected_status=args.expected_status,software=args.expect_software or '',
+            capabilities=args.capability or [],ca_file=args.ca_file,timeout=args.timeout,dry_run=args.dry_run)
+        say(json.dumps(result,sort_keys=True))
+        return 0 if result['ok'] else 1
     server = need_server(args)
     if server is None:
         return 2
@@ -2933,13 +2939,15 @@ def cmd_http(args, index):
         return 0
     text = (render_caddy if args.flavour == "caddy" else render_nginx)(server, routes)
     if args.out:
+        if args.dry_run:
+            note('preview only; no proxy file or deployment state written')
+            say(text)
+            return 0
         Path(args.out).write_text(text + "\n", encoding="utf-8")
         say(f"{Out.ok('written')}  {args.out}")
         if args.flavour == "nginx":
             say(Out.dim("  then: nginx -t && systemctl reload nginx"))
-        # Written down so `doctor` stops nagging about routes that are in
-        # place, and starts again the day a piece adds a new one.
-        server.state["http_applied"] = {r["name"]: r["path"] for r in routes}
+        server.state["http_generated"] = {r["name"]: r["path"] for r in routes}
         server.save_state()
         return 0
     say(text)
@@ -4285,9 +4293,15 @@ def build_parser():
 
     http_cmd = add("http", cmd_http, "the web server config this server needs")
     http_cmd.add_argument("flavour", nargs="?", default="nginx",
-                          choices=["nginx", "caddy"],
+                          choices=["nginx", "caddy", "check"],
                           help="which web server to write it for (default: nginx)")
     http_cmd.add_argument("--out", help="write it to a file instead of printing")
+    http_cmd.add_argument('--url', help='explicit HTTPS JSON endpoint to check, without credentials/query/fragment')
+    http_cmd.add_argument('--expect-software', help='required JSON software identifier')
+    http_cmd.add_argument('--capability', action='append', help='require one enabled JSON capability; repeatable')
+    http_cmd.add_argument('--expected-status', type=int, default=200, help='expected HTTP response status')
+    http_cmd.add_argument('--ca-file', help='explicit CA bundle for a private deployment; hostname verification stays enabled')
+    http_cmd.add_argument('--timeout', type=float, default=5, help='timeout in seconds, at most10')
 
     storage = add("storage", cmd_storage, "what pieces are storing, and its ceiling")
     storage.add_argument("--purge", action="store_true",

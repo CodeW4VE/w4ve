@@ -125,9 +125,15 @@ class NoRemoteByDefaultCase(unittest.TestCase):
     """"API remota abierta por defecto"."""
 
     def test_the_api_is_off_unless_asked_for(self):
+        # Off unless asked for. A piece declaring that it needs identity or
+        # game events is asking, and then a token is never optional.
         text = source_of("runtime.py")
-        self.assertIn('section.get("enabled", False)', text,
+        self.assertIn('section.get("enabled", bool(self.identity_services or self.event_services)'
+                      ' or bridge.get("enabled") is True)', text,
                       "the API has to default to off")
+        self.assertIn("tokens_required=True if self.identity_services or self.event_services"
+                      " or self.game_bridge", text,
+                      "an API turned on by a piece must require tokens")
 
     def test_a_socket_needs_no_token_and_a_port_always_does(self):
         tmp = Path(tempfile.mkdtemp(prefix="w4ve-remote-"))

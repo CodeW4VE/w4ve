@@ -253,12 +253,36 @@ class NginxCase(unittest.TestCase):
     def test_an_alias_ends_in_a_slash_because_nginx_needs_it_to(self):
         text = w4ve.render_nginx(self.server, w4ve.http_routes(self.server))
         line = [l for l in text.splitlines() if l.strip().startswith("alias")][0]
-        self.assertTrue(line.rstrip().endswith("/;"), line)
+        self.assertTrue(line.rstrip().endswith('/";'), line)
 
     def test_caddy_is_offered_because_it_does_the_certificate_itself(self):
         text = w4ve.render_caddy(self.server, w4ve.http_routes(self.server))
         self.assertIn("reverse_proxy 127.0.0.1:8792", text)
         self.assertIn("file_server", text)
+
+    def test_caddy_prefix_matches_children_but_exact_route_stays_exact(self):
+        routes = [{'name':'chat','path':'/v2/chat/','serve':None,'proxy':'127.0.0.1:8792','exact':False,'why':'','max_body':None,'cache':'none'},
+                  {'name':'hello','path':'/hello','serve':None,'proxy':'127.0.0.1:8792','exact':True,'why':'','max_body':None,'cache':'none'}]
+        text = w4ve.render_caddy(self.server,routes)
+        self.assertIn('handle /v2/chat/* {',text)
+        self.assertIn('handle /hello {',text)
+        self.assertNotIn('/hello*',text)
+
+    def test_generation_is_not_deployment_and_dry_run_writes_nothing(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        target = self.tmp / 'proxy.conf'
+        with redirect_stdout(StringIO()):
+            code = w4ve.main(['--dir',str(self.server.root),'http','caddy','--out',str(target),'--dry-run'])
+        self.assertEqual(code,0)
+        self.assertFalse(target.exists())
+        self.assertNotIn('http_generated',w4ve.Server(self.server.root).state)
+        with redirect_stdout(StringIO()):
+            code = w4ve.main(['--dir',str(self.server.root),'http','caddy','--out',str(target)])
+        self.assertEqual(code,0)
+        state = w4ve.Server(self.server.root).state
+        self.assertIn('http_generated',state)
+        self.assertNotIn('http_applied',state)
 
 
 class PurgeCase(unittest.TestCase):

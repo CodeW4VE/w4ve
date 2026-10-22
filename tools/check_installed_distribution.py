@@ -25,7 +25,7 @@ def check(archive, tests_dir=None):
         release = prefix / "releases" / version
         imports = (
             "import sys; sys.path[:0] = " + repr([str(release), str(release / "sdk/python")])
-            + "; import runtime, package, worker, api, piecesettings, discover, rcon, pluginhost, serviceprep, sourceprep;"
+            + "; import runtime, package, worker, api, piecesettings, discover, rcon, pluginhost, serviceprep, sourceprep, httpprobe;"
             + " import identity, gameevents, mcdr, w4ve_plugin; print('installed modules imported')"
         )
         result = subprocess.run([sys.executable, "-I", "-c", imports], cwd=root,
@@ -38,7 +38,7 @@ def check(archive, tests_dir=None):
         if tests_dir is not None:
             environment = dict(os.environ)
             environment["PYTHONPATH"] = os.pathsep.join([str(release), str(release / "sdk/client"), str(tests_dir)])
-            for pattern in ("test_exec_service.py", "test_service_diagnostics.py", "test_serviceprep.py", "test_sourceprep.py", "test_gameevents*.py", "test_identity*.py", "test_api.py", "test_package.py", "test_pairing.py", "test_settings.py",
+            for pattern in ("test_exec_service.py", "test_service_diagnostics.py", "test_serviceprep.py", "test_sourceprep.py", "test_httpprobe.py", "test_infra.py", "test_gameevents*.py", "test_identity*.py", "test_api.py", "test_package.py", "test_pairing.py", "test_settings.py",
                             "test_runtime.py", "test_handover.py"):
                 result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", str(tests_dir),
                                          "-p", pattern, "-v"], cwd=root, env=environment,
